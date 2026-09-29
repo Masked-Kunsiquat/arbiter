@@ -54,14 +54,11 @@ linters:
     - thelper
     - usetesting
     # modernization & meta
-    - modernize
     - intrange
     - usestdlibvars
     - nolintlint
 
   disable:
-    # whitespace: too opinionated, generates retroactive noise
-    - wsl_v5
     # paralleltest: none of the existing tests use t.Parallel(); add later intentionally
     - paralleltest
     # too strict / noisy defaults
