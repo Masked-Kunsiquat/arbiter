@@ -2,26 +2,29 @@
 
 A lean, local-first execution arbiter, task governor, and multi-agent coordination layer built on native Git primitives, embedded SQLite, and signed audit records.
 
-> **v2 changes (responding to `spec-review.md`).** Previous version preserved in `spec.v1.md`.
+> **Changes from v1** (see git history), responding to `spec-review.md` and later design discussion:
 >
-> | Review crack | Resolution | Section |
+> | Issue | Resolution | Section |
 > |---|---|---|
 > | DAG edges not persisted | `task_edges` table + `ready` / `stale` task states | §4, §5.1 |
 > | Cascading interface drift | Symbol-diff staleness detection; Ringleader re-specs tasks without human re-signing unless the PRD itself changes | §5.1 |
-> | Reservation deadlocks | Atomic all-or-nothing acquisition; mid-flight expansion releases and re-queues (no hold-and-wait) | §5.2 |
+> | Reservation deadlocks | Single-lane core has no contention; Fleet uses atomic all-or-nothing acquisition | §5.2, §12 |
 > | Adversary hallucinated tests | Attack Validation Protocol: ERROR ≠ defect, claim check, worker disputes, retries count only upheld rejections | §5.4 |
-> | Semantic merge breakage | Integration gate: rebase → full suite + accumulated attack tests → fast-forward (merge queue under Fleet) | §5.6, §12 |
-> | Worktree install cost | Warm worktree pool, lockfile-hash reinstall, shared caches, default concurrency 2 | §7 |
-> | Blank Utility formula / miss attribution | Formula defined; Judge auto-resolves every injection at verdict time; `lesson_injections` table | §6 |
+> | Semantic merge breakage | Integration gate before every merge; serialized merge queue under Fleet | §5.6, §12 |
+> | Worktree install cost | Warm worktree slot, lockfile-hash reinstall, shared caches | §7 |
+> | Blank Utility formula / miss attribution | Formula defined; Judge auto-resolves every injection at verdict time | §6 |
 > | Context dilution / conflicting lessons | Ranked, token-budgeted injection; conflict check at Gate 1 | §6 |
-> | Stack-trace clustering false positives | Deterministic trace fingerprints first; embeddings only on NL root-cause summaries (v0.3) | §6 |
+> | Stack-trace clustering false positives | Deterministic trace fingerprints; embeddings only on root-cause summaries | §6 |
 > | Windows has no PGIDs | `Supervisor` interface: Job Objects on Windows, PGID + PDEATHSIG on Linux | §7 |
-> | Crypto as security theater | Explicit threat model; per-agent ephemeral keys dropped; git-native SSH signing for humans; hash-chained daemon log for agents | §8 |
-> | Human SSH fatigue | ~2 signatures per feature; batch org promotions | §8 |
-> | Harness tools bypass the "tool layer" | Boundary enforcement moved to a deterministic diff check at submit time | §5.3 |
-> | (new) Scope risk | Staged build order; v0.1 is a single-lane loop | §11 |
->
-> **v2.1:** Parallel execution moved to an opt-in **Fleet** module (§12); the core runs one task at a time. Identity is now Graphban-style **credentials + seats** that form an explicit agent tree (§8.B). Attribution travels in **signed commit trailers + a committed ledger** that GitHub can verify years later (§8.D). An explicit role/knowledge-flow map was added (§5.0).
+> | Crypto as security theater | Explicit threat model; per-agent keypairs dropped; seats + hash-chained ledger | §8 |
+> | Human SSH fatigue | ~2 signatures per feature; batch org promotions | §8.C |
+> | Harness tools bypass the "tool layer" | Boundaries enforced by a deterministic diff check at submit time | §5.3 |
+> | Scope risk | Single-lane core first; parallelism is the deferred Fleet module | §11, §12 |
+> | Agent organization | Credentials + seats form an explicit agent tree; role/knowledge-flow map | §5.0, §8.B |
+> | Identity routed through the model (Graphban-style seat codes in prompts) | Seats are bound to the process/connection Arbiter launched; the model never handles tokens; no MCP in v0.1 | §8.B, §9.A |
+> | Long-term attribution | Supervisor-signed commits with trailers + committed ledger, verifiable on GitHub | §8.D |
+> | Laptop vs server | Core / Runner / Client split; one binary locally, `arbiter serve` on a home server later; SSH transport; client-side human signing | §10 |
+> | Self-hosting risk | Bootstrap rule: gate code is human-reviewed; dogfood with a pinned known-good binary | §13 |
 
 ---
 
@@ -52,8 +55,8 @@ The Arbiter is a governance plane and execution supervisor. It sits between loca
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                             The Arbiter Supervisor                          │
 │  - Embedded SQLite (Tasks, Edges, Reservations, PRDs, Knowledge Pipeline)   │
-│  - Warm Worktree Pool & Process Supervisor (Job Objects / PGIDs)            │
-│  - Role Capability Tokens & Hash-Chained Signed Audit Log                   │
+│  - Runner: Worktree Slot & Process Supervisor (Job Objects / PGIDs)         │
+│  - Seats (agent tree) & Hash-Chained Signed Ledger                          │
 │  - Tree-sitter Symbol Index (blast radius, interface drift)                 │
 │  - Integration Gate (full suite + attack tests before every merge)          │
 │  - Knowledge Synthesizer (fingerprint clustering & promotion)               │
@@ -81,6 +84,7 @@ The Arbiter is a governance plane and execution supervisor. It sits between loca
 - **Physical Isolation over Permissions:** Agents operate in dedicated git worktrees under OS-level process containment (Job Objects on Windows, process groups on POSIX).
 - **Git as the Ledger of Record:** PRD locks are signed tags, merges are signed commits carrying attribution trailers, and each PRD's hash-chained ledger is committed into the repo (§8.D).
 - **Seats, Not Sessions:** Every agent acts through a minted, role-bound seat. Seats form the agent tree, and every ledger entry names the seat that did it.
+- **Identity Never Passes Through the Model:** A seat is bound to the process or connection Arbiter created, never to a code the model must remember and repeat.
 - **Contract-Driven Scope (PRD-First):** Features originate as machine-parseable, human-signed contracts. Diffs outside the declared file boundaries are rejected.
 - **Hierarchical Epistemic Lifecycle:** Memories distill into Project Lessons, which earn promotion into Org Invariants through an efficacy threshold plus human sign-off.
 - **Honest Accountability:** Signatures provide provenance and tamper-evidence, not sandboxing. See the threat model (§8.A).
@@ -326,30 +330,34 @@ CREATE TABLE disputes (
     FOREIGN KEY(task_id) REFERENCES tasks(id)
 );
 
--- Long-lived identities (one per harness+model, plus the human). Written once, never change.
+-- Who an agent is. For agents Arbiter launches this is a descriptor, not a secret.
 CREATE TABLE credentials (
     id TEXT PRIMARY KEY,                     -- e.g. "cred:claude-code/claude-opus-5-5", "cred:human/Masked-Kunsiquat"
     kind TEXT NOT NULL CHECK (kind IN ('human', 'agent')),
     harness TEXT,                            -- 'claude-code' | 'cursor' | 'aider' | ...
     model TEXT,
+    model_provenance TEXT CHECK (model_provenance IN ('launched', 'claimed')),
+                                             -- launched: Arbiter set --model itself; claimed: self-reported by an attached session
     eligible_roles TEXT NOT NULL,            -- JSON array: which roles this credential may be seated as
-    secret_hash TEXT NOT NULL,               -- API key, stored hashed; the key itself never enters the ledger
+    secret_hash TEXT,                        -- only for attached (not launched) sessions; NULL otherwise
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
 -- Ephemeral, role-bound seats. The seat id is the agent's identity in the ledger.
 CREATE TABLE seats (
-    id TEXT PRIMARY KEY,                     -- e.g. "seat_7f3a9c"
+    id TEXT PRIMARY KEY,                     -- readable + suffix: "PRD-004/TASK-101/worker.2~7f3a"
     role TEXT NOT NULL CHECK (role IN ('ringleader', 'worker', 'adversary', 'judge')),
-    task_id TEXT,                            -- bound seats: the task is claimed on registration
+    task_id TEXT,                            -- bound seats claim their task at creation
     prd_id TEXT NOT NULL,
     parent_seat_id TEXT,                     -- who minted it → forms the agent tree
     minted_by TEXT NOT NULL,                 -- seat id or 'human'
-    credential_id TEXT,                      -- filled at registration
-    code_hash TEXT NOT NULL,                 -- one-time registration code, stored hashed
+    credential_id TEXT NOT NULL,
+    binding TEXT NOT NULL CHECK (binding IN ('process', 'connection')),
+                                             -- process: Arbiter launched it (v0.1); connection: attached MCP session (later)
+    code_hash TEXT,                          -- one-time attach code, only for 'connection' seats
     status TEXT NOT NULL CHECK (status IN ('minted', 'active', 'expired', 'revoked')),
-    expires_at DATETIME NOT NULL,            -- 30-min TTL to register; lease governs after
-    registered_at DATETIME,
+    code_expires_at DATETIME,                -- attach codes are short-lived (5 min)
+    lease_expires_at DATETIME,               -- renewed by supervisor observation, not by the model
     FOREIGN KEY(parent_seat_id) REFERENCES seats(id),
     FOREIGN KEY(credential_id) REFERENCES credentials(id)
 );
@@ -360,7 +368,7 @@ CREATE TABLE audit_log (
     prd_id TEXT,
     task_id TEXT,
     seat_id TEXT NOT NULL,                   -- 'human' or a seat id; the role is looked up via the seat
-    action TEXT NOT NULL,                    -- e.g. 'mint', 'register', 'submit', 'verdict', 'merge', 'outcome'
+    action TEXT NOT NULL,                    -- e.g. 'mint', 'launch', 'result', 'verdict', 'merge', 'outcome'
     payload_json TEXT NOT NULL,              -- hashes + summaries, never secrets or full transcripts
     prev_hash TEXT NOT NULL,
     entry_hash TEXT NOT NULL,                -- sha256(prev_hash || canonical(payload))
@@ -406,18 +414,19 @@ Every agent is a **seat** (§8.B). Seats are minted top-down, so each PRD run fo
 ```
 human (cred:human/Masked-Kunsiquat)
 └── PRD-004 lock (signed tag)
-    └── seat_r01  ringleader        cred:claude-code/claude-opus-5-5
+    └── PRD-004/ringleader.1         cred:claude-code/claude-opus-5-5 (launched)
         ├── TASK-101
-        │   ├── seat_w11  worker      attempt 1   (expired: autopsy)
-        │   ├── seat_w12  worker      attempt 2   ← author
-        │   ├── seat_a11  adversary
-        │   └── seat_j11  judge
+        │   ├── worker.1             (expired: autopsy)
+        │   ├── worker.2             ← author
+        │   ├── adversary.1          cred:claude-code/claude-sonnet-5 (launched)
+        │   └── judge.1
         └── TASK-102
-            ├── seat_w21  worker
-            ├── seat_a21  adversary
-            └── seat_j21  judge
+            ├── worker.1
+            ├── adversary.1
+            └── judge.1
 ```
 
+- Seat ids are readable paths plus a random suffix (`PRD-004/TASK-101/worker.2~7f3a`), so the ledger stays legible years later.
 - **Only the Ringleader seat or the human can mint seats.** A worker cannot mint an adversary or judge seat to review its own work. This restriction is the core of the no-self-grading guarantee.
 - **Independence:** the adversary and judge seats for a task must differ from the author seat, must not descend from it, and should use a different credential (a different model) where one is configured. Authorship is stored on the task (`author_seat_id`), so it outlives the worker's lease.
 - **Harness-internal subagents** (for example, Claude Code's own Task tool) run *inside* their parent's seat. Arbiter treats them as the same agent. The tree only contains seats Arbiter minted.
@@ -427,8 +436,8 @@ human (cred:human/Masked-Kunsiquat)
 | Role | Reads | Writes | Never |
 |---|---|---|---|
 | Human | Everything | PRD + amendments, HITL decisions, outcome overrides, Gate 3 | — |
-| Ringleader | PRD, code index, lesson summaries | Tasks, edges, specs, reservations, seats | Code, verdicts, outcomes |
-| Worker | Task spec, PRD invariants/boundaries, injected lessons, own prior-attempt autopsy | Code commit, heartbeats | Tests marked `@adversary`, `.arbiter/**`, outcomes |
+| Ringleader | PRD, code index, lesson summaries | Tasks, edges, specs, reservations, seat requests (the core mints them) | Code, verdicts, outcomes |
+| Worker | Task spec, PRD invariants/boundaries, injected lessons, own prior-attempt autopsy | Code commit + JSON result | Tests marked `@adversary`, `.arbiter/**`, outcomes |
 | Adversary | Task spec, PRD invariants, the worker's **diff** (not its transcript, to avoid anchoring), injected lessons | Attack-test commit, `catch` outcomes | Application code |
 | Judge | Spec, diff, attack results, disputes, injections, blast radius | Verdict, claim rulings, injection resolutions, root-cause summaries, Gate 1 activation | Code, tests |
 | Synthesizer (deterministic, no LLM) | Tier 1 fingerprints | Gate 1 candidates, precision warnings | Anything in the repo |
@@ -460,9 +469,9 @@ The core runs **one task at a time** in DAG order. Parallel dispatch is the Flee
                                                                         │
 ┌───────────────────────────────────────────────────────────────────────┘
 ▼
-2. Next 'ready' task in topological order; Ringleader mints worker/adversary/judge seats
+2. Next 'ready' task in topological order; worker/adversary/judge seats minted under the Ringleader
    ▼
-3. Worker (worktree slot, bound seat)
+3. Worker (worktree slot, process-bound seat)
    - Writes code + unit tests, submits commit
    - Submit-time diff check (boundaries, protected files) ──► reject if violated
    ▼
@@ -492,18 +501,18 @@ The core runs **one task at a time** in DAG order. Parallel dispatch is the Flee
 - Compiles the locked PRD into a DAG: tasks, `task_edges`, per-task reservation prefixes (each must fall within PRD boundaries), and `task_symbol_deps` (the existing symbols each task's spec relies on).
 - **Triage Scope Guard:** no task may reserve more than 3 files (or 1 directory prefix) or exceed ~15 minutes of estimated runtime. Ambiguous decompositions prompt the human.
 - **Injection:** assembles each task's context from PRD invariants, ranked Org Invariants and Project Lessons (§6.B).
-- **Interface drift / cascading invalidation:** after every merge, the supervisor diffs tree-sitter signature hashes of exported symbols. Any task in `backlog`/`ready` with a `task_symbol_deps` row whose hash changed is set to `stale`. The Ringleader regenerates its spec (`spec_revision += 1`) against the new code. This needs **no human signature** because the PRD is unchanged. A running task whose deps change is notified via its next heartbeat and must rebase before submitting. Only if the new spec would require touching files outside PRD boundaries or violate an invariant does the PRD move to `amendment_needed`.
+- **Interface drift / cascading invalidation:** after every merge, the supervisor diffs tree-sitter signature hashes of exported symbols. Any task in `backlog`/`ready` with a `task_symbol_deps` row whose hash changed is set to `stale`. The Ringleader regenerates its spec (`spec_revision += 1`) against the new code. This needs **no human signature** because the PRD is unchanged. Under Fleet, a task already running when its deps change must rebase before its result is accepted. Only if the new spec would require touching files outside PRD boundaries or violate an invariant does the PRD move to `amendment_needed`.
 
 ### 5.2 Reservations (single-lane)
 
 - The Ringleader declares each task's reservations: path prefixes inside the PRD boundaries.
 - In single-lane mode nothing competes for them. They define the scope that the submit-time diff check enforces.
-- **Mid-flight expansion:** the worker calls `arbiter_reserve`. The request is granted if the path is inside the PRD boundaries; otherwise the task goes to `amendment_needed`. Fleet-mode contention rules are in §12.
+- **Scope expansion (v0.1):** the worker ends its run with a structured `scope_request` in its result (§9.A). The core grants it if the paths are inside the PRD boundaries and re-runs the task with the enlarged reservation set; otherwise the PRD goes to `amendment_needed`. From v0.3, attached MCP sessions can call `arbiter_reserve` mid-run instead. Fleet-mode contention rules are in §12.
 
 ### 5.3 The Worker (Execution Sub-Process)
 
-- Runs in a worktree slot (§7) under a supervisor-managed process container.
-- Registers with a bound worker seat code (§8.B), which claims the task on first call. The Arbiter MCP tools (`heartbeat`, `reserve`, `submit`) act as that seat.
+- Runs in the worktree slot (§7) under a supervisor-managed process container.
+- Launched by the Runner with its seat already bound to the process (§8.B). It needs no Arbiter tools in v0.1: it edits files, commits, and exits with a result (§9.A).
 - **Submit-time diff check (the real boundary):** `git diff --name-only <base_commit>..<submit_commit>` must be a subset of the task's reservations and must not touch `.arbiter/**` or any adversary test file (`**/*.adversary.test.*` or files carrying an `@adversary` marker). A violation rejects the submission deterministically, whatever tools the harness used to produce it.
 
 ### 5.4 The Adversarial Reviewer & Attack Validation Protocol
@@ -680,8 +689,9 @@ Fresh worktrees per task would mean `npm install` / `cargo build` every time. In
 
 ### Liveness & Leases
 
-- Liveness = process alive **and** activity (stdout or worktree fs writes) within the last 120s. Harnesses that do not call the heartbeat tool still work.
-- Standard lease: 15 minutes. `heartbeat({status: "running_integration_tests"})` extends it, up to an absolute ceiling (default 60 minutes).
+- Liveness = process alive **and** activity (stdout or worktree fs writes) within the last 120s. The supervisor observes this itself; the model never has to heartbeat.
+- Standard lease: 15 minutes, renewed automatically while the process is live and active, up to an absolute ceiling (default 60 minutes). Test runs launched by the Runner pause the lease clock.
+- **Expiry kills, it doesn't error.** When a lease ends, the supervisor terminates the process and runs the autopsy. The model is never handed an "expired" error it might try to work around.
 - `awaiting_human` freezes all timers.
 
 ### Automated Crash Autopsy
@@ -706,24 +716,30 @@ Everything runs locally as one OS user. Any process running as that user can rea
 1. *Agent overreach:* scope creep, editing tests to pass, touching the PRD, self-grading. Enforced by submit-time diff checks, planner-only seat minting, and role-restricted outcome authoring.
 2. *Confused or prompt-injected agents* acting outside their role through Arbiter's own APIs. Seats are role- and task-bound and expire with the lease.
 3. *After-the-fact tampering* with history, attribution, or the outcome ledger: hash-chained ledger, signed commits and tags.
+4. *A compromised or remote core forging your approval:* the core never holds your key; human signatures are always produced client-side (§8.C).
 
 **Not defended against (through v0.3):** a malicious process with the user's privileges, or an agent using its harness shell to exfiltrate data or damage files outside the repo. Real containment needs an OS sandbox (container, Windows Sandbox, bubblewrap, Seatbelt). That is future work (§11).
 
 ### 8.B Agent Identity: Credentials & Seats
 
-v1's per-agent ephemeral Ed25519 keypairs are **removed**. The supervisor held every private key, so a signature only proved which IPC connection asked for it. Identity is modeled on Graphban's credentials and seats instead:
+v1's per-agent ephemeral Ed25519 keypairs are **removed**. The supervisor held every private key, so a signature only proved which IPC connection asked for it. Identity follows Graphban's credentials-and-seats shape, with one important change: **identity never passes through the model.** Graphban puts the seat code in the agent's instructions and relies on the model calling `register_agent` with it. That makes identity probabilistic: the model can forget, mistype, re-register, or lose the code to context compaction.
 
-- **Credential:** a long-lived API key per (harness, model), e.g. `cred:claude-code/claude-opus-5-5`, plus one for the human. It is created once and records which roles it is eligible for. Only a hash is stored. Credentials answer *"what kind of agent is this?"*
-- **Seat:** an ephemeral, single-use, role-bound identity minted for one task, e.g. `seat_w12` = worker for TASK-101, attempt 2. It is minted with a one-time code (30-minute TTL to register). Registering with the code binds the seat to a credential and claims the task in the same transaction. Seats answer *"who did this, in what role, under whom?"*
-- **Minting rule:** only the Ringleader seat or the human can mint. Workers, adversaries, and judges cannot. Every seat records `parent_seat_id`, which is how the agent tree in §5.0 is built.
-- **Delivery:** the seat code reaches the harness as part of its launch prompt / MCP registration argument, not as ambient config. Harness-internal subagents inherit it.
-- **Expiry:** a seat stops authorizing calls when its lease ends. Its id stays in the ledger permanently. Secrets (credential keys, seat codes) never enter the ledger or the repo.
-- **Supervisor key:** one SSH signing key in `~/.config/arbiter/` (optionally the OS keychain). It signs `audit_log` entries and the task-level commits described in §8.D.
-- **Hash chain:** each `audit_log.entry_hash` covers the previous one, so deleting or editing any past entry is detectable.
+- **Credential:** what kind of agent this is, e.g. `cred:claude-code/claude-opus-5-5`, plus one for the human. For agents Arbiter launches, a credential is a **descriptor, not a secret**: the Runner knows which harness and `--model` it started, so `model_provenance = launched`. Secrets exist only for sessions attached from outside (v0.3+), whose model name is `claimed`.
+- **Seat:** an ephemeral, role-bound identity for one task, e.g. `PRD-004/TASK-101/worker.2~7f3a`. It answers *"who did this, in what role, under whom?"*
+- **Binding:**
+  - `process` (v0.1): the Runner launches the harness for the seat. Every git commit and result from that process belongs to the seat. There is no token for the model to see, leak, or lose.
+  - `connection` (v0.3+, MCP): the Runner writes a per-seat MCP config for the harness it launches, with the seat token in an env var (stdio) or `Authorization` header (HTTP). The token authenticates every call and never enters the prompt. For a session you attach by hand, you run `arbiter seat attach`, which prints a one-time code (5-minute TTL) to put in *your* MCP config, not in a prompt.
+- **Minting rule:** only the Ringleader seat or the human can request seats; the core mints them. Workers, adversaries, and judges cannot. Every seat records `parent_seat_id`, which is how the agent tree in §5.0 is built.
+- **Role-filtered tools:** when MCP arrives, `tools/list` returns only the seat's role's tools. A worker never sees `verdict`, so it can't waste turns trying it.
+- **Leases:** codes expire fast (they're used immediately); the seat's lease is renewed by supervisor observation (§7). On expiry the process is killed. Seat ids stay in the ledger permanently. Secrets (attach codes, tokens) never enter the ledger or the repo.
+- **Supervisor key:** one SSH signing key held by the core (`~/.config/arbiter/`, optionally the OS keychain). It signs ledger entries and the task-level commits described in §8.D.
+- **Hash chain:** each ledger `entry_hash` covers the previous one, so deleting or editing any past entry is detectable.
 
 ### 8.C Human Signatures (git-native, minimal prompts)
 
 Human authority uses git's native SSH signing (`git config gpg.format ssh`, `user.signingkey`, an `allowed_signers` file) and `ssh-keygen -Y sign/verify`. It works with ssh-agent, YubiKeys, and 1Password's SSH agent.
+
+**Signing is always client-side.** The core never holds your key. It prepares the object to sign (tag, merge commit, promotion manifest), your CLI signs it locally, and sends the signature back. This works the same whether the core is on your laptop or a server (§10).
 
 Signatures are required **only** for:
 
@@ -747,9 +763,9 @@ auth: rotate refresh tokens on /auth/refresh
 
 Arbiter-PRD: PRD-004@v1 (tag arbiter/prd/PRD-004/v1)
 Arbiter-Task: TASK-101 (spec rev 2)
-Arbiter-Worker: seat_w12 cred:claude-code/claude-opus-5-5
-Arbiter-Adversary: seat_a11 cred:claude-code/claude-sonnet-5 (5 attacks, 0 upheld)
-Arbiter-Judge: seat_j11 cred:claude-code/claude-opus-5-5 (verdict: low-risk)
+Arbiter-Worker: PRD-004/TASK-101/worker.2~7f3a cred:claude-code/claude-opus-5-5 (launched)
+Arbiter-Adversary: PRD-004/TASK-101/adversary.1~b20c cred:claude-code/claude-sonnet-5 (5 attacks, 0 upheld)
+Arbiter-Judge: PRD-004/TASK-101/judge.1~e91d cred:claude-code/claude-opus-5-5 (verdict: low-risk)
 Arbiter-Approved-By: human:Masked-Kunsiquat
 Arbiter-Ledger: .arbiter/ledger/PRD-004.jsonl#seq=148 sha256:9c1e...
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
@@ -767,7 +783,24 @@ The signature covers the trailers, so attribution can't be edited without breaki
 
 ---
 
-## 9. User Interface & CLI / TUI Design
+## 9. Interfaces
+
+### 9.A Agent I/O Contract (v0.1, no MCP)
+
+In v0.1 agents talk to Arbiter only through their process and git. The Runner launches each harness headless (e.g. `claude -p --model <m> --output-format json`) with the role prompt, and reads the result when it exits:
+
+| Role | Input (prompt) | Output |
+|---|---|---|
+| Ringleader | PRD, code index summary, lesson summaries | JSON: tasks, edges, reservations, symbol deps (schema-validated) |
+| Worker | Task spec, invariants, boundaries, injected lessons, prior autopsy | Commit(s) in the slot + JSON result: `{status, summary, scope_request?}` |
+| Adversary | Task spec, invariants, worker diff, injected lessons | Attack-test commit + JSON: `{attacks: [{test_id, targets}]}` |
+| Judge | Evidence bundle | JSON: verdict, claim rulings, injection resolutions, root-cause summaries |
+
+- Every JSON result is validated against a schema. Invalid output → one retry with the validation error, then autopsy.
+- There is no `submit` or `heartbeat` tool. Submitting is exiting; liveness is observed (§7).
+- MCP (v0.3+) adds mid-run tools (`reserve`, `get_context`, `ask_judge`) and attached interactive sessions, using `connection` binding (§8.B). The I/O contract above stays valid; MCP is an addition, not a replacement.
+
+### 9.B Human Interface
 
 Built as a single terminal binary with no web dashboard.
 
@@ -796,6 +829,8 @@ Built as a single terminal binary with no web dashboard.
 - `arbiter prd review <prd-id>` — full integration pass, then signed merge into main.
 - `arbiter run <prd-id>` — Ringleader decomposition and DAG dispatch.
 - `arbiter tasks` — tasks, DAG status, seat tree, leases, reservations.
+- `arbiter seats [<prd-id>]` — print the agent tree with roles, credentials, and outcomes.
+- `arbiter seat attach --role <role> --task <task-id>` — (v0.3+) mint a connection seat for a session you run yourself.
 - `arbiter review <task-id>` — diff viewer with HITL prompt.
 - `arbiter lesson list [--injections]` — lessons with U, P, and outcome counts.
 - `arbiter lesson outcome <id> --<catch|miss|contradiction> --task <task-id> -m "<reason>"` — human override for one (lesson, task).
@@ -803,17 +838,52 @@ Built as a single terminal binary with no web dashboard.
 - `arbiter org promote [<id>... | --all-staged]` — sign one manifest and promote.
 - `arbiter audit verify` — verify the ledger hash chains against the signed commit trailers.
 - `arbiter prune` — reset dead worktree slots, orphaned branches, dangling reservations.
+- `arbiter serve` — (later) run core + runner headless on a server; clients connect over SSH (§10).
 
 ---
 
-## 10. Technology Stack
+## 10. Architecture, Deployment & Technology Stack
 
-- **Core language: Go.** Chosen over TypeScript because Windows Job Objects (`golang.org/x/sys/windows`), POSIX process groups, and single static binary distribution are all native. From Node, Job Objects would need a native addon. TUI via bubbletea.
+### 10.A Core / Runner / Client
+
+```
+┌──────────── Client ────────────┐      ┌──────────────── Core ─────────────────┐
+│ CLI / TUI                      │ API  │ SQLite, seats, ledger, gates,         │
+│ Signs with YOUR key, locally   │─────►│ supervisor key. The only authority.   │
+└────────────────────────────────┘      └───────────────────┬───────────────────┘
+                                                            │ asks
+                                        ┌───────────────────▼───────────────────┐
+                                        │ Runner (no authority)                 │
+                                        │ worktree slot(s), process supervisor, │
+                                        │ harness launch, test execution        │
+                                        └───────────────────────────────────────┘
+```
+
+- **Core** holds all authority. Only the core writes to the database or mints seats.
+- **Runner** starts, watches, and reaps processes and runs tests. It cannot mint, approve, or merge. The Fleet spawner (§12) is a Runner extension.
+- **Clients** only use the core's API; they never open the database directly. That rule is what makes remote deployment possible later without a rewrite.
+
+### 10.B Deployment Modes
+
+| Mode | Where things run | When |
+|---|---|---|
+| **Local (default, v0.1)** | One binary on your laptop; core, runner, and client in one process; API over a named pipe (Windows) or Unix socket | Single lane. Arbiter itself is light; the load is one harness plus one test run. |
+| **Home server (later)** | `arbiter serve` in an LXC/VM. Repo and worktrees live on the server; you edit via VS Code Remote-SSH; the laptop is a thin client. | Fleet, heavy builds (Gradle, emulators), or a laptop that's struggling. |
+| **Split runners (maybe never)** | Core in one place, runners on other machines | Only if a real need appears. |
+
+Remote-access rules, decided now so the server mode stays simple:
+- **Transport is SSH** (or Tailscale), e.g. `ssh box arbiter tasks`, the way git works. Human authentication reuses your SSH keys; there is no separate human API-key system and no built-in public HTTP listener. Internet exposure, if ever wanted, is a reverse proxy's job.
+- **One binary, one port** (for MCP over HTTP, when enabled). There's no separate web UI process to collide with. Startup fails loudly on a port conflict or invalid config.
+- **Human signing stays on the client** (§8.C).
+
+### 10.C Technology Stack
+
+- **Core language: Go.** Windows Job Objects (`golang.org/x/sys/windows`), POSIX process groups, and single static binary distribution are all native. From Node, Job Objects would need a native addon. TUI via bubbletea.
 - **Database:** SQLite (WAL, FTS5) via `modernc.org/sqlite` (pure Go, no cgo, easier cross-compile).
 - **Code intelligence:** Tree-sitter for symbol extraction, signature hashing, and blast radius.
-- **Harness integration:** Arbiter exposes an MCP server (`heartbeat`, `reserve`, `submit`, `get_context`). Harnesses are launched headless (e.g. `claude -p`), but enforcement never depends on the harness calling these tools (§5.3).
+- **Harness integration:** headless launch with the §9.A I/O contract in v0.1. An MCP server (stdio + HTTP) arrives in v0.3 with connection-bound seats and role-filtered tools. Enforcement never depends on the harness calling Arbiter tools (§5.3).
 - **Embeddings (v0.3, optional):** local `bge-small` / `nomic-embed-text` via ONNX Runtime, applied to root-cause summaries only.
-- **Crypto:** Go stdlib `crypto/ed25519` for the supervisor key; OpenSSH / `ssh-keygen -Y` and git SSH signing for humans.
+- **Crypto:** Go stdlib `crypto/ed25519` / SSH signing for the supervisor key; OpenSSH / `ssh-keygen -Y` and git SSH signing for humans, client-side.
 - **VCS:** Git CLI via sub-process (`git worktree`, `git commit -S`, `git interpret-trailers`, `git tag -s`).
 
 ---
@@ -824,10 +894,11 @@ Build in this order. Each stage should be usable on its own.
 
 | Stage | Scope | Explicitly deferred |
 |---|---|---|
-| **v0.1: Single lane** | One PRD, tasks run **sequentially** in DAG order, one worktree slot. Credentials + seats + agent tree. Worker → Adversary (Attack Validation Protocol) → Judge → integration gate. Submit-time diff check. Signed PRD lock tag, supervisor-signed task commits with trailers, committed ledger, signed final merge. Windows + Linux supervisor. Tier 1 autopsies. CLI only. One harness (Claude Code headless). | Lessons, TUI, org tier, Fleet |
+| **v0.1: Single lane** | One PRD, tasks run **sequentially** in DAG order, one worktree slot, local mode. Credentials + process-bound seats + agent tree. Worker → Adversary (Attack Validation Protocol) → Judge → integration gate, via the §9.A I/O contract. Submit-time diff check. Signed PRD lock tag, supervisor-signed task commits with trailers, committed ledger, client-signed final merge. Windows + Linux supervisor. Tier 1 autopsies. CLI only. One harness (Claude Code headless). | MCP, lessons, TUI, org tier, server mode, Fleet |
 | **v0.2: Memory** | Fingerprinting, Gate 1, `lesson_injections`, Judge outcome resolution, U and P, ranking + token budget, circuit breaker, symbol-drift staleness + re-spec. | Org tier, embeddings |
-| **v0.3: Polish** | TUI (agent tree view), Tier 3 org promotion, `audit verify`, summary embeddings, additional harnesses. | |
-| **Fleet (power users)** | See §12. | |
+| **v0.3: Connect & polish** | MCP server (connection-bound seats, role-filtered tools, `seat attach`), TUI with agent tree view, Tier 3 org promotion, `audit verify`, summary embeddings, additional harnesses. | |
+| **Server mode** | `arbiter serve`, SSH transport, client-side signing over the wire. | |
+| **Fleet (power users)** | See §12. Pairs naturally with server mode. | |
 | **Later** | OS-level sandboxing, macOS shim. | |
 
 Sequential execution sidesteps deadlocks, semantic merge conflicts, and worktree contention entirely. Build Fleet only once the single-lane loop has shown it produces better code than one agent working alone.
@@ -836,7 +907,7 @@ Sequential execution sidesteps deadlocks, semantic merge conflicts, and worktree
 
 ## 12. Fleet (Parallel Execution, deferred)
 
-An opt-in module (`arbiter run --fleet N`). **The Fleet spawner holds no authority of its own.** It cannot mint seats, approve work, or merge. It spawns, waits, and reaps processes, and asks the core for everything else. This keeps every core guarantee unchanged under parallelism. The schema already supports it (`reservations`, `worktree_slot`, `task_edges`), so no migration is needed.
+An opt-in module (`arbiter run --fleet N`), realistically run in server mode (§10.B). **The Fleet spawner is a Runner extension and holds no authority of its own.** It cannot mint seats, approve work, or merge. It spawns, waits, and reaps processes, and asks the core for everything else. This keeps every core guarantee unchanged under parallelism. The schema already supports it (`reservations`, `worktree_slot`, `task_edges`), so no migration is needed.
 
 **Scheduling & reservations (deadlock freedom)**
 - A task is dispatched only if it is `ready`, a pool slot is free, and its whole reservation set can be acquired **atomically** (one SQLite transaction, all or nothing). No task holds some reservations while waiting for others, so circular wait is impossible.
@@ -856,3 +927,14 @@ After each wave, the spawner reports:
 - changes outside declared reservations (already rejected by the diff check, but surfaced for tuning)
 - how far the feature branch moved while each task ran, which predicts rebase pain
 - tasks marked `stale` by symbol drift
+
+---
+
+## 13. Building Arbiter with Arbiter (Bootstrap Rule)
+
+Arbiter will eventually be used to develop itself. That creates a specific risk: a bug in a gate could approve the "fix" for that same bug.
+
+- **Gate code is human-owned.** The diff check, attack validation, integration gate, seat minting, ledger, and signing live in a protected path (e.g. `internal/gate/**`, `internal/ledger/**`). Agents may *propose* changes there, but every such change goes to `awaiting_human` regardless of blast radius and needs real tests.
+- **Dogfood with a pinned binary.** When Arbiter works on its own repo, it runs a pinned, known-good release (`stage0`), never the build under change. Promote a new stage0 only after it has passed CI and some real use. Compilers bootstrap the same way.
+- **Main stays green.** Nothing merges to `main` unless CI passes, which is exactly the rule Arbiter enforces on everyone else.
+- **Config is validated at startup.** Port conflicts, missing keys, or bad paths fail loudly instead of producing a half-working install.
