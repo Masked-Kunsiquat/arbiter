@@ -13,8 +13,7 @@ linters:
   enable:
     # correctness
     - govet
-    - staticcheck
-    - unused
+    - staticcheck # includes unused, gosimple, stylecheck in v2
     - errcheck
     - errorlint
     - nilerr
