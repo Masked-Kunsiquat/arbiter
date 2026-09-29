@@ -143,3 +143,85 @@ func TestLoadOrGenerate_PublicKeySize(t *testing.T) {
 		t.Errorf("public key size = %d, want %d", len(edPub), ed25519.PublicKeySize)
 	}
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Fixes from CodeRabbit review on PR #42: permission check on load, atomic
+// publish on generate.
+// ─────────────────────────────────────────────────────────────────────────────
+
+func TestLoadOrGenerate_RejectsLooseExistingPermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX file mode bits are not meaningful on Windows")
+	}
+	dir := t.TempDir()
+	configDir := filepath.Join(dir, "arbiter")
+
+	// Generate a real key first, then loosen its permissions to simulate an
+	// accidentally-widened umask or a key copied in from elsewhere.
+	if _, err := supervisorkey.LoadOrGenerate(configDir); err != nil {
+		t.Fatalf("LoadOrGenerate: %v", err)
+	}
+	keyPath := filepath.Join(configDir, supervisorkey.FileName)
+	if err := os.Chmod(keyPath, 0o644); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+
+	if _, err := supervisorkey.LoadOrGenerate(configDir); err == nil {
+		t.Fatal("expected error loading a key file with group/other permissions, got nil")
+	}
+}
+
+func TestLoadOrGenerate_ConcurrentGenerate_SameKeyWins(t *testing.T) {
+	// Two "processes" racing LoadOrGenerate on a fresh config dir must agree
+	// on one key, never each publish their own and silently diverge.
+	dir := t.TempDir()
+	configDir := filepath.Join(dir, "arbiter")
+
+	type result struct {
+		pub []byte
+		err error
+	}
+	results := make(chan result, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			signer, err := supervisorkey.LoadOrGenerate(configDir)
+			if err != nil {
+				results <- result{nil, err}
+				return
+			}
+			results <- result{signer.PublicKey().Marshal(), nil}
+		}()
+	}
+
+	r1, r2 := <-results, <-results
+	if r1.err != nil {
+		t.Fatalf("goroutine 1: %v", r1.err)
+	}
+	if r2.err != nil {
+		t.Fatalf("goroutine 2: %v", r2.err)
+	}
+	if !bytes.Equal(r1.pub, r2.pub) {
+		t.Error("expected both concurrent callers to agree on the same published key")
+	}
+}
+
+func TestLoadOrGenerate_NoTempFilesLeftBehind(t *testing.T) {
+	dir := t.TempDir()
+	configDir := filepath.Join(dir, "arbiter")
+
+	if _, err := supervisorkey.LoadOrGenerate(configDir); err != nil {
+		t.Fatalf("LoadOrGenerate: %v", err)
+	}
+
+	entries, err := os.ReadDir(configDir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name() != supervisorkey.FileName {
+		names := make([]string, len(entries))
+		for i, e := range entries {
+			names[i] = e.Name()
+		}
+		t.Errorf("configDir contents = %v, want only %q", names, supervisorkey.FileName)
+	}
+}

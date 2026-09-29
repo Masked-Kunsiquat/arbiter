@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 
 	"golang.org/x/crypto/ssh"
 )
@@ -42,40 +43,105 @@ const FileName = "supervisor_ed25519"
 func LoadOrGenerate(configDir string) (ssh.Signer, error) {
 	path := filepath.Join(configDir, FileName)
 
-	data, err := os.ReadFile(path)
+	info, err := os.Stat(path)
 	switch {
 	case err == nil:
-		signer, perr := ssh.ParsePrivateKey(data)
-		if perr != nil {
-			return nil, fmt.Errorf("supervisorkey: parsing %s: %w", path, perr)
+		if err := checkPermissions(info); err != nil {
+			return nil, err
 		}
-		if signer.PublicKey().Type() != ssh.KeyAlgoED25519 {
-			return nil, fmt.Errorf("supervisorkey: %s is a %s key, want ed25519", path, signer.PublicKey().Type())
-		}
-		return signer, nil
+		return loadKey(path)
 	case errors.Is(err, os.ErrNotExist):
 		return generateAndSave(configDir, path)
 	default:
-		return nil, fmt.Errorf("supervisorkey: reading %s: %w", path, err)
+		return nil, fmt.Errorf("supervisorkey: stat %s: %w", path, err)
 	}
 }
 
+// checkPermissions rejects a key file that grants group or other access.
+// This is a courtesy on top of the threat model in §8.A (any process running
+// as the same OS user can already read local files regardless), but it
+// catches an accidentally-loosened umask or a key copied in from elsewhere
+// with the wrong mode.
+func checkPermissions(info os.FileInfo) error {
+	if runtime.GOOS == "windows" {
+		// POSIX mode bits aren't meaningful on Windows; ACLs would be the
+		// real check, and the threat model here is already best-effort on
+		// this platform (see the package doc comment).
+		return nil
+	}
+	if perm := info.Mode().Perm(); perm&0o077 != 0 {
+		return fmt.Errorf("supervisorkey: key file has group/other permissions %o, want 0600 or stricter", perm)
+	}
+	return nil
+}
+
+func loadKey(path string) (ssh.Signer, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("supervisorkey: reading %s: %w", path, err)
+	}
+	signer, err := ssh.ParsePrivateKey(data)
+	if err != nil {
+		return nil, fmt.Errorf("supervisorkey: parsing %s: %w", path, err)
+	}
+	if signer.PublicKey().Type() != ssh.KeyAlgoED25519 {
+		return nil, fmt.Errorf("supervisorkey: %s is a %s key, want ed25519", path, signer.PublicKey().Type())
+	}
+	return signer, nil
+}
+
+// generateAndSave creates a fresh key and publishes it to path without ever
+// replacing a file that's already there: it writes to a temp file in the
+// same directory, then links the temp file onto path (os.Link fails if path
+// already exists, and never leaves a partial file at path either way). If
+// another process wins the race and publishes first, this loads and returns
+// that file's key instead of the one just generated here.
 func generateAndSave(configDir, path string) (ssh.Signer, error) {
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		return nil, fmt.Errorf("supervisorkey: creating %s: %w", configDir, err)
+	}
+
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		return nil, fmt.Errorf("supervisorkey: generating key: %w", err)
 	}
-
 	block, err := ssh.MarshalPrivateKey(priv, "arbiter-supervisor")
 	if err != nil {
 		return nil, fmt.Errorf("supervisorkey: marshaling key: %w", err)
 	}
 
-	if err := os.MkdirAll(configDir, 0o700); err != nil {
-		return nil, fmt.Errorf("supervisorkey: creating %s: %w", configDir, err)
+	tmp, err := os.CreateTemp(configDir, ".supervisor_ed25519.tmp-*")
+	if err != nil {
+		return nil, fmt.Errorf("supervisorkey: creating temp key file: %w", err)
 	}
-	if err := os.WriteFile(path, pem.EncodeToMemory(block), 0o600); err != nil {
-		return nil, fmt.Errorf("supervisorkey: writing %s: %w", path, err)
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath) // no-op once the link below succeeds and nothing references tmpPath's name anymore
+
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return nil, fmt.Errorf("supervisorkey: setting permissions on %s: %w", tmpPath, err)
+	}
+	if _, err := tmp.Write(pem.EncodeToMemory(block)); err != nil {
+		tmp.Close()
+		return nil, fmt.Errorf("supervisorkey: writing %s: %w", tmpPath, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return nil, fmt.Errorf("supervisorkey: closing %s: %w", tmpPath, err)
+	}
+
+	if err := os.Link(tmpPath, path); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			// Someone else published first; use their key, not ours.
+			info, statErr := os.Stat(path)
+			if statErr != nil {
+				return nil, fmt.Errorf("supervisorkey: %s appeared but could not be read: %w", path, statErr)
+			}
+			if err := checkPermissions(info); err != nil {
+				return nil, err
+			}
+			return loadKey(path)
+		}
+		return nil, fmt.Errorf("supervisorkey: publishing %s: %w", path, err)
 	}
 
 	signer, err := ssh.NewSignerFromKey(priv)

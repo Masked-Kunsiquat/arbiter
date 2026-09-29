@@ -477,3 +477,122 @@ func must(t *testing.T, err error) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Minting rule: RingleaderSeatID must refer to a real, live ringleader seat
+// for the requested PRD, and ParentSeatID must actually be that seat or one
+// of its descendants (CodeRabbit review on PR #42).
+// ─────────────────────────────────────────────────────────────────────────────
+
+func TestMintSeat_RejectsFabricatedRingleaderSeatID(t *testing.T) {
+	raw := openDB(t)
+	seedPRDAndTask(t, raw, "PRD-001", "TASK-001")
+	registerAgentCred(t, raw, "cred:w", seat.RoleWorker)
+
+	_, err := seat.MintSeat(context.Background(), raw, seat.Minter{RingleaderSeatID: "not-a-real-seat"}, seat.MintRequest{
+		Role: seat.RoleWorker, PRDID: "PRD-001", TaskID: "TASK-001",
+		ParentSeatID: "not-a-real-seat", CredentialID: "cred:w", Binding: seat.BindingProcess,
+	})
+	if err == nil {
+		t.Fatal("expected error minting under a fabricated ringleader seat id, got nil")
+	}
+}
+
+func TestMintSeat_RejectsRingleaderFromWrongPRD(t *testing.T) {
+	raw := openDB(t)
+	seedPRDAndTask(t, raw, "PRD-001", "TASK-001")
+	seedPRDAndTask(t, raw, "PRD-002", "")
+	rlOther := mintRingleaderSeat(t, raw, "PRD-002")
+	registerAgentCred(t, raw, "cred:w", seat.RoleWorker)
+
+	_, err := seat.MintSeat(context.Background(), raw, seat.Minter{RingleaderSeatID: rlOther}, seat.MintRequest{
+		Role: seat.RoleWorker, PRDID: "PRD-001", TaskID: "TASK-001",
+		ParentSeatID: rlOther, CredentialID: "cred:w", Binding: seat.BindingProcess,
+	})
+	if err == nil {
+		t.Fatal("expected error minting for PRD-001 under a PRD-002 ringleader, got nil")
+	}
+}
+
+func TestMintSeat_RejectsClosedRingleader(t *testing.T) {
+	raw := openDB(t)
+	seedPRDAndTask(t, raw, "PRD-001", "TASK-001")
+	rlID := mintRingleaderSeat(t, raw, "PRD-001")
+	must(t, seat.Transition(context.Background(), raw, rlID, seat.StatusActive))
+	must(t, seat.Transition(context.Background(), raw, rlID, seat.StatusClosed))
+	registerAgentCred(t, raw, "cred:w", seat.RoleWorker)
+
+	_, err := seat.MintSeat(context.Background(), raw, seat.Minter{RingleaderSeatID: rlID}, seat.MintRequest{
+		Role: seat.RoleWorker, PRDID: "PRD-001", TaskID: "TASK-001",
+		ParentSeatID: rlID, CredentialID: "cred:w", Binding: seat.BindingProcess,
+	})
+	if err == nil {
+		t.Fatal("expected error minting under a closed ringleader seat, got nil")
+	}
+}
+
+func TestMintSeat_RejectsParentNotDescendantOfMinter(t *testing.T) {
+	raw := openDB(t)
+	seedPRDAndTask(t, raw, "PRD-001", "TASK-001")
+	rl1 := mintRingleaderSeat(t, raw, "PRD-001")
+	registerAgentCred(t, raw, "cred:w", seat.RoleWorker)
+
+	// A worker seat under a different (fabricated) parent that rl1 did not mint.
+	_, err := seat.MintSeat(context.Background(), raw, seat.Minter{RingleaderSeatID: rl1}, seat.MintRequest{
+		Role: seat.RoleWorker, PRDID: "PRD-001", TaskID: "TASK-001",
+		ParentSeatID: "some-unrelated-seat", CredentialID: "cred:w", Binding: seat.BindingProcess,
+	})
+	if err == nil {
+		t.Fatal("expected error minting with a parent unrelated to the minting ringleader, got nil")
+	}
+}
+
+func TestMintSeat_AllowsGrandchildParentage(t *testing.T) {
+	// Judge disputes mint a fresh judge seat (§5.4); the ringleader itself
+	// remains the minter, but the new seat's parent can be any seat the
+	// ringleader is the ancestor of, not only the ringleader directly.
+	raw := openDB(t)
+	seedPRDAndTask(t, raw, "PRD-001", "TASK-001")
+	rlID := mintRingleaderSeat(t, raw, "PRD-001")
+	registerAgentCred(t, raw, "cred:w", seat.RoleWorker)
+	registerAgentCred(t, raw, "cred:j", seat.RoleJudge)
+
+	workerID, err := seat.MintSeat(context.Background(), raw, seat.Minter{RingleaderSeatID: rlID}, seat.MintRequest{
+		Role: seat.RoleWorker, PRDID: "PRD-001", TaskID: "TASK-001",
+		ParentSeatID: rlID, CredentialID: "cred:w", Binding: seat.BindingProcess,
+	})
+	if err != nil {
+		t.Fatalf("mint worker: %v", err)
+	}
+
+	_, err = seat.MintSeat(context.Background(), raw, seat.Minter{RingleaderSeatID: rlID}, seat.MintRequest{
+		Role: seat.RoleJudge, PRDID: "PRD-001", TaskID: "TASK-001",
+		ParentSeatID: workerID, CredentialID: "cred:j", Binding: seat.BindingProcess,
+	})
+	if err != nil {
+		t.Fatalf("expected grandchild parentage (judge under worker) to be allowed: %v", err)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Transition: concurrent status change is detected, not silently overwritten
+// (CodeRabbit review on PR #42).
+// ─────────────────────────────────────────────────────────────────────────────
+
+func TestTransition_DetectsConcurrentChange(t *testing.T) {
+	raw := openDB(t)
+	id := mintTestSeat(t, raw)
+	must(t, seat.Transition(context.Background(), raw, id, seat.StatusActive))
+
+	// Simulate a second actor closing the seat between another caller's read
+	// and write by closing it directly, then trying to apply a transition
+	// that was decided against the pre-close status.
+	must(t, seat.Transition(context.Background(), raw, id, seat.StatusClosed))
+
+	// A stale caller that decided "active -> expired" before the close above
+	// must not be able to silently stomp the closed status.
+	err := seat.Transition(context.Background(), raw, id, seat.StatusExpired)
+	if err == nil {
+		t.Fatal("expected error applying a transition against an already-changed status, got nil")
+	}
+}

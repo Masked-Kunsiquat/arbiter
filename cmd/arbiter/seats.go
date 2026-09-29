@@ -4,8 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"flag"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -38,14 +38,9 @@ type seatRow struct {
 // #15). This direct-read path is a stopgap to unblock the command, not the
 // final architecture.
 func runSeats(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("seats", flag.ContinueOnError)
-	stats := fs.Bool("stats", false, "add dismissed-attack and upheld-claim rates per credential")
-	if err := fs.Parse(args); err != nil {
+	stats, prdFilter, err := parseSeatsArgs(args)
+	if err != nil {
 		return err
-	}
-	var prdFilter string
-	if fs.NArg() > 0 {
-		prdFilter = fs.Arg(0)
 	}
 
 	dbPath, err := findStateDB()
@@ -68,11 +63,40 @@ func runSeats(ctx context.Context, args []string) error {
 	}
 
 	printTree(rows)
-	if *stats {
+	if stats {
 		fmt.Println()
 		fmt.Println("--stats: dismissed-attack and upheld-claim rates are not available yet (require issues #10, #11).")
 	}
 	return nil
+}
+
+// parseSeatsArgs accepts the optional PRD id and --stats in either order
+// (flag.FlagSet.Parse alone stops at the first non-flag argument, so
+// "arbiter seats PRD-001 --stats" would otherwise leave --stats unconsumed
+// and silently ignored). Any argument that isn't consumed as either the
+// single positional PRD id or a recognized flag is an error, including a
+// mistyped flag like "--stat".
+func parseSeatsArgs(args []string) (stats bool, prdFilter string, err error) {
+	var positional []string
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--stats", "-stats":
+			stats = true
+		default:
+			if strings.HasPrefix(args[i], "-") {
+				return false, "", fmt.Errorf("unknown flag %q", args[i])
+			}
+			positional = append(positional, args[i])
+		}
+	}
+	switch len(positional) {
+	case 0:
+	case 1:
+		prdFilter = positional[0]
+	default:
+		return false, "", fmt.Errorf("unexpected arguments: %v", positional[1:])
+	}
+	return stats, prdFilter, nil
 }
 
 // findStateDB locates .arbiter/state.db by walking up from the current
@@ -84,8 +108,14 @@ func findStateDB() (string, error) {
 	}
 	for {
 		candidate := filepath.Join(dir, ".arbiter", "state.db")
-		if _, err := os.Stat(candidate); err == nil {
+		_, err := os.Stat(candidate)
+		switch {
+		case err == nil:
 			return candidate, nil
+		case errors.Is(err, fs.ErrNotExist):
+			// keep walking up
+		default:
+			return "", fmt.Errorf("checking %s: %w", candidate, err)
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
@@ -133,17 +163,28 @@ func loadSeats(ctx context.Context, raw *sql.DB, prdFilter string) ([]seatRow, e
 
 // printTree renders seats as an indented tree by parent_seat_id, grouped and
 // sorted by PRD, mirroring the shape in spec §5.0.
+//
+// byID is built in its own pass before any row is classified as a root or a
+// child, so a --prd-id filter that excludes a parent seat doesn't silently
+// drop its children: a row whose parent isn't in the filtered set (because
+// the filter excluded it, not because it's truly a ringleader) still
+// renders, just as its own root, instead of vanishing.
 func printTree(rows []seatRow) {
-	byParent := map[string][]seatRow{}
-	var roots []seatRow
 	byID := map[string]seatRow{}
 	for _, r := range rows {
 		byID[r.id] = r
+	}
+
+	byParent := map[string][]seatRow{}
+	var roots []seatRow
+	for _, r := range rows {
 		if r.parentID.Valid && r.parentID.String != "" {
-			byParent[r.parentID.String] = append(byParent[r.parentID.String], r)
-		} else {
-			roots = append(roots, r)
+			if _, ok := byID[r.parentID.String]; ok {
+				byParent[r.parentID.String] = append(byParent[r.parentID.String], r)
+				continue
+			}
 		}
+		roots = append(roots, r)
 	}
 	sort.Slice(roots, func(i, j int) bool { return roots[i].id < roots[j].id })
 
@@ -170,8 +211,8 @@ func printNode(r seatRow, byParent map[string][]seatRow, depth int) {
 	if r.harness.Valid && r.model.Valid {
 		cred = fmt.Sprintf("%s (%s/%s)", r.credentialID, r.harness.String, r.model.String)
 	}
-	fmt.Printf("%s└── %s [%s]  %s  invocations=%d cost=$%.2f\n",
-		indent, label, r.status, cred, r.invocationCount, r.totalCostUSD)
+	fmt.Printf("%s└── %s [%s]  id=%s  %s  invocations=%d cost=$%.2f\n",
+		indent, label, r.status, r.id, cred, r.invocationCount, r.totalCostUSD)
 
 	children := byParent[r.id]
 	sort.Slice(children, func(i, j int) bool { return children[i].id < children[j].id })

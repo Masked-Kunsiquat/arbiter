@@ -58,6 +58,60 @@ func (m Minter) mintedBy() (string, error) {
 	}
 }
 
+// verifyRingleader checks that seatID is a real, currently-live ringleader
+// seat for prdID. mintedBy() only checks the shape of the Minter struct; a
+// caller could otherwise pass an arbitrary string as RingleaderSeatID and
+// have it accepted as the minting authority, defeating the minting rule
+// (§8.B) entirely.
+func verifyRingleader(ctx context.Context, db *sql.DB, seatID, prdID string) error {
+	var role, status, seatPRD string
+	err := db.QueryRowContext(ctx, `SELECT role, status, prd_id FROM seats WHERE id = ?`, seatID).
+		Scan(&role, &status, &seatPRD)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("seat: minting rule: ringleader seat %s does not exist", seatID)
+	}
+	if err != nil {
+		return fmt.Errorf("seat: verifying ringleader %s: %w", seatID, err)
+	}
+	if role != string(RoleRingleader) {
+		return fmt.Errorf("seat: minting rule: %s is not a ringleader seat", seatID)
+	}
+	if status != string(StatusMinted) && status != string(StatusActive) {
+		return fmt.Errorf("seat: minting rule: ringleader seat %s is %s, not minted or active", seatID, status)
+	}
+	if seatPRD != prdID {
+		return fmt.Errorf("seat: minting rule: ringleader seat %s belongs to %s, not %s", seatID, seatPRD, prdID)
+	}
+	return nil
+}
+
+// verifyParentage checks that parentSeatID is either minterSeatID itself or
+// one of its descendants in the seat tree (walking parent_seat_id upward).
+// Only the Ringleader seat mints, but every minted seat must record its true
+// place in the agent tree (§5.0); this stops a Ringleader from minting a
+// seat and attributing it to a different, unrelated seat as parent.
+func verifyParentage(ctx context.Context, db *sql.DB, minterSeatID, parentSeatID string) error {
+	current := parentSeatID
+	for depth := 0; depth < 64; depth++ { // bound: the agent tree is shallow; this guards against a corrupt cycle
+		if current == minterSeatID {
+			return nil
+		}
+		var parent sql.NullString
+		err := db.QueryRowContext(ctx, `SELECT parent_seat_id FROM seats WHERE id = ?`, current).Scan(&parent)
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("seat: minting rule: parent_seat_id %s does not exist", current)
+		}
+		if err != nil {
+			return fmt.Errorf("seat: verifying parentage of %s: %w", parentSeatID, err)
+		}
+		if !parent.Valid {
+			break
+		}
+		current = parent.String
+	}
+	return fmt.Errorf("seat: minting rule: parent_seat_id %s is not the minting ringleader %s or one of its descendants", parentSeatID, minterSeatID)
+}
+
 // MintRequest describes a seat to be minted.
 type MintRequest struct {
 	Role         Role
@@ -94,6 +148,16 @@ func MintSeat(ctx context.Context, db *sql.DB, by Minter, req MintRequest) (stri
 	}
 	if req.Binding != BindingProcess && req.Binding != BindingConnection {
 		return "", fmt.Errorf("seat: invalid binding %q", req.Binding)
+	}
+	if by.RingleaderSeatID != "" {
+		if err := verifyRingleader(ctx, db, by.RingleaderSeatID, req.PRDID); err != nil {
+			return "", err
+		}
+		if req.ParentSeatID != "" {
+			if err := verifyParentage(ctx, db, by.RingleaderSeatID, req.ParentSeatID); err != nil {
+				return "", err
+			}
+		}
 	}
 
 	cred, err := loadCredential(ctx, db, req.CredentialID)
@@ -227,9 +291,20 @@ func Transition(ctx context.Context, db *sql.DB, seatID string, to Status) error
 	if !valid {
 		return fmt.Errorf("seat: %s: invalid transition %s -> %s", seatID, current, to)
 	}
-	_, err = db.ExecContext(ctx, `UPDATE seats SET status = ? WHERE id = ?`, string(to), seatID)
+	// The WHERE clause re-checks status = current so a concurrent transition
+	// between the read above and this write can't be silently overwritten;
+	// RowsAffected == 0 means someone else moved the seat first.
+	res, err := db.ExecContext(ctx, `UPDATE seats SET status = ? WHERE id = ? AND status = ?`,
+		string(to), seatID, string(current))
 	if err != nil {
 		return fmt.Errorf("seat: transitioning %s to %s: %w", seatID, to, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("seat: transitioning %s to %s: %w", seatID, to, err)
+	}
+	if n == 0 {
+		return fmt.Errorf("seat: %s: status changed concurrently, retry", seatID)
 	}
 	return nil
 }
