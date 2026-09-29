@@ -2,6 +2,7 @@ package config_test
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/Masked-Kunsiquat/arbiter/internal/config"
@@ -262,15 +263,12 @@ func TestValidate_AdversaryPattern_SkipsCheckWhenEcosystemEmpty(t *testing.T) {
 // errors.Is — ErrHarnessShim sentinel
 // ---------------------------------------------------------------------------
 
-func TestErrHarnessShim_Sentinel(t *testing.T) {
-	// Even when wrapped, errors.Is should unwrap to ErrHarnessShim.
-	// We can test this by checking that the exported sentinel is non-nil and
-	// that a manually-wrapped error satisfies errors.Is.
-	wrapped := errors.New("outer: " + config.ErrHarnessShim.Error())
-	// errors.Is won't match here (not actually wrapped), but we confirm the
-	// sentinel itself is comparable.
-	if !errors.Is(config.ErrHarnessShim, config.ErrHarnessShim) {
-		t.Error("ErrHarnessShim is not equal to itself via errors.Is")
+func TestErrHarnessShim_WrapsWithErrorsIs(t *testing.T) {
+	// ResolveHarnessCommand wraps ErrHarnessShim with fmt.Errorf(%w);
+	// errors.Is must unwrap it correctly so callers can distinguish shim
+	// errors from other lookup failures.
+	wrapped := fmt.Errorf("outer: %w", config.ErrHarnessShim)
+	if !errors.Is(wrapped, config.ErrHarnessShim) {
+		t.Error("errors.Is(wrapped, ErrHarnessShim) = false, want true")
 	}
-	_ = wrapped
 }

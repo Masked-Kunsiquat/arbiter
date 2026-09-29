@@ -16,9 +16,9 @@ import (
 )
 
 // Config mirrors .arbiter/config.toml (spec §9.C). Field names match the
-// TOML keys via struct tags rather than Go's default case-insensitive
-// matching, so a typo'd key in the file is a silent zero-value instead of a
-// startup failure only if BurntSushi/toml's MetadataUndecoded is checked.
+// TOML keys via struct tags. Load rejects unknown keys by checking
+// meta.Undecoded() after parsing, so a typo'd key in the file is a
+// startup failure rather than a silent zero value.
 type Config struct {
 	Harness     Harness     `toml:"harness"`
 	Limits      Limits      `toml:"limits"`

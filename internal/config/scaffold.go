@@ -51,10 +51,11 @@ func FromEcosystem(eco stack.Ecosystem) *Config {
 			AttackTimeoutSeconds: 120,
 		},
 		Test: Test{
-			Build:    eco.Test.Build,
-			All:      eco.Test.All,
-			Files:    eco.Test.Files,
-			Reporter: eco.Test.Reporter,
+			Build:     eco.Test.Build,
+			All:       eco.Test.All,
+			Files:     eco.Test.Files,
+			Reporter:  eco.Test.Reporter,
+			JUnitPath: eco.Test.JUnitPath,
 		},
 		Adversary: Adversary{
 			Pattern: eco.Adversary.Pattern,
@@ -106,7 +107,7 @@ const gitattributesEntry = "*.jsonl text eol=lf\n"
 // EnsureGitattributes appends gitattributesEntry to repoRoot/.gitattributes,
 // creating the file if needed. It's a no-op if the exact line is already
 // present, so re-running arbiter init doesn't duplicate the entry.
-func EnsureGitattributes(repoRoot string) error {
+func EnsureGitattributes(repoRoot string) (retErr error) {
 	path := filepath.Join(repoRoot, ".gitattributes")
 
 	existing, err := os.ReadFile(path)
@@ -121,7 +122,11 @@ func EnsureGitattributes(repoRoot string) error {
 	if err != nil {
 		return fmt.Errorf("config: opening %s: %w", path, err)
 	}
-	defer f.Close()
+	defer func() {
+		if cerr := f.Close(); cerr != nil && retErr == nil {
+			retErr = fmt.Errorf("config: closing %s: %w", path, cerr)
+		}
+	}()
 
 	if len(existing) > 0 && existing[len(existing)-1] != '\n' {
 		if _, err := f.WriteString("\n"); err != nil {

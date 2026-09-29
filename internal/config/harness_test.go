@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -24,22 +25,32 @@ func TestResolveHarnessCommand_NotFound(t *testing.T) {
 	}
 }
 
-func TestResolveHarnessCommand_RejectsWindowsShim(t *testing.T) {
+// TestResolveHarnessCommand_RejectsNonExe verifies that on Windows any
+// resolved extension other than .exe is rejected. We test with .cmd (a common
+// shim) and .bat; both must fail with ErrHarnessShim.
+func TestResolveHarnessCommand_RejectsNonExe(t *testing.T) {
 	if runtime.GOOS != "windows" {
-		t.Skip("shim rejection only applies on windows")
+		t.Skip("non-.exe rejection only applies on windows")
 	}
 
-	dir := t.TempDir()
-	shim := filepath.Join(dir, "fake-harness.cmd")
-	if err := os.WriteFile(shim, []byte("@echo off\r\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	for _, ext := range []string{".cmd", ".bat"} {
+		ext := ext
+		t.Run(ext, func(t *testing.T) {
+			dir := t.TempDir()
+			name := "fake-harness" + ext
+			if err := os.WriteFile(filepath.Join(dir, name), []byte("@echo off\r\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
-
-	_, err := config.ResolveHarnessCommand("fake-harness")
-	if err == nil {
-		t.Fatal("ResolveHarnessCommand(.cmd shim): want error, got nil")
+			_, err := config.ResolveHarnessCommand("fake-harness")
+			if err == nil {
+				t.Fatalf("ResolveHarnessCommand(%s): want error, got nil", ext)
+			}
+			if !errors.Is(err, config.ErrHarnessShim) {
+				t.Errorf("ResolveHarnessCommand(%s): got %v, want errors.Is(ErrHarnessShim)", ext, err)
+			}
+		})
 	}
 }
 
@@ -47,7 +58,7 @@ func TestResolveHarnessCommand_AcceptsNativeExe(t *testing.T) {
 	dir := t.TempDir()
 	var name, content string
 	if runtime.GOOS == "windows" {
-		name, content = "fake-native.exe", "not a real PE, just needs to exist and not be .cmd/.bat"
+		name, content = "fake-native.exe", "not a real PE, just needs to be a .exe"
 	} else {
 		name, content = "fake-native", "#!/bin/sh\nexit 0\n"
 	}

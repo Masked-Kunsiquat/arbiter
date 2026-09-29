@@ -4,6 +4,9 @@
 package stack
 
 import (
+	"errors"
+	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 )
@@ -16,10 +19,11 @@ type Ecosystem struct {
 		ShellAllow []string
 	}
 	Test struct {
-		Build    string
-		All      string
-		Files    string
-		Reporter string
+		Build     string
+		All       string
+		Files     string
+		Reporter  string
+		JUnitPath string // non-empty only when Reporter == "junit-xml"
 	}
 	Adversary struct {
 		Pattern string
@@ -58,7 +62,10 @@ func Detect(dir string) ([]Ecosystem, error) {
 	for _, d := range detectors {
 		_, err := os.Stat(filepath.Join(dir, d.file))
 		if err != nil {
-			continue
+			if errors.Is(err, fs.ErrNotExist) {
+				continue
+			}
+			return nil, fmt.Errorf("stack: stat %s: %w", d.file, err)
 		}
 		eco := d.build()
 		if seen[eco.Name] {
@@ -113,9 +120,11 @@ func pythonEcosystem() Ecosystem {
 		"Bash(pytest*)", "Bash(git status*)", "Bash(git diff*)",
 	}
 	e.Test.Build = "python -m py_compile ."
-	e.Test.All = "pytest"
-	e.Test.Files = "pytest {files}"
+	// junit-xml reporter requires a path; pytest emits JUnit XML via --junitxml.
+	e.Test.All = "pytest --junitxml=.arbiter/test-results.xml"
+	e.Test.Files = "pytest --junitxml=.arbiter/test-results.xml {files}"
 	e.Test.Reporter = "junit-xml"
+	e.Test.JUnitPath = ".arbiter/test-results.xml"
 	e.Adversary.Pattern = "**/test_adversary_*.py"
 	e.Deps.Install = "pip install -r requirements.txt"
 	e.Deps.Lockfiles = []string{"requirements.txt"}

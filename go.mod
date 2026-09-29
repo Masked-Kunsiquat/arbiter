@@ -3,12 +3,12 @@ module github.com/Masked-Kunsiquat/arbiter
 go 1.27
 
 require (
+	github.com/BurntSushi/toml v1.6.0
 	golang.org/x/crypto v0.57.0
 	modernc.org/sqlite v1.60.0
 )
 
 require (
-	github.com/BurntSushi/toml v1.6.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/mattn/go-isatty v0.0.24 // indirect

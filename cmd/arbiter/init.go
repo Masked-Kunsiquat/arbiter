@@ -50,16 +50,17 @@ func runInit(ctx context.Context, args []string) error {
 
 	cfg := config.FromEcosystem(primary)
 	cfgPath := config.ConfigPath(arbiterDir)
+
+	if err := config.Validate(cfg, primary.Name); err != nil {
+		return fmt.Errorf("arbiter init: config validation failed before writing:\n%w", err)
+	}
+
 	if err := config.Write(cfg, cfgPath, force); err != nil {
 		return err
 	}
 
 	if err := config.EnsureGitattributes(repoRoot); err != nil {
 		return err
-	}
-
-	if err := config.Validate(cfg, primary.Name); err != nil {
-		return fmt.Errorf("arbiter init: wrote %s but it fails validation:\n%w", cfgPath, err)
 	}
 
 	fmt.Printf("arbiter init: detected %s, wrote %s\n", primary.Name, cfgPath)
