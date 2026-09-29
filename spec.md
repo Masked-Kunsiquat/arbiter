@@ -1,6 +1,23 @@
-# Arbiter Engine: Architecture & System Specification (v3)
+# Arbiter Engine: Architecture & System Specification (v3.1)
 
 A lean, local-first execution arbiter, task governor, and multi-agent coordination layer built on native Git primitives, embedded SQLite, and signed audit records.
+
+> **Changes from v3** (pre-build spikes; evidence in `spikes/*/FINDINGS.md`):
+>
+> | Issue | Resolution | Section |
+> |---|---|---|
+> | A plain `claude -p` inherits the user's plugins, hooks, MCP servers and memory; `--allowedTools` is a permission allow-list, not a tool list | Isolation baseline on every launch; roles defined by `--tools` plus shell allow rules | §9.A, §9.C |
+> | Ledger format had no version field and hashed `prev_hash` twice; signature and line format unpinned | `v` field from entry 1; `entry_hash = sha256(JCS(entry))`; SSHSIG details, `created_at` form and canonical lines pinned | §4, §8.B, §8.D |
+> | An app compile error became an ASSERTION_FAIL with nothing for the claim check to check | Build + vet + test-compile at submit; rule 4 no longer covers build failures | §5.3, §5.4 |
+> | One panicking or timed-out attack hides every later attack in its package; `-json` has no file per test and no test ids on build failure | Attacks run one per test from a compiled test binary; attacks found by parsing adversary files; build failures classified per file | §5.4, §9.C |
+> | `CTRL_BREAK` fails from a console-less supervisor and silently doesn't arrive with `CREATE_NO_WINDOW` | `CREATE_NO_WINDOW` always; break sent through an `AttachConsole` helper; hard kill always follows | §7 |
+> | Killed invocations report no cost | `cost_usd` nullable with a usage-based fallback; `--max-budget-usd` caps spend in the harness | §4, §5.8 |
+> | `result` isn't always the last event; API errors report `subtype: "success"` | Read to EOF, succeed on `is_error == false`, no `result` = crash; instruction-first prompts | §9.A |
+> | A process can leave the Job Object through WMI | Listed as not defended; post-run process scan | §7, §8.A |
+> | "Deleting any entry is detectable" overclaimed; verifying key unspecified | Tail truncation caught only by the pinned head; key from `allowed_signers` with namespaces | §8.B, §8.D |
+> | Catalog gaps (`merge_commit`, union `dispute`, no credential action, non-null cost) | Rows added and split; required fields may be null | §8.E |
+> | Go test cache could replay a PASS | `-count=1` on every test command | §9.C |
+> | Liveness and process-tree wording | `thinking_tokens` counts as activity; `claude.exe` is native; Go spawn-race detail | §7 |
 
 > **Changes from v2** (design round 3: stress test of §5.4, §6.B, §9.A):
 >
@@ -419,7 +436,8 @@ CREATE TABLE invocations (
     pid INTEGER,
     lease_expires_at DATETIME,               -- renewed by supervisor observation, not by the model
     exit_reason TEXT CHECK (exit_reason IN ('ok', 'invalid_output', 'crash', 'lease_expired', 'killed')),
-    cost_usd REAL,                           -- from the harness's final result event (§9.A)
+    cost_usd REAL,                           -- from the harness's final result event (§9.A); NULL if none arrived (killed)
+    cost_estimated INTEGER NOT NULL DEFAULT 0, -- 1 when cost_usd was summed from streamed usage instead (§5.8)
     started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     ended_at DATETIME,
     FOREIGN KEY(seat_id) REFERENCES seats(id)
@@ -429,16 +447,17 @@ CREATE TABLE invocations (
 -- One chain per PRD (chain = 'PRD-004'), plus chain = 'global' for entries with no PRD
 -- (credentials, org promotions), so each exported ledger file verifies on its own.
 CREATE TABLE audit_log (
+    v INTEGER NOT NULL DEFAULT 1,            -- ledger format version (§8.B); part of the hash
     chain TEXT NOT NULL,
     seq INTEGER NOT NULL,                    -- 1, 2, 3... within the chain
     task_id TEXT,
     seat_id TEXT NOT NULL,                   -- 'human', 'core', or a seat id; the role is looked up via the seat
     action TEXT NOT NULL,                    -- see §8.E
     payload_json TEXT NOT NULL,              -- hashes + summaries, never secrets or full transcripts
-    created_at TEXT NOT NULL,                -- RFC 3339 UTC, set by the core (part of the hash)
+    created_at TEXT NOT NULL,                -- UTC, exactly YYYY-MM-DDTHH:MM:SS.ffffffZ, set by the core (part of the hash)
     prev_hash TEXT NOT NULL,                 -- entry_hash of seq-1 in the same chain; 64 zeros for seq 1
-    entry_hash TEXT NOT NULL,                -- sha256(prev_hash || JCS(every other column except supervisor_signature))
-    supervisor_signature TEXT NOT NULL,      -- SSH signature over entry_hash
+    entry_hash TEXT NOT NULL,                -- hex(sha256(JCS(every other column except supervisor_signature)))
+    supervisor_signature TEXT NOT NULL,      -- SSHSIG over entry_hash, namespace arbiter-ledger (§8.B)
     PRIMARY KEY (chain, seq)
 );
 ```
@@ -546,6 +565,7 @@ The core runs **one task at a time** in DAG order. Parallel dispatch is the Flee
    - Edits files + unit tests, exits with a JSON result
    - Arbiter snapshots the slot into the submit commit (§5.3)
    - Diff check (boundaries, protected files) ──► reject if violated (counts as an attempt)
+   - Build check (build, vet, compile tests)  ──► reject if it fails (counts as an attempt)
    ▼
 4. Adversary (separate process) writes attack-test files; Arbiter commits them separately
    ▼
@@ -597,6 +617,7 @@ Every relaunch in steps 2–6 increments the task's attempt counter; the ceiling
   - deny rules compare case-insensitively (on Windows, `.ARBITER/x` and `.arbiter/x` are the same file); allow rules compare case-sensitively.
 
   A violation rejects the submission deterministically, whatever tools the harness used to produce it. The adversary pattern is a path glob only; there is no content marker, because a worker can delete a marker.
+- **Build check:** after the diff check passes, the Runner runs the project's `test.build` command (§9.C; for Go, `go build ./... && go vet ./...` plus compiling the tests without running them, `go test -count=1 -run '^$' ./...`). A failure is a deterministic rejection back to the worker with the compiler output. It counts as an attempt and needs no claim check. Once the worker's code is known to build, any build failure during an attack run belongs to the attack files (§5.4). Without this check, a worker's compile error would surface as an attack failure with no attack behind it.
 - **Unseen state (what the diff cannot show):** the diff sees tracked files only. Two kinds of change bypass it and would otherwise carry into the gates:
   1. *Ignored dependency dirs* kept in the warm slot (`node_modules`, `target`, `.venv`, per the keep-list). A worker could patch a dependency until the tests pass.
   2. *`.git` config and hooks*, which linked worktrees share with the main repo. A hook or a `core.fsmonitor` setting would run inside Arbiter's own git commands, including the signed merge.
@@ -606,20 +627,23 @@ Every relaunch in steps 2–6 increments the task's attempt counter; the ceiling
 ### 5.4 The Adversarial Reviewer & Attack Validation Protocol
 
 - **Rule:** never modifies application code. It may only add or modify files that match the adversary test pattern (§9.C) inside the PRD boundaries. Arbiter commits them on top of `submit_commit`, and the result is diff-checked like the worker's.
-- **Test identity comes from the runner, not the model.** Each attack test's name must encode the INVARIANT or AC it targets, e.g. `TestAttack_INVARIANT_2_RawSQLInRefresh` or `attack INVARIANT-2: raw SQL in refresh`. Arbiter reads test ids from the runner's machine-readable report and extracts targets with `(INVARIANT|AC)[-_](\d+)`. A test with no parseable target is an ERROR. The Adversary does not list its tests in JSON, so its list and the runner's can't disagree.
-- Attack tests run through the project's test command with a machine-readable reporter (`go test -json`, JUnit XML, or TAP; §9.C).
+- **Test identity comes from the code and the runner, not the model.** Each attack test's name must encode the INVARIANT or AC it targets, e.g. `TestAttack_INVARIANT_2_RawSQLInRefresh` or `attack INVARIANT-2: raw SQL in refresh`. Targets are extracted with `(INVARIANT|AC)[-_](\d+)`; a test with no parseable target is an ERROR. The Adversary does not list its tests in JSON, so its list and Arbiter's can't disagree.
+  - **Which tests are attacks** is decided deterministically from the files matching the adversary pattern. Runner reports don't reliably say which file a test lives in (`go test -json` never does), so for `go-json` Arbiter parses the adversary files (`go/parser`) and takes their top-level `Test*` functions. For JUnit/TAP it uses the report's file attribute where present. This list is also what reveals an attack that never ran.
+  - **Results** come from the runner's machine-readable report (`go test -json`, JUnit XML, or TAP; §9.C).
+- **One attack per run.** A panic or timeout kills the whole test process, so every later attack in the same package or file would never run and leave no trace. Attacks are therefore executed one at a time, each with its own timeout (`limits.attack_timeout_seconds`). For Go: build each affected package's test binary once (`go test -c -o <pkg>.test`), then run `<pkg>.test -test.run '^Name$' -test.timeout <t> -test.count=1 -test.v=test2json` with cwd set to the package directory, piped through `go tool test2json -p <pkg>`. Other ecosystems use their single-test selector (`jest -t`, `pytest <file>::<name>`).
+- **A run with no terminal event is still a result.** A test that started but has no pass/fail event, while the process failed, crashed under that test (goroutine panics and timeouts in Go look like this). It is classified by its panic output or as a timeout, using the process exit code, not the report, as the failure signal.
 
 **Classification: by where the failure comes from, not by the runner's label.** Runners disagree about what an "error" is. Jest and pytest both report a `TypeError` from calling a made-up API *inside the test body* as an ordinary failure, and in Go a single broken `_test.go` file fails the whole package's build. So each attack result is classified by these rules, applied in order:
 
-1. **ERROR: build, import, or collection failure** whose compiler or loader errors are all located in adversary files. (If errors are also in application files, the build broke on the worker's code: see step 4.)
+1. **ERROR: build, import, or collection failure.** Application code already passed the build check (§5.3), so a build failure during an attack run belongs to the attack files. Build failures carry no test ids (in Go they arrive as `build-output` events keyed by import path, before any test runs), so they are classified **per file**: every attack in an affected file or package gets the same ERROR, with the compiler output. Only primary error lines (`file:line:col: message`) name the culprit file; indented note lines such as "other declaration of X" may point at application code and are ignored.
 2. **ERROR: timeout.**
-3. **ERROR: throw site in test code.** The failure is not an assertion-library failure, and the top in-repo stack frame is in an adversary file or test helper. Stack frames are extracted with the same normalizer as §6.D.
-4. **Candidate ASSERTION_FAIL:** an assertion-library failure, or an exception whose top in-repo frame is in non-test code, or a build failure located in application code.
-5. **Reproduction:** each candidate is rerun once in isolation. If it passes on the rerun it is **ERROR (flaky)** and is not kept.
+3. **ERROR: throw site in test code.** The failure is not an assertion-library failure, and the top in-repo stack frame is in an adversary file or any other test file. That includes a test helper the worker wrote: the attack chose to depend on it. Stack frames are extracted with the same normalizer as §6.D.
+4. **Candidate ASSERTION_FAIL:** an assertion-library failure (testify, `t.Error`/`t.Fatal`, `expect`, `assert`), or an exception whose top in-repo frame is in non-test code.
+5. **Reproduction:** each candidate is rerun once, with the same single-test command. If it passes on the rerun it is **ERROR (flaky)** and is not kept. Because every run is already isolated, a pass on rerun can't be an ordering effect between attacks.
 
 Outcomes:
 
-- **ERROR** is evidence about the *test*, not the code. Erroring tests go back to the Adversary with their output (max 2 regenerations) and don't touch the worker's counts. Tests still erroring after the second regeneration are **dropped**, logged against the Adversary, and the review continues with the rest. If no valid attack remains, the task skips the automatic path and goes to `awaiting_human` with "no adversarial coverage", whatever the blast radius.
+- **ERROR** is evidence about the *test*, not the code. Erroring tests go back to the Adversary with their output (max 2 regenerations) and don't touch the worker's counts. Tests still erroring after the second regeneration are **dropped** (for build failures, the offending files are removed from the attack commit), logged against the Adversary, and the review continues with the rest. If no valid attack remains, the task skips the automatic path and goes to `awaiting_human` with "no adversarial coverage", whatever the blast radius.
 - **ASSERTION_FAIL** is a candidate defect. The Judge performs a **claim check**: does the cited invariant/AC actually require the asserted behavior? Upheld → rejection to the Worker with the trace and the test. Not upheld → attack dismissed and logged against the Adversary.
 - **PASS:** no defect found by this attack.
 
@@ -686,6 +710,8 @@ Every retry path has one shared bound.
 
 - **Attempt ceiling:** every agent relaunch for a task increments `tasks.attempt`, whatever the reason: diff-check rejection, upheld rejection, integration red, rebase conflict, crash or lease expiry, granted scope request, invalid-output retry. At `attempt > max_attempts` (default 6, set in project config) the task goes to `awaiting_human`. The narrower caps (3 upheld rejections, 2 adversary regenerations, 1 schema retry) still apply inside it.
 - **Budget:** each invocation records `cost_usd` from the harness's final result event (§9.A). Task spend and PRD spend (`prds.spent_usd`) are sums of that. Before every launch the core checks `prds.spent_usd < max_budget_usd`; if the budget is used up, the task goes to `awaiting_human` and nothing new launches for that PRD. On subscription plans the reported cost is notional but still works as a relative brake.
+  - **The harness enforces the cap too.** Every launch passes `--max-budget-usd <max_budget_usd − prds.spent_usd>`, so a runaway invocation stops mid-run instead of being noticed at exit.
+  - **Killed invocations report no cost.** A process stopped by lease expiry, `Terminate`, or a crash emits no `result` event. The core then sums the per-message `usage` from the streamed `assistant` events against a model price table, stores that as `cost_usd`, and sets `invocations.cost_estimated = 1`. If even that is unavailable, `cost_usd` stays NULL and the ledger `exit` entry records `null`. The budget check counts estimates and treats a NULL as unknown, flagged to the human at the next HITL prompt.
 - **Ways out of `awaiting_human`** (the HITL prompt, §5.7):
   - **Approve**: continue to the next step (integration gate, or the verdict for "no adversarial coverage").
   - **Retry with note**: resume the worker seat with the note; counts as an upheld rejection, and resets `attempt` to 0 once so the human can buy more tries.
@@ -814,10 +840,16 @@ type Supervisor interface {
 | | Windows | Linux | macOS |
 |---|---|---|---|
 | Container | Job Object (`CreateJobObject`) | Process group (`Setpgid`) | Process group (`Setpgid`) |
-| Spawn race | Create with `CREATE_SUSPENDED`, assign to job, then resume, so no grandchild escapes | n/a | n/a |
-| Graceful stop | `CTRL_BREAK_EVENT` (spawned with `CREATE_NEW_PROCESS_GROUP`) | `kill -TERM -<pgid>` | `kill -TERM -<pgid>` |
+| Spawn flags | `CREATE_SUSPENDED \| CREATE_NEW_PROCESS_GROUP \| CREATE_NO_WINDOW` | `Setpgid` | `Setpgid` |
+| Spawn race | Create suspended, assign to job, then resume, so no grandchild escapes. Go's `os/exec` drops the main-thread handle, so resume via a Toolhelp thread snapshot (`TH32CS_SNAPTHREAD` → `ResumeThread`), or create the process directly inside the job with `PROC_THREAD_ATTRIBUTE_JOB_LIST` | n/a | n/a |
+| Graceful stop | `CTRL_BREAK_EVENT`, sent by a helper process (`arbiter _ctrlbreak <pid>`: `FreeConsole` → `AttachConsole(pid)` → `GenerateConsoleCtrlEvent`), never by the supervisor itself | `kill -TERM -<pgid>` | `kill -TERM -<pgid>` |
 | Hard kill | `TerminateJobObject` | `kill -KILL -<pgid>` | `kill -KILL -<pgid>` |
 | Supervisor-death cleanup | `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`: the OS kills the job when the supervisor's handle closes | `PR_SET_PDEATHSIG`. Go gotcha: it fires when the *spawning OS thread* exits, so spawn from a `runtime.LockOSThread()` goroutine | No PDEATHSIG; a tiny shim polls `getppid()` / kqueue `NOTE_EXIT` and kills its group |
+
+- **Why the break goes through a helper.** `CTRL_BREAK_EVENT` only reaches a process group attached to the *caller's* console. A console-less supervisor (`arbiter serve`, a background launch) gets "handle is invalid". A child with its own console (`CREATE_NO_WINDOW`, which stops a console window popping up for every agent) gets nothing, *and the call still reports success*. Attaching to the child's console detaches the caller from its own and is process-global, so it runs in a short-lived helper.
+- **`Terminate(h, grace)` always ends in a hard kill:** send the graceful signal, wait `grace`, then `TerminateJobObject` / `kill -KILL` regardless, then close the job handle. The graceful signal is best effort and can silently not arrive.
+- **What's in the container.** `claude.exe` is a single native binary; its tree is whatever its shell tools start (powershell/cmd/bash and their commands) plus `conhost.exe`.
+- **Containment is cleanup, not a sandbox.** Children can't break away from the job (`CREATE_BREAKAWAY_FROM_JOB` is denied), but a process started *through a system service* is not the job's child: WMI (`Win32_Process.Create`), the Task Scheduler, or a service can start processes that survive `TerminateJobObject`, without admin rights. After every invocation the Runner scans for live processes whose command line or working directory contains the slot path and logs any as a violation against the seat (§8.A).
 
 ### Warm Worktree Slot
 
@@ -831,7 +863,8 @@ Fresh worktrees per task would mean `npm install` / `cargo build` every time. In
 
 ### Liveness & Leases
 
-- Liveness = process alive **and** activity within the last 120s. Activity means a stdout event or a worktree fs write. Harnesses run with streaming output (§9.A), so a role that only reads and thinks (Ringleader, Judge) still emits an event per turn or tool call. With buffered JSON output it would look dead until it exited. The supervisor observes all of this itself; the model never has to heartbeat.
+- Liveness = process alive **and** activity within the last 120s. Activity means a stdout event or a worktree fs write. Harnesses run with streaming output (§9.A), so a role that only reads and thinks (Ringleader, Judge) still emits an event per turn or tool call, and Claude Code emits a `system/thinking_tokens` event about once a second while the model thinks. With buffered JSON output it would look dead until it exited. The supervisor observes all of this itself; the model never has to heartbeat.
+  - A long single generation with thinking off could still go quiet for its whole length. If that trips the 120s rule in practice, launch with `--include-partial-messages`, which streams per-chunk deltas.
 - Leases belong to invocations (§4, `invocations.lease_expires_at`). Standard lease: 15 minutes, renewed automatically while the process is live and active, up to an absolute ceiling (default 60 minutes). Test runs launched by the Runner pause the lease clock.
 - **Expiry kills, it doesn't error.** When a lease ends, the supervisor terminates the process and runs the autopsy. The model is never handed an "expired" error it might try to work around.
 - `awaiting_human` freezes all timers.
@@ -840,7 +873,7 @@ Fresh worktrees per task would mean `npm install` / `cargo build` every time. In
 
 When an agent times out or crashes:
 
-1. `Terminate` the container.
+1. `Terminate` the container, and record the invocation's cost from streamed usage (§5.8), since a killed harness emits no `result` event.
 2. Capture the last 50 lines of stdout/stderr and `git diff`. From v0.2, also compute the trace fingerprint (§6.D).
 3. Evaluate progress deterministically: if the diff is non-empty **and** the project builds/type-checks → checkpoint commit (`checkpoint/<task>/attempt-N`), and the next seat starts from it. Otherwise `git reset --hard <base_commit>`.
 4. The seat is marked `expired` (lease) or `revoked` (crash), and the Judge writes a one-line root-cause summary into the autopsy memory (an `autopsy_summary` invocation).
@@ -860,7 +893,7 @@ Everything runs locally as one OS user. Any process running as that user can rea
 3. *After-the-fact tampering* with history, attribution, or the outcome ledger: hash-chained ledger, signed commits and tags.
 4. *A compromised or remote core forging your approval:* the core never holds your key; human signatures are always produced client-side (§8.C).
 
-**Not defended against (through v0.3):** a malicious process with the user's privileges, or an agent using its harness shell to exfiltrate data or damage files outside the repo. Real containment needs an OS sandbox (container, Windows Sandbox, bubblewrap, Seatbelt). That is future work (§11).
+**Not defended against (through v0.3):** a malicious process with the user's privileges, or an agent using its harness shell to exfiltrate data or damage files outside the repo. Nor an agent leaving processes behind: Job Objects and process groups clean up cooperative trees, but a process started through WMI, the Task Scheduler, or a service is outside the container and survives the hard kill (§7). The post-run scan detects the obvious cases; it doesn't prevent them. Real containment needs an OS sandbox (container, Windows Sandbox, bubblewrap, Seatbelt). That is future work (§11).
 
 ### 8.B Agent Identity: Credentials & Seats
 
@@ -880,8 +913,12 @@ v1's per-agent ephemeral Ed25519 keypairs are **removed**. The supervisor held e
 - **Minting rule:** only the Ringleader seat or the human can request seats; the core mints them. Workers, adversaries, and judges cannot. Every seat records `parent_seat_id`, which is how the agent tree in §5.0 is built.
 - **Role-filtered tools:** when MCP arrives, `tools/list` returns only the seat's role's tools. A worker never sees `verdict`, so it can't waste turns trying it.
 - **Leases:** codes expire fast (they're used immediately); each invocation's lease is renewed by supervisor observation (§7). On expiry the process is killed and the seat is marked `expired`. Seat ids stay in the ledger permanently. Secrets (attach codes, tokens) never enter the ledger or the repo.
-- **Supervisor key:** one SSH signing key held by the core (`~/.config/arbiter/`, optionally the OS keychain). It signs ledger entries and the task-level commits described in §8.D.
-- **Hash chain:** `entry_hash = sha256(prev_hash || JCS(entry))`, where `entry` is the row as a JSON object with every column except `entry_hash` and `supervisor_signature`, including `chain`, `seq`, `task_id`, `seat_id`, `action`, `payload_json` (as parsed JSON), and `created_at`. `JCS` is RFC 8785 JSON canonicalization. `prev_hash` for `seq = 1` is 64 zeros. There is one chain per PRD (`chain = 'PRD-004'`) plus a `global` chain, so each exported ledger file verifies on its own. Editing, reordering, re-attributing, or deleting any past entry is detectable. This format is frozen once the first ledger is committed; any change needs a new `ledger_version` field, never a silent rehash.
+- **Supervisor key:** one Ed25519 SSH signing key held by the core (`~/.config/arbiter/`, optionally the OS keychain or an SSH agent). It signs ledger entries and the task-level commits described in §8.D. Ed25519 signatures are deterministic, so the same entry signs to the same bytes on every platform.
+- **Hash chain (ledger format v1):** `entry_hash = hex(sha256(JCS(entry)))`, where `entry` is the row as a JSON object with every column except `entry_hash` and `supervisor_signature`: `v`, `chain`, `seq`, `task_id` (`null` when absent), `seat_id`, `action`, `payload_json` (as parsed JSON), `created_at`, and `prev_hash`. `prev_hash` is the previous entry's `entry_hash` (lowercase hex), 64 zeros for `seq = 1`; it links the chain from *inside* the hashed object, so nothing is concatenated outside it. `JCS` is RFC 8785 JSON canonicalization. There is one chain per PRD (`chain = 'PRD-004'`) plus a `global` chain, so each exported ledger file verifies on its own.
+  - **Pinned details:** `v` is `1` on every entry from the first one. `created_at` is UTC in exactly `YYYY-MM-DDTHH:MM:SS.ffffffZ` form. Payload numbers must be exactly representable as IEEE-754 doubles (integers within ±2^53); anything else is rejected at write time, never rounded.
+  - **Signature:** OpenSSH SSHSIG (the `ssh-keygen -Y sign` format), namespace `arbiter-ledger` (distinct from git's `git`, so a ledger signature can't be replayed as a commit signature), over the message = the 64-character `entry_hash` with no newline. Stored armored: 70-column base64 lines, LF endings, no trailing newline. It checks with `ssh-keygen -Y verify -n arbiter-ledger`.
+  - **What it detects:** editing, re-attributing, reordering, or deleting any entry *before the last one*. Removing entries from the end leaves a shorter valid chain; that is detected only against a head pinned elsewhere, the `Arbiter-Ledger` trailer of a signed commit (§8.D). Entries written after the last signed task commit are not pinned by anything yet.
+  - **Frozen:** this format is frozen once the first ledger is committed. Any change bumps `v`, and verifiers keep accepting every earlier version. Never a silent rehash.
 
 ### 8.C Human Signatures (git-native, minimal prompts)
 
@@ -921,37 +958,41 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 
 The signature covers the trailers, so attribution can't be edited without breaking **Verified**.
 
-**2. Committed ledger.** Each PRD's chain is exported to `.arbiter/ledger/<PRD>.jsonl` (one JSON object per line, in `seq` order, exactly the hashed form plus `entry_hash` and `supervisor_signature`) and committed in each task's squash commit. The file holds the actions in §8.E: hashes and short summaries only, no transcripts or secrets. The `Arbiter-Ledger` trailer pins the chain head, so the signed commit vouches for the entire history before it. The `merge` entry for a commit can't contain that commit's own sha, so it records the tree hash of the merged content, and the next entry records the commit sha.
+**2. Committed ledger.** Each PRD's chain is exported to `.arbiter/ledger/<PRD>.jsonl` and committed in each task's squash commit. Each line is exactly `JCS(hashed form + entry_hash + supervisor_signature)`, in `seq` order, with LF line endings. Verifiers reject any line that isn't byte-identical to its own canonical form, which rules out extra fields, duplicate keys, reformatting and non-canonical escapes in one check, and makes a re-export byte-identical. A trailing CR per line is tolerated for `core.autocrlf` checkouts; `arbiter init` adds `.arbiter/ledger/*.jsonl text eol=lf` to `.gitattributes`. The file holds the actions in §8.E: hashes and short summaries only, no transcripts or secrets. The `Arbiter-Ledger` trailer pins the chain head, so the signed commit vouches for the entire history before it. The `merge` entry for a commit can't contain that commit's own sha, so it records the tree hash of the merged content, and the next entry records the commit sha.
 
 **3. Human capstone.** The final feature → main merge is signed with *your* key. That key's signature covers everything the supervisor key did on the branch.
 
-**Verification:** `arbiter audit verify [<commit>]` (v0.1) checks commit signatures against `allowed_signers`, recomputes the ledger hash chain, and confirms that each trailer's head hash matches. It ships with the ledger because it is also the ledger's test oracle. Plain `git log --show-signature` plus reading the JSONL gets most of the way without Arbiter installed.
+**Verification:** `arbiter audit verify [<commit>]` (v0.1) checks commit signatures against `allowed_signers`, recomputes the ledger hash chain, verifies every entry's signature, and confirms that the chain ends exactly at each trailer's pinned head (which is what catches truncation). The verifying key always comes from `allowed_signers`, never from the ledger file: a rewritten chain re-signed with another key is internally consistent. The supervisor key's line restricts its namespaces, e.g. `arbiter@host namespaces="git,arbiter-ledger" ssh-ed25519 AAAA…`. It ships with the ledger because it is also the ledger's test oracle. Plain `git log --show-signature`, `ssh-keygen -Y verify`, and reading the JSONL get most of the way without Arbiter installed.
 
 **What this proves, honestly:** that *your* Arbiter installation recorded these seats doing these things, and that the record hasn't changed since it was signed. It does not cryptographically prove a particular model wrote a particular line; nothing running locally could. This is the same trust level as a signed `Co-Authored-By` trailer, only far more detailed and tamper-evident.
 
 ### 8.E Ledger Action Catalog
 
-Every entry has `seat_id` and, where relevant, `task_id`. The payload fields listed are required; payloads never contain secrets, prompts, or transcripts (hashes of them are allowed).
+Every entry has `seat_id` and, where relevant, `task_id`. The payload fields listed are required to be *present*; a value may be `null` where the table says so (e.g. the ringleader's `parent_seat_id`). Unknown actions are rejected at write time. Payloads never contain secrets, prompts, or transcripts (hashes of them are allowed).
 
 | Action | Seat | Payload |
 |---|---|---|
+| `credential` | core (global chain) | `credential_id`, `kind`, `harness`, `model`, `model_provenance` |
 | `prd_lock` | human | `tag`, `spec_hash`, `tag_object_sha` |
 | `plan` | ringleader | `plan_hash`, `task_ids[]` |
 | `spec` | ringleader | `task_id`, `spec_revision`, `spec_hash` |
-| `mint` | core | `new_seat_id`, `role`, `parent_seat_id`, `credential_id` |
+| `mint` | core | `new_seat_id`, `role`, `parent_seat_id` (`null` for the ringleader), `credential_id` |
 | `launch` | core | `invocation_id`, `seat_id`, `purpose`, `prompt_hash`, `injected_lesson_ids[]` |
-| `exit` | core | `invocation_id`, `exit_reason`, `cost_usd` |
+| `exit` | core | `invocation_id`, `exit_reason`, `cost_usd` (`null` when unknown), `cost_estimated` (§5.8) |
 | `result` | the invoking seat | `invocation_id`, `result_hash`, `status` |
-| `submit` | core | `submit_commit`, `base_commit`, `diff_check` (`pass`/violations) |
+| `submit` | core | `submit_commit`, `base_commit`, `diff_check` (`pass`/violations), `build_check` (`pass`/`fail`/`null` when the diff check failed) |
 | `unseen_state` | core | `changed_paths[]`, `action` (`reinstalled`/`restored`) |
-| `attack_run` | core | `commit`, per-test `{test_id, targets[], class}` |
+| `stray_processes` | core | `invocation_id`, `processes[]` (`{pid, image, cmdline_hash}` found by the post-run scan, §7) |
+| `attack_run` | core | `commit`, `tests[]` (`{test_id, targets[], class}`) |
 | `claim_ruling` | judge | `test_id`, `ruling`, `reason_hash` |
-| `dispute` | worker / judge | `test_id`, `argument_hash` / `ruling` |
+| `dispute` | worker | `test_id`, `argument_hash` |
+| `dispute_ruling` | judge (fresh seat) | `test_id`, `ruling` |
 | `verdict` | judge | `verdict`, `blast_radius`, `bundle_hash` |
 | `hitl` | human | `decision`, `note_hash` |
 | `scope_grant` | core | `paths[]`, `trigger` (`worker`/`integration`) |
 | `integration` | core | `result`, `failing_tests[]`, `routing` |
-| `merge` | core | `tree`, `parent`, `trailers_hash`; followed by `merge_commit` with `sha` |
+| `merge` | core | `tree`, `parent`, `trailers_hash` |
+| `merge_commit` | core | `sha` (the commit made from the preceding `merge` entry, §8.D) |
 | `outcome` | judge / core / human | `lesson_id`, `lesson_tier`, `outcome_type`, `evidence_backed` |
 | `autopsy` | core | `invocation_id`, `tail_hash`, `checkpoint_ref` |
 | `task_state` | core / human | `from`, `to`, `reason` |
@@ -969,20 +1010,33 @@ In v0.1 agents talk to Arbiter only through their process, their working tree, a
 
 ```
 claude -p --model <model> --output-format stream-json --verbose \
+       --restricted --strict-mcp-config --disable-slash-commands --permission-prompts none \
+       --max-budget-usd <remaining PRD budget> \
        [--resume <harness_session_id>] <role tool profile flags>
 ```
 
-- **Prompt on stdin, never in argv.** A prompt carrying a diff easily overflows Windows' 32,767-character command-line limit, or 8,191 if the command goes through `cmd.exe`. On Windows, `harness.command` must resolve to a native `.exe`; startup validation (§13) rejects a `.cmd`/`.bat` shim.
-- **Streaming output** gives the supervisor a stdout event per turn and tool call (liveness, §7) and a live feed for the TUI. The final `result` event carries the model's final message, `session_id` (stored as `seats.harness_session_id`), `is_error`, and `total_cost_usd` (stored as `invocations.cost_usd`, §5.8).
-- **Git environment** is overridden per process with `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n` (git ≥ 2.31): `commit.gpgsign=false` and `tag.gpgsign=false` (so a global signing setup never prompts you for an agent's commit), `core.hooksPath=<empty arbiter dir>`, and `user.name`/`user.email` = the seat. `GIT_TERMINAL_PROMPT=0` as well.
-- **Role tool profiles** (defense in depth on top of the diff check):
+- **Isolation baseline (every role).** Without it, a headless `claude -p` loads the user's whole environment: plugins and their hooks, every configured MCP server (including ones with write access to GitHub or mail), skills, the subagent tool, auto-memory, and CLAUDE.md. That's 100+ tools the role never asked for. The baseline flags drop all of it:
+  - `--restricted` ignores user, project and local settings files (so a `.claude/settings.json` a worker commits can't grant permissions), removes code-running tools unless `--tools` names them, and confines file tools to the working directory;
+  - `--strict-mcp-config` loads no MCP servers (none are passed);
+  - `--disable-slash-commands` disables skills;
+  - `--permission-prompts none` denies anything that would prompt.
 
-| Role | Profile | After exit |
+  `--bare` would be leaner but accepts only `ANTHROPIC_API_KEY`, never subscription (OAuth) login, so it isn't used.
+- **Prompt on stdin, never in argv.** A prompt carrying a diff easily overflows Windows' 32,767-character command-line limit, or 8,191 if the command goes through `cmd.exe`. On Windows, `harness.command` must resolve to a native `.exe`; startup validation (§13) rejects a `.cmd`/`.bat` shim.
+- **Prompt layout: instruction first, data fenced.** Every prompt starts with the role instruction; diffs, test output, specs and other untrusted material follow in delimited blocks (`<diff>…</diff>`). An instruction placed after a large blob reads like prompt injection, and the model may refuse it.
+- **Streaming output** gives the supervisor a stdout event per turn and tool call (liveness, §7) and a live feed for the TUI. The final `result` event carries the model's final message, `session_id` (stored as `seats.harness_session_id`; it stays the same across `--resume`), `is_error`, and `total_cost_usd` (stored as `invocations.cost_usd`, §5.8).
+- **Reading the stream.** Read stdout to EOF: `result` is not always the last event (hook events can follow it). The invocation succeeded only if `is_error == false`. Never go by `subtype`: an API error arrives as `subtype: "success"` with `is_error: true`. No `result` event at all (killed, crashed) is a crash (autopsy). `terminal_reason` and `api_error_status` are recorded with the invocation. `rate_limit_event` carries subscription utilization; it's shown in the TUI and logged.
+- **Git environment** is overridden per process with `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n` (git ≥ 2.31): `commit.gpgsign=false` and `tag.gpgsign=false` (so a global signing setup never prompts you for an agent's commit), `core.hooksPath=<empty arbiter dir>`, and `user.name`/`user.email` = the seat. `GIT_TERMINAL_PROMPT=0` as well.
+- **Role tool profiles** (defense in depth on top of the diff check). A role is defined by `--tools`, which decides which tools *exist*, plus allow rules for which shell commands may run. `--allowedTools` alone is only a permission allow-list: every other tool stays loaded, and anything else that grants permission (a permission mode, a settings file) lets it through.
+
+| Role | Profile flags (on top of the baseline) | After exit |
 |---|---|---|
-| Ringleader | read-only (`--allowedTools "Read,Grep,Glob"`, edits and shell disallowed) | Runner asserts `git status --porcelain` is empty; otherwise the changes are discarded and a violation is logged |
-| Worker | edit + shell (`--permission-mode acceptEdits`, shell allowed so it can run tests) | Snapshot commit + diff check (§5.3) |
-| Adversary | edit + shell | Commit of adversary files + diff check |
-| Judge | read-only | Same assertion as the Ringleader |
+| Ringleader | `--tools "Read,Grep,Glob"` | Runner asserts `git status --porcelain` is empty; otherwise the changes are discarded and a violation is logged |
+| Worker | `--tools "Read,Grep,Glob,Edit,Write,Bash,PowerShell" --permission-mode acceptEdits --allowedTools "<harness.shell_allow>"` | Snapshot commit + diff check + build check (§5.3) |
+| Adversary | same as Worker | Commit of adversary files + diff check |
+| Judge | `--tools "Read,Grep,Glob"` | Same assertion as the Ringleader |
+
+  `harness.shell_allow` (§9.C) lists the shell commands the edit roles may run, as Claude Code allow rules (e.g. `Bash(go test *)`); everything else is denied. The list doesn't stop a test file from running arbitrary code; the diff check and unseen-state check remain the boundary.
 
 **Result.** The model's final message must be exactly one JSON object; Arbiter strips a single surrounding code fence if present. It's validated against the schema for the invocation's `purpose`. Invalid output → **resume the same session once** with the validation error (the worker's edits are kept), then treat it as a crash (autopsy). Either way it counts as an attempt.
 
@@ -1064,17 +1118,25 @@ ringleader_model = "claude-opus-5-5"
 worker_model     = "claude-opus-5-5"
 adversary_model  = "claude-sonnet-5"   # a different model from the worker, where possible (§5.0)
 judge_model      = "claude-opus-5-5"
+shell_allow = ["Bash(go test *)", "Bash(go build *)", "Bash(go vet *)", "Bash(git status*)", "Bash(git diff*)",
+               "PowerShell(go test *)", "PowerShell(go build *)", "PowerShell(go vet *)"]
+                                   # shell commands the Worker/Adversary may run (§9.A); everything else is denied
 
 [limits]
 max_attempts = 6                   # §5.8
 lease_minutes = 15
 lease_ceiling_minutes = 60
 judge_bundle_tokens = 60000        # §9.A
+attack_timeout_seconds = 120       # per attack test (§5.4)
 
 [test]
-all      = "go test -json ./..."             # full suite
-files    = "go test -json {packages}"        # subset; {files} or {packages} is substituted
+# Every command runs uncached: a cached PASS would replay without executing, even after the
+# unseen-state check reinstalled dependencies.
+build    = "go build ./... && go vet ./... && go test -count=1 -run ^$ ./..."   # build check (§5.3)
+all      = "go test -json -count=1 ./..."              # full suite
+files    = "go test -json -count=1 {packages}"         # subset; {files} or {packages} is substituted
 reporter = "go-json"                          # go-json | junit-xml | tap
+                                              # go-json: attacks run one per test from `go test -c` binaries (§5.4)
 junit_path = ""                               # when reporter = junit-xml: where the file lands
 
 [adversary]
@@ -1143,10 +1205,10 @@ Remote-access rules, decided now so the server mode stays simple:
 - **Core language: Go.** Windows Job Objects (`golang.org/x/sys/windows`), POSIX process groups, and single static binary distribution are all native. From Node, Job Objects would need a native addon. TUI via bubbletea.
 - **Database:** SQLite (WAL, FTS5) via `modernc.org/sqlite` (pure Go, no cgo, easier cross-compile).
 - **Code intelligence (v0.2+):** Tree-sitter for symbol extraction, signature hashing, and blast radius. Its Go bindings require cgo, which on Windows means a gcc toolchain (e.g. MSYS2/mingw-w64) and gives up the pure-Go build `modernc.org/sqlite` was chosen for. That trade is made deliberately in v0.2; v0.1 stays cgo-free with path-based blast radius (§5.5).
-- **Canonical JSON:** RFC 8785 (JCS) for ledger hashing (§8.B).
+- **Canonical JSON:** RFC 8785 (JCS) for ledger hashing (§8.B), via the standard library's `encoding/json/jsontext` (released API since Go 1.27, so Go ≥ 1.27 is required), behind Arbiter's stricter input validation. An independent implementation is kept as a test oracle, so a Go release that changed canonical output would fail tests before any ledger rehashed.
 - **Harness integration:** headless launch with the §9.A I/O contract in v0.1. An MCP server (stdio + HTTP) arrives in v0.3 with connection-bound seats and role-filtered tools. Enforcement never depends on the harness calling Arbiter tools (§5.3).
 - **Embeddings (v0.3, optional):** local `bge-small` / `nomic-embed-text` via ONNX Runtime, applied to root-cause summaries only.
-- **Crypto:** Go stdlib `crypto/ed25519` / SSH signing for the supervisor key; OpenSSH / `ssh-keygen -Y` and git SSH signing for humans, client-side.
+- **Crypto:** Ed25519 supervisor key with SSHSIG signatures produced in-process via `golang.org/x/crypto/ssh` (byte-compatible with `ssh-keygen -Y sign`; no subprocess per ledger entry); OpenSSH / `ssh-keygen -Y` and git SSH signing for humans, client-side.
 - **VCS:** Git CLI via sub-process (`git worktree`, `git commit -S`, `git interpret-trailers`, `git tag -s`).
 
 ---

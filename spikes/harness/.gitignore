@@ -1,0 +1,2 @@
+# Raw event streams: contain local paths, plugin/MCP lists and rate-limit data.
+out/
