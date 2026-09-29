@@ -1,0 +1,160 @@
+package seat
+
+import (
+	"context"
+	"crypto/rand"
+	"database/sql"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"time"
+)
+
+// Purpose matches the invocations.purpose values from §4 (not a CHECK
+// constraint in the schema, but pinned by the catalog in §8.E and §9.A).
+type Purpose string
+
+const (
+	PurposePlan           Purpose = "plan"
+	PurposeSpec           Purpose = "spec"
+	PurposeImplement      Purpose = "implement"
+	PurposeFix            Purpose = "fix"
+	PurposeAttack         Purpose = "attack"
+	PurposeAttackMaint    Purpose = "attack_maintenance"
+	PurposeClaimCheck     Purpose = "claim_check"
+	PurposeDisputeRuling  Purpose = "dispute_ruling"
+	PurposeVerdict        Purpose = "verdict"
+	PurposeAutopsySummary Purpose = "autopsy_summary"
+)
+
+// ExitReason matches the invocations.exit_reason CHECK constraint.
+type ExitReason string
+
+const (
+	ExitOK            ExitReason = "ok"
+	ExitInvalidOutput ExitReason = "invalid_output"
+	ExitCrash         ExitReason = "crash"
+	ExitLeaseExpired  ExitReason = "lease_expired"
+	ExitKilled        ExitReason = "killed"
+)
+
+// StartInvocationRequest describes a new process launch under an existing
+// seat. The seat must already be 'minted' or 'active'; StartInvocation moves
+// it to 'active' if this is its first invocation.
+type StartInvocationRequest struct {
+	SeatID           string
+	TaskID           string // empty when not task-bound (e.g. a plan invocation)
+	Purpose          Purpose
+	SupervisorHandle string // PGID (POSIX) or Job Object name (Windows)
+	PID              int64
+	LeaseExpiresAt   time.Time
+}
+
+// StartInvocation inserts an invocations row and activates the seat if this
+// is its first invocation (seat status minted -> active).
+func StartInvocation(ctx context.Context, db *sql.DB, req StartInvocationRequest) (string, error) {
+	if req.SeatID == "" {
+		return "", errors.New("seat: invocation requires a seat_id")
+	}
+	if req.Purpose == "" {
+		return "", errors.New("seat: invocation requires a purpose")
+	}
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", fmt.Errorf("seat: StartInvocation: begin: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // rollback on any non-commit path
+
+	var status Status
+	if err := tx.QueryRowContext(ctx, `SELECT status FROM seats WHERE id = ?`, req.SeatID).Scan(&status); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", fmt.Errorf("seat: %s not found", req.SeatID)
+		}
+		return "", fmt.Errorf("seat: loading seat %s: %w", req.SeatID, err)
+	}
+	if status != StatusMinted && status != StatusActive {
+		return "", fmt.Errorf("seat: %s: cannot start an invocation from status %s", req.SeatID, status)
+	}
+	if status == StatusMinted {
+		if _, err := tx.ExecContext(ctx, `UPDATE seats SET status = ? WHERE id = ?`, string(StatusActive), req.SeatID); err != nil {
+			return "", fmt.Errorf("seat: activating %s: %w", req.SeatID, err)
+		}
+	}
+
+	id, err := randomInvocationID()
+	if err != nil {
+		return "", err
+	}
+	var taskID any
+	if req.TaskID != "" {
+		taskID = req.TaskID
+	}
+	var leaseExpiresAt any
+	if !req.LeaseExpiresAt.IsZero() {
+		leaseExpiresAt = req.LeaseExpiresAt.UTC()
+	}
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO invocations (id, seat_id, task_id, purpose, supervisor_handle, pid, lease_expires_at)
+		VALUES (?, ?, ?, ?, NULLIF(?, ''), ?, ?)`,
+		id, req.SeatID, taskID, string(req.Purpose), req.SupervisorHandle, req.PID, leaseExpiresAt,
+	)
+	if err != nil {
+		return "", fmt.Errorf("seat: starting invocation for seat %s: %w", req.SeatID, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return "", fmt.Errorf("seat: StartInvocation: commit: %w", err)
+	}
+	return id, nil
+}
+
+// EndInvocationRequest records how an invocation finished.
+type EndInvocationRequest struct {
+	InvocationID  string
+	ExitReason    ExitReason
+	CostUSD       *float64 // nil if none arrived (killed), per spec §4
+	CostEstimated bool     // true when CostUSD was summed from streamed usage instead (§5.8)
+}
+
+// EndInvocation records the exit reason and cost for an invocation. It does
+// not transition the seat: a crash or lease expiry needs a fresh seat (§8.B
+// rule 1), which is the caller's decision, not this function's.
+func EndInvocation(ctx context.Context, db *sql.DB, req EndInvocationRequest) error {
+	if req.InvocationID == "" {
+		return errors.New("seat: EndInvocation requires an invocation_id")
+	}
+	switch req.ExitReason {
+	case ExitOK, ExitInvalidOutput, ExitCrash, ExitLeaseExpired, ExitKilled:
+	default:
+		return fmt.Errorf("seat: invalid exit_reason %q", req.ExitReason)
+	}
+	var cost any
+	if req.CostUSD != nil {
+		cost = *req.CostUSD
+	}
+	res, err := db.ExecContext(ctx, `
+		UPDATE invocations
+		SET exit_reason = ?, cost_usd = ?, cost_estimated = ?, ended_at = CURRENT_TIMESTAMP
+		WHERE id = ?`,
+		string(req.ExitReason), cost, req.CostEstimated, req.InvocationID,
+	)
+	if err != nil {
+		return fmt.Errorf("seat: ending invocation %s: %w", req.InvocationID, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("seat: ending invocation %s: %w", req.InvocationID, err)
+	}
+	if n == 0 {
+		return fmt.Errorf("seat: invocation %s not found", req.InvocationID)
+	}
+	return nil
+}
+
+func randomInvocationID() (string, error) {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("seat: generating invocation id: %w", err)
+	}
+	return "inv-" + hex.EncodeToString(b), nil
+}
