@@ -2,3 +2,8 @@
 .arbiter/*.db
 .arbiter/*.db-*
 .arbiter/worktrees/
+
+# Agent Skills
+.agents/
+agent/
+.claude/skills/
