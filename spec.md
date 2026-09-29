@@ -1,13 +1,36 @@
-# Arbiter Engine: Architecture & System Specification (v2)
+# Arbiter Engine: Architecture & System Specification (v3)
 
 A lean, local-first execution arbiter, task governor, and multi-agent coordination layer built on native Git primitives, embedded SQLite, and signed audit records.
+
+> **Changes from v2** (design round 3: stress test of §5.4, §6.B, §9.A):
+>
+> | Issue | Resolution | Section |
+> |---|---|---|
+> | Renames hid adversary-test deletions and `.arbiter/**` moves from the diff check | `--no-renames --name-status -z`; rules apply to both sides of every change | §5.3 |
+> | Ignored dependency dirs and `.git` hooks/config are invisible to the diff | Snapshot-and-restore of unseen state before every test run; supervisor git pins `core.hooksPath` | §5.3, §7 |
+> | Hallucinated-API attack tests were classified as defects | Classify by throw site + reproduction, not by the runner's label | §5.4 |
+> | Integration failures in files the worker may not touch had no legal fix | Route gate failures by file: adversary maintenance run or automatic scope request | §5.6 |
+> | Upfront specs went stale in v0.1 with no staleness check until v0.2 | Just-in-time specs in single-lane; symbol-drift staleness moves to Fleet | §5.1, §12 |
+> | Headless launch recipe didn't work (silent stdout, Windows arg limits, permissions, signing prompts) | Pinned launch recipe: `stream-json`, prompt on stdin, per-role tool profiles, git config overrides | §9.A |
+> | "Submission" undefined; merges described as fast-forwards | Arbiter snapshots the slot into the submit commit; task merges are signed squash commits | §5.3, §5.6 |
+> | Seat-per-process would bloat the agent tree | Seats span invocations; new seats only on abnormal end or for independence | §8.B |
+> | Unbounded retry loops; no source for `spent_usd` | One attempt ceiling for every relaunch; spend from harness-reported cost | §5.8 |
+> | Hash chain covered only the payload; global vs per-PRD chain unclear | Hash covers every column (RFC 8785); one chain per PRD plus a global chain | §8.B |
+> | Adversary pattern undiscoverable by `go test` / pytest | Per-ecosystem path glob in config; targets encoded in test names | §5.4, §9.C |
+> | Attack lifecycle across attempts, disputes in v0.1 | Defined: ERROR exhaustion, incremental re-review, dispute field, fresh judge seat | §5.4 |
+> | Adversary could log catches for its own tests | Judge (and the deterministic core) are the only agent outcome authors | §6.A |
+> | `catch` measured compliance, not prevention | Gate 2 requires an evidence-backed catch | §6.A, §6.E |
+> | Judge could mark misses irrelevant | Fingerprint recurrence forces a deterministic miss | §6.A |
+> | Ranking floor erased negative U; specificity 0 zeroed broad/org lessons | Prior-based `U_rank`; specificity = 1 + literal segments; repo-agnostic org patterns | §6.C |
+> | v0.1 needed tree-sitter (cgo) for blast radius | v0.1 blast radius is path-based; tree-sitter arrives in v0.2 | §5.5, §11 |
+> | Underspecified for coding | Project config, role output schemas, Judge evidence bundle, ledger action catalog, PRD grammar, terminal states, local process model | §2.C, §5.8, §8.E, §9.A, §9.C, §10.B |
 
 > **Changes from v1** (see git history), responding to `spec-review.md` and later design discussion:
 >
 > | Issue | Resolution | Section |
 > |---|---|---|
 > | DAG edges not persisted | `task_edges` table + `ready` / `stale` task states | §4, §5.1 |
-> | Cascading interface drift | Symbol-diff staleness detection; Ringleader re-specs tasks without human re-signing unless the PRD itself changes | §5.1 |
+> | Cascading interface drift | Symbol-diff staleness detection; Ringleader re-specs tasks without human re-signing unless the PRD itself changes (v3: single-lane avoids drift with just-in-time specs) | §5.1, §12 |
 > | Reservation deadlocks | Single-lane core has no contention; Fleet uses atomic all-or-nothing acquisition | §5.2, §12 |
 > | Adversary hallucinated tests | Attack Validation Protocol: ERROR ≠ defect, claim check, worker disputes, retries count only upheld rejections | §5.4 |
 > | Semantic merge breakage | Integration gate before every merge; serialized merge queue under Fleet | §5.6, §12 |
@@ -57,7 +80,7 @@ The Arbiter is a governance plane and execution supervisor. It sits between loca
 │  - Embedded SQLite (Tasks, Edges, Reservations, PRDs, Knowledge Pipeline)   │
 │  - Runner: Worktree Slot & Process Supervisor (Job Objects / PGIDs)         │
 │  - Seats (agent tree) & Hash-Chained Signed Ledger                          │
-│  - Tree-sitter Symbol Index (blast radius, interface drift)                 │
+│  - Symbol Index (v0.2+: tree-sitter blast radius, Fleet interface drift)    │
 │  - Integration Gate (full suite + attack tests before every merge)          │
 │  - Knowledge Synthesizer (fingerprint clustering & promotion)               │
 └──────────────┬───────────────────────┬───────────────────────────────┬──────┘
@@ -80,7 +103,7 @@ The Arbiter is a governance plane and execution supervisor. It sits between loca
 
 - **No Self-Grading:** The agent writing code cannot review, test, or approve its own work.
 - **Deterministic Gating:** State transitions require deterministic evidence (test runner results, static analysis, diff checks) rather than agent declarations. Where an LLM judgment is unavoidable (claim checks, relevance), it is recorded as a judgment, not as proof, and ambiguous cases escalate to the human.
-- **Enforce at the Diff, Not the Tool:** Harnesses ship their own shell and file tools, so the Arbiter cannot rely on intercepting writes. Every boundary rule is enforced by inspecting the committed diff at submit time.
+- **Enforce at the Diff, Not the Tool:** Harnesses ship their own shell and file tools, so the Arbiter cannot rely on intercepting writes. Every boundary rule is enforced by inspecting the submitted diff, and state the diff cannot see (ignored dependency dirs, `.git` config and hooks) is snapshot-checked before any test runs.
 - **Physical Isolation over Permissions:** Agents operate in dedicated git worktrees under OS-level process containment (Job Objects on Windows, process groups on POSIX).
 - **Git as the Ledger of Record:** PRD locks are signed tags, merges are signed commits carrying attribution trailers, and each PRD's hash-chained ledger is committed into the repo (§8.D).
 - **Seats, Not Sessions:** Every agent acts through a minted, role-bound seat. Seats form the agent tree, and every ledger entry names the seat that did it.
@@ -100,7 +123,7 @@ PRDs are version-controlled, machine-parseable contracts stored in the repositor
 `draft → locked → executing → completed → archived` (side state: `amendment_needed`)
 
 - **The Spec-Lock:** Once drafted with Ringleader assistance, the PRD is committed and the human creates a signed tag `arbiter/prd/PRD-004/v1` using git's native SSH signing (`gpg.format = ssh`). The tag pins the exact content; `spec_hash` is recorded for fast lookup.
-- **Zero Unilateral Drift:** Workers and reviewers cannot alter PRD invariants or file boundaries (enforced by the diff check on `.arbiter/**`). If a design flaw is uncovered, the task halts and the PRD moves to `amendment_needed`.
+- **Zero Unilateral Drift:** Workers and reviewers cannot alter PRD invariants or file boundaries (enforced by the diff check on `.arbiter/**`). If a worker reports a design flaw (`status: blocked_prd`, §9.A), the task goes to `awaiting_human`; the human either rejects the claim or moves the PRD to `amendment_needed`. Agents cannot trigger an amendment on their own, so "the PRD is wrong" is not an escape hatch from hard work.
 - **What needs re-signing:** Only changes to the PRD itself (invariants, boundaries, acceptance criteria). Task specs are *derived* by the Ringleader and may be regenerated without human signatures as long as they stay within the signed PRD (§5.1).
 
 ### B. Format & Structure (`.arbiter/prds/PRD-XXX.md`)
@@ -138,6 +161,16 @@ Mitigate replay attacks by revoking the entire token family if a reused token is
 - [ ] AC-3: Integration tests pass in both native and mock runtimes.
 ```
 
+### C. Parser Rules
+
+The PRD parser is strict; anything it cannot parse blocks `prd lock` with a line-numbered error.
+
+- **Frontmatter:** YAML between `---` fences. Required: `id` (`^PRD-\d{3,}$`), `title`, `target_branch`. Optional: `max_budget_usd` (default 5.00). `status`, `spec_hash`, and `created_by` are written by Arbiter, not the author, and are excluded from `spec_hash`.
+- **Sections** are recognized by `##` headings whose text *contains* (case-insensitive) `Intent`, `Invariants`, `File Boundaries`, `Acceptance Criteria`. Leading numbering (`## 2.`) is ignored. All four are required.
+- **IDs:** invariants match `^- \[(INVARIANT-\d+)\] (.+)$`, acceptance criteria match `^- \[[ x]\] (AC-\d+): (.+)$`. IDs are unique within the PRD and never renumbered across amendments (a removed ID is retired, not reused), so ledger references stay valid.
+- **Boundaries:** one backticked glob per bullet, repo-relative, forward slashes. Glob syntax is doublestar (`**` crosses directories, `*` does not). Patterns are compared case-sensitively for allow rules and case-insensitively for deny rules (§5.3).
+- **`spec_hash`** = SHA-256 of the file with the Arbiter-written frontmatter fields removed and line endings normalized to LF, so a Windows checkout with `core.autocrlf` hashes the same as Linux.
+
 ---
 
 ## 3. Epistemic Knowledge Architecture: The Three Tiers
@@ -168,7 +201,7 @@ The system separates high-entropy transient telemetry from persistent, battle-te
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
-- **Tier 1: Ephemeral Memory (Task-Scoped):** Transient runtime telemetry, failure traces, crash autopsies. Each record carries a deterministic trace fingerprint (§6.C). Never injected into prompts except as an autopsy note to the *same task's* next attempt.
+- **Tier 1: Ephemeral Memory (Task-Scoped):** Transient runtime telemetry, failure traces, crash autopsies. From v0.2 each record carries a deterministic trace fingerprint (§6.D). Never injected into prompts except as an autopsy note to the *same task's* next attempt.
 - **Tier 2: Project Lessons (Repository-Scoped):** Concrete technical rules tied to file globs. Every injection is tracked and resolved to an outcome.
 - **Tier 3: Org Invariants (Machine-Global):** Architectural standards applied across projects on the host, filtered by detected tech stack.
 
@@ -176,7 +209,7 @@ The system separates high-entropy transient telemetry from persistent, battle-te
 
 ## 4. Data & Storage Layer
 
-All persistence is local and embedded: SQLite in WAL mode with `PRAGMA busy_timeout = 5000` and `PRAGMA foreign_keys = ON`. Storage needs no server; the Arbiter supervisor process is only required while tasks are running.
+All persistence is local and embedded: SQLite in WAL mode with `PRAGMA busy_timeout = 5000` and `PRAGMA foreign_keys = ON`. Storage needs no server; exactly one process hosts the core (and writes the database) at a time (§10.B).
 
 ### A. Repository-Level Schema (`.arbiter/state.db`)
 
@@ -203,9 +236,10 @@ CREATE TABLE tasks (
     id TEXT PRIMARY KEY,
     prd_id TEXT NOT NULL,
     title TEXT NOT NULL,
-    spec_markdown TEXT NOT NULL,
-    spec_hash TEXT NOT NULL,                 -- changes when the Ringleader re-specs a stale task
-    spec_revision INTEGER DEFAULT 1,
+    intent TEXT NOT NULL,                    -- one paragraph, written at planning time
+    spec_markdown TEXT,                      -- full spec, written just-in-time when the task becomes 'ready' (§5.1)
+    spec_hash TEXT,
+    spec_revision INTEGER DEFAULT 0,         -- 0 = not yet specced
     author_seat_id TEXT,                     -- worker seat whose commit is under review; outlives the seat's lease
     status TEXT NOT NULL CHECK (status IN (
         'backlog',        -- dependencies not yet done
@@ -215,15 +249,15 @@ CREATE TABLE tasks (
         'awaiting_human',
         'integrating',    -- in the integration gate (queued, under Fleet)
         'done',
-        'stale',          -- an upstream interface changed; needs re-spec
-        'failed'
+        'stale',          -- Fleet only: an upstream interface changed; needs re-spec (§12)
+        'failed'          -- terminal; set only by the human (§5.8)
     )),
     base_commit TEXT,                        -- feature-branch commit the worktree started from
+    submit_commit TEXT,                      -- Arbiter-made snapshot of the slot at worker exit (§5.3)
     worktree_slot INTEGER,                   -- worktree slot (always 0 single-lane)
-    supervisor_handle TEXT,                  -- PGID (POSIX) or Job Object name (Windows)
-    upheld_rejections INTEGER DEFAULT 0,     -- only upheld rejections count toward the retry cap
-    attempt INTEGER DEFAULT 1,
-    lease_expires_at DATETIME,
+    upheld_rejections INTEGER DEFAULT 0,     -- only upheld rejections count toward the rejection cap
+    attempt INTEGER DEFAULT 0,               -- every agent relaunch for this task, of any kind (§5.8)
+    spent_usd REAL DEFAULT 0,                -- sum of invocations.cost_usd for this task
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(prd_id) REFERENCES prds(id)
@@ -240,7 +274,7 @@ CREATE TABLE task_edges (
 );
 -- Cycle check runs in the supervisor on insert (DFS); the Ringleader's DAG is rejected if cyclic.
 
--- Symbols a task's spec relies on (used for staleness detection)
+-- Symbols a task's spec relies on. Fleet only (§12): single-lane specs are written just-in-time and cannot go stale.
 CREATE TABLE task_symbol_deps (
     task_id TEXT NOT NULL,
     symbol TEXT NOT NULL,                    -- e.g. "src/auth/utils.ts#signToken"
@@ -249,7 +283,8 @@ CREATE TABLE task_symbol_deps (
     FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
 );
 
--- Path reservations (prefix semantics: "src/auth/" conflicts with "src/auth/token.ts").
+-- Path reservations. Prefixes compare by whole path segment: "src/auth/" covers "src/auth/token.ts"
+-- but not "src/authz/x.ts". Stored with forward slashes and a trailing slash for directories.
 -- Populated in single-lane mode too (they drive the submit-time diff check); only contended under Fleet.
 CREATE TABLE reservations (
     path_prefix TEXT NOT NULL,
@@ -266,7 +301,7 @@ CREATE TABLE task_memories (
     attempt INTEGER NOT NULL,
     commit_sha TEXT,
     observation_type TEXT CHECK (observation_type IN ('autopsy', 'test_failure', 'execution_log')),
-    fingerprint TEXT,                        -- normalized trace fingerprint (§6.C)
+    fingerprint TEXT,                        -- normalized trace fingerprint (§6.D); NULL in v0.1
     root_cause_summary TEXT,                 -- Judge-written natural-language summary
     content TEXT NOT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -302,29 +337,38 @@ CREATE TABLE lesson_injections (
     FOREIGN KEY(task_id) REFERENCES tasks(id)
 );
 
--- Outcome Ledger: at most one outcome per (lesson, task); a human entry overrides a judge entry
+-- Outcome Ledger: at most one outcome per (lesson, task).
+-- Precedence when rows would collide: human > core > judge (a higher author replaces the row).
+-- No FK on lesson_id: org lessons live in global_registry.db; lesson_tier says which table to join.
 CREATE TABLE lesson_outcomes (
     id TEXT PRIMARY KEY,
     lesson_id TEXT NOT NULL,
+    lesson_tier TEXT NOT NULL CHECK (lesson_tier IN ('project', 'org')),
     task_id TEXT NOT NULL,
-    seat_id TEXT NOT NULL,                   -- who logged it
-    author_role TEXT NOT NULL CHECK (author_role IN ('human', 'judge', 'adversary')),
+    seat_id TEXT NOT NULL,                   -- judge seat, 'core', or 'human'
+    author_role TEXT NOT NULL CHECK (author_role IN ('human', 'core', 'judge')),
+                                             -- core: deterministic rules (§6.A), e.g. fingerprint recurrence
     outcome_type TEXT NOT NULL CHECK (outcome_type IN ('catch', 'miss', 'contradiction')),
+    evidence_backed INTEGER NOT NULL DEFAULT 0,
+                                             -- 1 for a catch that shows prevention, not just compliance (§6.A)
     description TEXT NOT NULL,               -- Mandatory narrative
     context_diff_or_trace TEXT,
-    audit_seq INTEGER NOT NULL,              -- pointer into the signed audit log
+    audit_chain TEXT NOT NULL,               -- pointer into the signed ledger (§8.B)
+    audit_seq INTEGER NOT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE (lesson_id, task_id),
-    FOREIGN KEY(lesson_id) REFERENCES project_lessons(id)
+    UNIQUE (lesson_id, lesson_tier, task_id)
 );
 
--- Attack-test disputes (§5.4)
+-- Attack-test disputes (§5.4). At most one per task, across all attempts.
 CREATE TABLE disputes (
     id TEXT PRIMARY KEY,
-    task_id TEXT NOT NULL,
+    task_id TEXT NOT NULL UNIQUE,
     attack_test_id TEXT NOT NULL,
+    worker_seat_id TEXT NOT NULL,
     worker_argument TEXT NOT NULL,
+    judge_seat_id TEXT,                      -- a fresh judge seat, never the one that upheld the claim
     ruling TEXT CHECK (ruling IN ('upheld', 'dismissed', 'escalated')),
+                                             -- upheld: the worker is right, the attack is dismissed
     ruling_reason TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(task_id) REFERENCES tasks(id)
@@ -344,40 +388,62 @@ CREATE TABLE credentials (
 );
 
 -- Ephemeral, role-bound seats. The seat id is the agent's identity in the ledger.
+-- A seat spans one or more invocations (§8.B); the tree stays one node per logical agent.
 CREATE TABLE seats (
     id TEXT PRIMARY KEY,                     -- readable + suffix: "PRD-004/TASK-101/worker.2~7f3a"
     role TEXT NOT NULL CHECK (role IN ('ringleader', 'worker', 'adversary', 'judge')),
-    task_id TEXT,                            -- bound seats claim their task at creation
+    task_id TEXT,                            -- bound seats claim their task at creation; NULL for the ringleader
     prd_id TEXT NOT NULL,
     parent_seat_id TEXT,                     -- who minted it → forms the agent tree
     minted_by TEXT NOT NULL,                 -- seat id or 'human'
     credential_id TEXT NOT NULL,
     binding TEXT NOT NULL CHECK (binding IN ('process', 'connection')),
                                              -- process: Arbiter launched it (v0.1); connection: attached MCP session (later)
+    harness_session_id TEXT,                 -- harness conversation resumed across invocations (e.g. claude --resume)
     code_hash TEXT,                          -- one-time attach code, only for 'connection' seats
-    status TEXT NOT NULL CHECK (status IN ('minted', 'active', 'expired', 'revoked')),
+    status TEXT NOT NULL CHECK (status IN ('minted', 'active', 'closed', 'expired', 'revoked')),
+                                             -- closed: finished normally; expired: lease ran out (autopsy); revoked: killed by core/human
     code_expires_at DATETIME,                -- attach codes are short-lived (5 min)
-    lease_expires_at DATETIME,               -- renewed by supervisor observation, not by the model
     FOREIGN KEY(parent_seat_id) REFERENCES seats(id),
     FOREIGN KEY(credential_id) REFERENCES credentials(id)
 );
 
--- Hash-chained, supervisor-signed audit log (§8)
-CREATE TABLE audit_log (
-    seq INTEGER PRIMARY KEY AUTOINCREMENT,
-    prd_id TEXT,
+-- One row per process launch. Leases and supervisor handles live here, not on the seat.
+CREATE TABLE invocations (
+    id TEXT PRIMARY KEY,
+    seat_id TEXT NOT NULL,
     task_id TEXT,
-    seat_id TEXT NOT NULL,                   -- 'human' or a seat id; the role is looked up via the seat
-    action TEXT NOT NULL,                    -- e.g. 'mint', 'launch', 'result', 'verdict', 'merge', 'outcome'
+    purpose TEXT NOT NULL,                   -- 'plan' | 'spec' | 'implement' | 'fix' | 'attack' | 'attack_maintenance'
+                                             -- | 'claim_check' | 'dispute_ruling' | 'verdict' | 'autopsy_summary'
+    supervisor_handle TEXT,                  -- PGID (POSIX) or Job Object name (Windows)
+    pid INTEGER,
+    lease_expires_at DATETIME,               -- renewed by supervisor observation, not by the model
+    exit_reason TEXT CHECK (exit_reason IN ('ok', 'invalid_output', 'crash', 'lease_expired', 'killed')),
+    cost_usd REAL,                           -- from the harness's final result event (§9.A)
+    started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    ended_at DATETIME,
+    FOREIGN KEY(seat_id) REFERENCES seats(id)
+);
+
+-- Hash-chained, supervisor-signed audit log (§8.B, action catalog in §8.E).
+-- One chain per PRD (chain = 'PRD-004'), plus chain = 'global' for entries with no PRD
+-- (credentials, org promotions), so each exported ledger file verifies on its own.
+CREATE TABLE audit_log (
+    chain TEXT NOT NULL,
+    seq INTEGER NOT NULL,                    -- 1, 2, 3... within the chain
+    task_id TEXT,
+    seat_id TEXT NOT NULL,                   -- 'human', 'core', or a seat id; the role is looked up via the seat
+    action TEXT NOT NULL,                    -- see §8.E
     payload_json TEXT NOT NULL,              -- hashes + summaries, never secrets or full transcripts
-    prev_hash TEXT NOT NULL,
-    entry_hash TEXT NOT NULL,                -- sha256(prev_hash || canonical(payload))
-    supervisor_signature TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    created_at TEXT NOT NULL,                -- RFC 3339 UTC, set by the core (part of the hash)
+    prev_hash TEXT NOT NULL,                 -- entry_hash of seq-1 in the same chain; 64 zeros for seq 1
+    entry_hash TEXT NOT NULL,                -- sha256(prev_hash || JCS(every other column except supervisor_signature))
+    supervisor_signature TEXT NOT NULL,      -- SSH signature over entry_hash
+    PRIMARY KEY (chain, seq)
 );
 ```
 
-Attestations live in **signed commit trailers** plus a **committed per-PRD ledger file** (§8.D). v2 used git notes; they were dropped because GitHub does not display them and they are not pushed by default.
+Attestations live in **signed commit trailers** plus a **committed per-PRD ledger file** (§8.D). An earlier draft used git notes; they were dropped because GitHub does not display them and they are not pushed by default.
 
 ### B. Machine-Global Registry (`~/.config/arbiter/global_registry.db`)
 
@@ -393,7 +459,7 @@ CREATE TABLE org_lessons (
     id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
     tech_stack_tag TEXT NOT NULL,            -- e.g. "sqlite", "react-native", "caddy"
-    file_pattern TEXT NOT NULL,
+    file_pattern TEXT NOT NULL,              -- repo-agnostic: extension/basename globs only, e.g. "**/*.sql" (§6.E)
     rule_markdown TEXT NOT NULL,
     origin_project_id TEXT NOT NULL,
     origin_lesson_id TEXT NOT NULL,
@@ -416,10 +482,11 @@ human (cred:human/Masked-Kunsiquat)
 └── PRD-004 lock (signed tag)
     └── PRD-004/ringleader.1         cred:claude-code/claude-opus-5-5 (launched)
         ├── TASK-101
-        │   ├── worker.1             (expired: autopsy)
-        │   ├── worker.2             ← author
+        │   ├── worker.1             (expired: lease ran out → autopsy)
+        │   ├── worker.2             ← author (3 invocations: implement, fix, fix)
         │   ├── adversary.1          cred:claude-code/claude-sonnet-5 (launched)
-        │   └── judge.1
+        │   ├── judge.1              (claim checks + verdict)
+        │   └── judge.2              (dispute ruling: fresh seat for independence)
         └── TASK-102
             ├── worker.1
             ├── adversary.1
@@ -427,6 +494,7 @@ human (cred:human/Masked-Kunsiquat)
 ```
 
 - Seat ids are readable paths plus a random suffix (`PRD-004/TASK-101/worker.2~7f3a`), so the ledger stays legible years later.
+- **One node per logical agent.** A seat covers every process launch (invocation) it needs; a fix after a rejection resumes the same seat. New seats appear only for the reasons in §8.B, so the tree stays readable.
 - **Only the Ringleader seat or the human can mint seats.** A worker cannot mint an adversary or judge seat to review its own work. This restriction is the core of the no-self-grading guarantee.
 - **Independence:** the adversary and judge seats for a task must differ from the author seat, must not descend from it, and should use a different credential (a different model) where one is configured. Authorship is stored on the task (`author_seat_id`), so it outlives the worker's lease.
 - **Harness-internal subagents** (for example, Claude Code's own Task tool) run *inside* their parent's seat. Arbiter treats them as the same agent. The tree only contains seats Arbiter minted.
@@ -436,10 +504,11 @@ human (cred:human/Masked-Kunsiquat)
 | Role | Reads | Writes | Never |
 |---|---|---|---|
 | Human | Everything | PRD + amendments, HITL decisions, outcome overrides, Gate 3 | — |
-| Ringleader | PRD, code index, lesson summaries | Tasks, edges, specs, reservations, seat requests (the core mints them) | Code, verdicts, outcomes |
-| Worker | Task spec, PRD invariants/boundaries, injected lessons, own prior-attempt autopsy | Code commit + JSON result | Tests marked `@adversary`, `.arbiter/**`, outcomes |
-| Adversary | Task spec, PRD invariants, the worker's **diff** (not its transcript, to avoid anchoring), injected lessons | Attack-test commit, `catch` outcomes | Application code |
-| Judge | Spec, diff, attack results, disputes, injections, blast radius | Verdict, claim rulings, injection resolutions, root-cause summaries, Gate 1 activation | Code, tests |
+| Ringleader | PRD, code index, lesson summaries | Task plan (tasks, edges, reservations, intents), then each task's spec just-in-time; seat requests (the core mints them) | Code, verdicts, outcomes, lesson selection |
+| Worker | Task spec, PRD invariants/boundaries, injected lessons, own prior-attempt autopsy | Working-tree changes (Arbiter commits them) + JSON result | Adversary test files, `.arbiter/**`, outcomes |
+| Adversary | Task spec, PRD invariants, the worker's **diff** (not its transcript, to avoid anchoring), injected lessons | Attack-test files only | Application code, outcomes |
+| Judge | Evidence bundle (§9.A): spec, diff, attack results, disputes, injections, blast radius | Verdict, claim rulings, dispute rulings, injection resolutions, root-cause summaries, Gate 1 activation | Code, tests |
+| Core (deterministic, no LLM) | Everything in `state.db` | Seats, injections (ranking, §6.C), deterministic outcomes (§6.A), ledger | — |
 | Synthesizer (deterministic, no LLM) | Tier 1 fingerprints | Gate 1 candidates, precision warnings | Anything in the repo |
 
 **How knowledge moves:**
@@ -449,7 +518,7 @@ human (cred:human/Masked-Kunsiquat)
             │                                                            ▼
  Tier 3 Org ◄── Gate 3 (human) ── Tier 2 Project ◄── Gate 1 ── Tier 1 Autopsies/Traces
                                    ▲    │                           ▲
-          outcomes (Judge/Adv/Human)    └── injected into ──► Worker/Adversary
+       outcomes (Judge/Core/Human)      └── injected into ──► Worker/Adversary
                                    │                                │
                                    └──────── resolved at verdict ◄──┘  (failures fingerprinted)
 ```
@@ -457,95 +526,143 @@ human (cred:human/Masked-Kunsiquat)
 - Raw telemetry (Tier 1) never reaches another task's prompt. It moves upward only as a Judge-written summary that passes Gate 1.
 - Lessons move downward only through ranked, budgeted injection. Every injection is recorded, and every injection comes back as an outcome. That loop is what makes U computable.
 
-### 5.1–5.7 Single-Lane Pipeline (core)
+### 5.1–5.8 Single-Lane Pipeline (core)
 
 The core runs **one task at a time** in DAG order. Parallel dispatch is the Fleet module (§12).
 
 ```
-1. Locked PRD ──► Ringleader (Decompose → Task DAG + reservations + symbol deps)
+1. Locked PRD ──► Ringleader (Plan → tasks + edges + reservations + one-paragraph intents)
                       │
                       ├── Task touches > 3 files or est. > 15m? ──► Split, or HITL proposal
                       └── Within atomic limits?                 ──► 'backlog' / 'ready'
                                                                         │
 ┌───────────────────────────────────────────────────────────────────────┘
 ▼
-2. Next 'ready' task in topological order; worker/adversary/judge seats minted under the Ringleader
+2. Next 'ready' task in topological order
+   - Ringleader writes its full spec now, against the current feature-branch code (just-in-time)
+   - Core assembles injected lessons (§6.C); worker/adversary/judge seats minted under the Ringleader
    ▼
 3. Worker (worktree slot, process-bound seat)
-   - Writes code + unit tests, submits commit
-   - Submit-time diff check (boundaries, protected files) ──► reject if violated
+   - Edits files + unit tests, exits with a JSON result
+   - Arbiter snapshots the slot into the submit commit (§5.3)
+   - Diff check (boundaries, protected files) ──► reject if violated (counts as an attempt)
    ▼
-4. Adversary (separate process, own token) writes attack tests as a separate commit
+4. Adversary (separate process) writes attack-test files; Arbiter commits them separately
    ▼
-   Attack Validation Protocol
-   ├── ERROR (syntax/import/collection/timeout) ──► back to Adversary (max 2), worker untouched
-   ├── ASSERTION_FAIL + claim upheld            ──► back to Worker (counts toward cap of 3)
+   Unseen-state check (§5.3), then Attack Validation Protocol (§5.4)
+   ├── ERROR (test mechanics: build/import/collection, throw site in test code, timeout, flaky)
+   │                                            ──► back to Adversary (max 2 regenerations), worker untouched
+   ├── ASSERTION_FAIL + claim upheld            ──► back to Worker (counts toward cap of 3); one dispute allowed
    ├── ASSERTION_FAIL + claim rejected          ──► attack dismissed, logged against Adversary
-   └── All attacks PASS                         ──► Judge
+   └── All remaining attacks PASS               ──► Judge
                                                       │
 ┌─────────────────────────────────────────────────────┘
 ▼
 5. Judge
    ├── Low blast radius  ──► Integration Gate
    └── High blast radius ──► 'awaiting_human' ──► Integration Gate on approval
-   (Resolves every lesson injection for the task — §6)
+   (From v0.2: resolves every lesson injection for the task — §6)
    ▼
-6. Integration gate: rebase onto feature tip → full suite + all accumulated attack tests → signed fast-forward
-   ▼
-7. Staleness sweep: changed exported symbols ──► downstream tasks marked 'stale' ──► Ringleader re-specs
+6. Integration gate: rebase onto feature tip → unseen-state check → full suite + all accumulated attack tests
+   ├── Green ──► supervisor-signed squash commit on the feature branch + ledger
+   └── Red   ──► routed by failing file (§5.6)
+
+Every relaunch in steps 2–6 increments the task's attempt counter; the ceiling and budget are in §5.8.
 ```
 
 ### 5.1 The Ringleader (Planning, Triage, Replanning)
 
 - High-reasoning model (configurable; harness-agnostic).
-- Compiles the locked PRD into a DAG: tasks, `task_edges`, per-task reservation prefixes (each must fall within PRD boundaries), and `task_symbol_deps` (the existing symbols each task's spec relies on).
+- **Plan (once per PRD):** compiles the locked PRD into tasks, `task_edges`, per-task reservation prefixes (each must fall within PRD boundaries), and a one-paragraph `intent` per task. The plan is cheap to review and does not describe code that doesn't exist yet.
+- **Spec (just-in-time, once per task):** when a task becomes `ready`, the same Ringleader seat writes its full spec against the *current* feature branch, after every upstream task has merged. The spec references real signatures, not the ones an upstream task was expected to produce. In single-lane mode nothing merges between spec and execution, so a spec cannot go stale; symbol-drift staleness is a Fleet concern (§12).
 - **Triage Scope Guard:** no task may reserve more than 3 files (or 1 directory prefix) or exceed ~15 minutes of estimated runtime. Ambiguous decompositions prompt the human.
-- **Injection:** assembles each task's context from PRD invariants, ranked Org Invariants and Project Lessons (§6.B).
-- **Interface drift / cascading invalidation:** after every merge, the supervisor diffs tree-sitter signature hashes of exported symbols. Any task in `backlog`/`ready` with a `task_symbol_deps` row whose hash changed is set to `stale`. The Ringleader regenerates its spec (`spec_revision += 1`) against the new code. This needs **no human signature** because the PRD is unchanged. Under Fleet, a task already running when its deps change must rebase before its result is accepted. Only if the new spec would require touching files outside PRD boundaries or violate an invariant does the PRD move to `amendment_needed`.
+- **Injection is not the Ringleader's job.** The core assembles each task's context deterministically (PRD invariants plus ranked lessons, §6.C). The Ringleader sees lesson summaries for planning but cannot choose what gets injected, so it cannot bias which lessons collect outcomes.
+- **Spec stays inside the PRD:** a spec is validated against the task's reservations and the PRD's boundaries before dispatch. If a spec cannot be written without touching paths outside PRD boundaries, the PRD moves to `amendment_needed`. Specs need **no human signature** because the PRD is unchanged.
 
 ### 5.2 Reservations (single-lane)
 
 - The Ringleader declares each task's reservations: path prefixes inside the PRD boundaries.
 - In single-lane mode nothing competes for them. They define the scope that the submit-time diff check enforces.
-- **Scope expansion (v0.1):** the worker ends its run with a structured `scope_request` in its result (§9.A). The core grants it if the paths are inside the PRD boundaries and re-runs the task with the enlarged reservation set; otherwise the PRD goes to `amendment_needed`. From v0.3, attached MCP sessions can call `arbiter_reserve` mid-run instead. Fleet-mode contention rules are in §12.
+- **Scope expansion (v0.1):** the worker ends its run with `status: scope_request` (§9.A). If the paths are inside the PRD boundaries and the enlarged set still satisfies the Triage Scope Guard, the core grants it and **resumes the same worker seat** (same harness session, worktree left as is) with the enlarged reservation set. Paths outside PRD boundaries, or growth past the guard, send the task to `awaiting_human`. Each grant counts as an attempt (§5.8). From v0.3, attached MCP sessions can call `arbiter_reserve` mid-run instead. Fleet-mode contention rules are in §12.
+- The integration gate can also create a scope request automatically (§5.6).
 
 ### 5.3 The Worker (Execution Sub-Process)
 
 - Runs in the worktree slot (§7) under a supervisor-managed process container.
-- Launched by the Runner with its seat already bound to the process (§8.B). It needs no Arbiter tools in v0.1: it edits files, commits, and exits with a result (§9.A).
-- **Submit-time diff check (the real boundary):** `git diff --name-only <base_commit>..<submit_commit>` must be a subset of the task's reservations and must not touch `.arbiter/**` or any adversary test file (`**/*.adversary.test.*` or files carrying an `@adversary` marker). A violation rejects the submission deterministically, whatever tools the harness used to produce it.
+- Launched by the Runner with its seat already bound to the process (§8.B). It needs no Arbiter tools in v0.1: it edits files and exits with a result (§9.A).
+- **Arbiter commits, not the agent.** When the worker exits, the Runner stages the slot's working tree (`git add -A`) and writes it as one commit whose parent is `base_commit`, using `git commit-tree`. Whatever the agent did with refs (extra commits, amends, rebases, checkouts, other branches) is ignored, and a forgotten commit is not a failure. That commit is `submit_commit`. Its committer is the user's identity, and the author is the seat (`PRD-004/TASK-101/worker.2~7f3a <arbiter@localhost>`).
+- **Diff check (the real boundary):** `git diff --no-renames --name-status -z <base_commit> <submit_commit>`. Rename detection is off so a rename shows up as a delete plus an add, and every path on either side is checked:
+  - every added or modified path must fall inside the task's reservations;
+  - no path, added, modified, or **deleted**, may match `.arbiter/**` or the project's adversary test pattern (§9.C);
+  - deny rules compare case-insensitively (on Windows, `.ARBITER/x` and `.arbiter/x` are the same file); allow rules compare case-sensitively.
+
+  A violation rejects the submission deterministically, whatever tools the harness used to produce it. The adversary pattern is a path glob only; there is no content marker, because a worker can delete a marker.
+- **Unseen state (what the diff cannot show):** the diff sees tracked files only. Two kinds of change bypass it and would otherwise carry into the gates:
+  1. *Ignored dependency dirs* kept in the warm slot (`node_modules`, `target`, `.venv`, per the keep-list). A worker could patch a dependency until the tests pass.
+  2. *`.git` config and hooks*, which linked worktrees share with the main repo. A hook or a `core.fsmonitor` setting would run inside Arbiter's own git commands, including the signed merge.
+
+  Before any agent launch, the Runner records a snapshot: the lockfile hash, plus size and mtime for every file under the keep-list dirs, `.git/config`, and `.git/hooks/`. Before any test run (attack validation and integration gate) it compares against the snapshot. Changed dependency dirs are reinstalled from the lockfile; changed `.git` config or hooks are restored and logged as a violation against the seat. The liveness watcher (§7) already sees these writes, so the common case costs nothing. Separately, every git command Arbiter runs itself passes `-c core.hooksPath=<empty arbiter dir> -c core.fsmonitor=false`.
 
 ### 5.4 The Adversarial Reviewer & Attack Validation Protocol
 
-- **Rule:** never modifies application code. Its commit may only add/modify files matching the adversary test pattern (diff-checked like the worker's).
-- Each attack test must cite the INVARIANT or AC it targets (in the test name or an `@targets INVARIANT-2` annotation).
-- Attack tests run via the project's test runner with a machine-readable reporter (JUnit XML / JSON / TAP). Each attack test is classified:
-  - **ERROR:** the test failed to parse, import, collect, or finished by timeout. This is evidence about the *test*, not the code. It goes back to the Adversary (max 2 regenerations) and does not touch the worker's retry count.
-  - **ASSERTION_FAIL:** candidate defect. The Judge performs a **claim check**: does the cited invariant/AC actually require the asserted behavior? Upheld → rejection to Worker with the trace and diff. Not upheld → attack dismissed and recorded against the Adversary.
-  - **PASS:** no defect found by this attack.
-- **Worker dispute:** on an upheld rejection, the worker may file one dispute (`disputes` table) arguing the test is wrong. The Judge rules; if confidence is low the dispute escalates to the human.
-- **Retry cap:** the worker gets at most 3 **upheld** rejections, then the task goes to `awaiting_human`.
+- **Rule:** never modifies application code. It may only add or modify files that match the adversary test pattern (§9.C) inside the PRD boundaries. Arbiter commits them on top of `submit_commit`, and the result is diff-checked like the worker's.
+- **Test identity comes from the runner, not the model.** Each attack test's name must encode the INVARIANT or AC it targets, e.g. `TestAttack_INVARIANT_2_RawSQLInRefresh` or `attack INVARIANT-2: raw SQL in refresh`. Arbiter reads test ids from the runner's machine-readable report and extracts targets with `(INVARIANT|AC)[-_](\d+)`. A test with no parseable target is an ERROR. The Adversary does not list its tests in JSON, so its list and the runner's can't disagree.
+- Attack tests run through the project's test command with a machine-readable reporter (`go test -json`, JUnit XML, or TAP; §9.C).
+
+**Classification: by where the failure comes from, not by the runner's label.** Runners disagree about what an "error" is. Jest and pytest both report a `TypeError` from calling a made-up API *inside the test body* as an ordinary failure, and in Go a single broken `_test.go` file fails the whole package's build. So each attack result is classified by these rules, applied in order:
+
+1. **ERROR: build, import, or collection failure** whose compiler or loader errors are all located in adversary files. (If errors are also in application files, the build broke on the worker's code: see step 4.)
+2. **ERROR: timeout.**
+3. **ERROR: throw site in test code.** The failure is not an assertion-library failure, and the top in-repo stack frame is in an adversary file or test helper. Stack frames are extracted with the same normalizer as §6.D.
+4. **Candidate ASSERTION_FAIL:** an assertion-library failure, or an exception whose top in-repo frame is in non-test code, or a build failure located in application code.
+5. **Reproduction:** each candidate is rerun once in isolation. If it passes on the rerun it is **ERROR (flaky)** and is not kept.
+
+Outcomes:
+
+- **ERROR** is evidence about the *test*, not the code. Erroring tests go back to the Adversary with their output (max 2 regenerations) and don't touch the worker's counts. Tests still erroring after the second regeneration are **dropped**, logged against the Adversary, and the review continues with the rest. If no valid attack remains, the task skips the automatic path and goes to `awaiting_human` with "no adversarial coverage", whatever the blast radius.
+- **ASSERTION_FAIL** is a candidate defect. The Judge performs a **claim check**: does the cited invariant/AC actually require the asserted behavior? Upheld → rejection to the Worker with the trace and the test. Not upheld → attack dismissed and logged against the Adversary.
+- **PASS:** no defect found by this attack.
+
+**Across attempts.** When the worker resubmits after an upheld rejection:
+
+- Every earlier attack (kept and upheld) is rerun deterministically; the upheld ones must now pass.
+- The same Adversary seat gets one pass over the **incremental** diff only (previous `submit_commit` → new one). It can't restart the review from scratch, which would give the worker a moving target, but a fix doesn't go unreviewed either.
+
+**Worker dispute (once per task).** When resumed with an upheld rejection, the worker may return `dispute: {attack_test_id, argument}` in its result instead of a fix (§9.A). Code changes from a disputing run are discarded. A **fresh judge seat** (not the one that upheld the claim; a different credential if configured) rules `upheld` (the worker is right, attack dismissed, rejection no longer counts), `dismissed` (the rejection stands, and the worker is resumed to fix it), or `escalated` (goes to the human). There's no numeric confidence: the Judge picks one of the three.
+
+- **Rejection cap:** the worker gets at most 3 **upheld** rejections, then the task goes to `awaiting_human`. The overall attempt ceiling (§5.8) applies too.
 - **Terminology:** a failing attack test is *evidence* of a defect, not proof. Proof comes only from an upheld claim.
+- **Dismissed attacks** are counted per adversary credential (`arbiter seats --stats`), so you can see which model writes bad attacks. They carry no other penalty.
 - Passing attack tests are kept. They join the PRD's regression suite that the integration gate runs (§5.6).
 
 ### 5.5 The Judge (Neutral Arbiter)
 
-- Evaluates the worker commit, attack results, the frozen spec, and the tree-sitter blast radius:
-  - **Low blast radius** (pure logic, docs, tests; no exported-signature changes outside the task's reservations): approve to the integration gate.
-  - **High blast radius** (migrations, auth config, root schema, exported-signature changes consumed elsewhere): `awaiting_human`.
-- Rules on attack claims and disputes (§5.4).
-- **Resolves every lesson injection** for the task at verdict time (§6.A).
-- Writes Tier 1 root-cause summaries for autopsies.
+- Evaluates the evidence bundle (§9.A): worker diff, attack results, the frozen spec, and the blast radius.
+- **Blast radius is computed by the core, not judged.** The Judge may escalate a low-radius task to `awaiting_human`, but it can never approve a high-radius task on its own.
+  - **v0.1 (path-based):** high if the diff touches any `high_risk` glob in project config (§9.C: migrations, auth config, root schema, CI files), or any §13 protected path. Otherwise low. (Paths outside the task's reservations never reach the Judge; the diff check has already rejected them.)
+  - **v0.2+ (symbol-based):** adds tree-sitter: exported-signature changes consumed outside the task's reservations are high. Tree-sitter's Go bindings need cgo, so taking them on in v0.2 is a deliberate decision; v0.1 stays cgo-free.
+- Rules on attack claims (§5.4). Dispute rulings go to a fresh judge seat.
+- From v0.2: **resolves every lesson injection** for the task at verdict time (§6.A).
+- Writes Tier 1 root-cause summaries for autopsies (an `autopsy_summary` invocation of the task's judge seat, minted on demand if needed).
 
 ### 5.6 Integration Gate
 
 Even one task at a time, a task tested against only its own tests can break earlier work. Before any merge:
 
-1. Rebase the task branch onto the current feature-branch tip. A conflict sends the task back to the worker with a rebase instruction; it does not count as a rejection. Conflicts are rare single-lane, routine under Fleet.
-2. Run the full test suite **plus every accumulated attack test for the PRD**.
-3. Green → fast-forward the feature branch with a supervisor-signed commit carrying attribution trailers (§8.D), append to the ledger, and run the staleness sweep (§5.1). Red → the task goes back to the worker with the failing output.
+1. Rebase the task's commits (worker submit + attack tests) onto the current feature-branch tip. A conflict resumes the worker seat with a rebase instruction; it does not count as a rejection but does count as an attempt. Conflicts are rare single-lane, routine under Fleet.
+2. Unseen-state check (§5.3).
+3. Run the full test suite **plus every accumulated attack test for the PRD**. Each failing test is rerun once; a test that then passes is reported as flaky and does not block, but is flagged for the human.
+4. **Green** → create **one supervisor-signed squash commit** on the feature branch: worker changes + attack tests + the ledger update, with attribution trailers (§8.D). The feature branch moves to it (`update-ref`); the task's intermediate commits are not kept on the branch.
+5. **Red** → route each failure by the file where it originates (top in-repo frame or build error location):
 
-Under Fleet this becomes a serialized merge queue (§12).
+| Failure is in | Goes to | Why |
+|---|---|---|
+| The task's own reservations | Worker seat (resume, with the failing output) | The worker can fix it |
+| An adversary test file (e.g. an earlier task's attack test still calls a signature this task legitimately changed) | **Attack maintenance**: the *current* task's adversary seat (the file's original seat closed with its task) updates the test to the new interface without weakening its assertion; the Judge checks the diff for weakened assertions | The worker may not touch adversary files |
+| Another non-adversary path inside PRD boundaries | Automatic scope request for that path (§5.2), then the worker | The worker needs the path reserved first |
+| Outside PRD boundaries | `awaiting_human` | Probably needs a PRD amendment |
+
+Every red counts as an attempt (§5.8), so this loop always terminates. Under Fleet the gate becomes a serialized merge queue (§12).
 
 ### 5.7 Human in the Loop (HITL)
 
@@ -556,12 +673,25 @@ Worker: Done (14 tests passed)
 Adversary: 5 attacks passed (INVARIANT-1, INVARIANT-2); 1 dismissed (claim not upheld)
 Blast Radius: Touches 2 critical files in src/auth; changes signature of signToken()
 
-[A]pprove   [R]eject with note   [I]nspect Diff   [S]hell into worktree
+[A]pprove   [R]etry with note   [F]ail task   [P]RD amendment   [I]nspect Diff   [S]hell into worktree
 > _
 ```
 
 - Approvals are keypresses recorded in the audit log, not SSH signatures. The human's signature on the final feature → main merge covers them.
-- Rejections send the task back to the worker, count as upheld rejections, and prompt for an optional lesson outcome.
+- Retries send the task back to the worker, count as upheld rejections, and prompt for an optional lesson outcome (v0.2+). The other exits are defined in §5.8.
+
+### 5.8 Attempts, Budget & Terminal States
+
+Every retry path has one shared bound.
+
+- **Attempt ceiling:** every agent relaunch for a task increments `tasks.attempt`, whatever the reason: diff-check rejection, upheld rejection, integration red, rebase conflict, crash or lease expiry, granted scope request, invalid-output retry. At `attempt > max_attempts` (default 6, set in project config) the task goes to `awaiting_human`. The narrower caps (3 upheld rejections, 2 adversary regenerations, 1 schema retry) still apply inside it.
+- **Budget:** each invocation records `cost_usd` from the harness's final result event (§9.A). Task spend and PRD spend (`prds.spent_usd`) are sums of that. Before every launch the core checks `prds.spent_usd < max_budget_usd`; if the budget is used up, the task goes to `awaiting_human` and nothing new launches for that PRD. On subscription plans the reported cost is notional but still works as a relative brake.
+- **Ways out of `awaiting_human`** (the HITL prompt, §5.7):
+  - **Approve**: continue to the next step (integration gate, or the verdict for "no adversarial coverage").
+  - **Retry with note**: resume the worker seat with the note; counts as an upheld rejection, and resets `attempt` to 0 once so the human can buy more tries.
+  - **Fail task**: sets `failed`, which is terminal. Downstream tasks stay in `backlog`, and the PRD can't complete until you amend it (removing or replacing the task) or reset the task.
+  - **Amend PRD**: moves the PRD to `amendment_needed`; you edit it and re-sign it (`arbiter prd amend`), and the Ringleader re-plans tasks that aren't done yet.
+- **PRD completion:** when every task is `done`, the PRD becomes `completed` and `arbiter prd review` offers the final signed merge to main. It moves to `archived` after that merge lands.
 
 ---
 
@@ -573,7 +703,8 @@ Blast Radius: Touches 2 critical files in src/auth; changes signature of signTok
        ▼  GATE 1: Candidate Activation (same fingerprint in >= 2 distinct tasks + Judge/Human sign-off + conflict check)
 [ Active Project Lesson ]
        │
-       ▼  GATE 2: Efficacy Threshold (U >= 0.80, relevant samples >= 5 distinct tasks, Contradictions == 0)
+       ▼  GATE 2: Efficacy Threshold (U >= 0.80, relevant samples >= 5 distinct tasks, Contradictions == 0,
+       │          >= 1 evidence-backed catch)
 [ Staged for Org Promotion ]
        │
        ▼  GATE 3: Human SSH Signature (batched manifest)
@@ -587,13 +718,16 @@ Misses and catches are not left to manual bookkeeping. When the Judge renders a 
 | Resolution | Meaning | Effect |
 |---|---|---|
 | `irrelevant` | The diff never touched the lesson's concern | Excluded from U; lowers precision P |
-| `catch` | The concern came up and the final code complies, or the lesson was cited in an upheld rejection that was then fixed | +1.0 |
+| `catch` | The concern came up and the final code complies | +1.0 |
+| `catch` (evidence-backed) | The lesson was cited in an upheld rejection and the next submission fixed it, or a human logged the catch | +1.0, and sets `evidence_backed = 1` |
 | `miss` | The concern came up and a defect in that area still reached the Adversary, Judge, integration gate, or human | −1.5 |
 | `contradiction` | Following the lesson caused a failure, or the lesson is wrong for this code | −3.0 |
 
-- The Adversary may also log `catch` when an attack test targeting a lesson's concern passes.
-- The **worker role cannot author outcomes.** This replaces v1's per-key "no self-endorsement" rule.
-- **Post-merge misses** (a bug found in production weeks later) are optional: `arbiter lesson outcome <id> --miss --task <task-id> -m "..."` overrides the Judge's entry for that task at human weight. U is designed to work without them.
+- **Compliance is not prevention.** A plain `catch` only shows the code agreed with the lesson; the model may have complied anyway. Rules it already follows ("use parameterized queries") would otherwise pile up catches and get promoted as no-ops, and judges of the same model that wrote the lesson would keep confirming it. So plain catches count toward U, but Gate 2 also requires at least one evidence-backed catch (§6.E).
+- **Deterministic misses (author `core`).** If a lesson's `source_fingerprint` shows up again in any failure (attack, integration red, autopsy) in a task it was injected into, the core records that injection as `relevant` + `miss` itself, before the Judge runs. The Judge cannot mark it `irrelevant`; only a human override can. This closes the easiest way to hide a miss.
+- **Only the Judge, the core, and the human author outcomes.** The Adversary does not: it would be grading its own tests. An attack test may name a lesson in its test name as evidence, and the Judge weighs it. The **worker role cannot author outcomes** either. This replaces v1's per-key "no self-endorsement" rule.
+- **Post-merge misses** (a bug found in production weeks later) are optional: `arbiter lesson outcome <id> --miss --task <task-id> -m "..."` overrides the entry for that task at human weight. U is designed to work without them.
+- **Org lessons** are resolved like project lessons (`lesson_tier = 'org'`). Their outcomes stay in each project's `state.db`; `arbiter org stage` rolls them up across registered projects.
 
 ### 6.B The Utility Formula
 
@@ -603,7 +737,7 @@ $$U = \frac{C - 1.5M - 3.0X}{N_{\text{injections}}}$$
 
 This has two problems. (1) Most injections do not touch the lesson's concern, so a correct lesson with a broad glob can never reach 0.80. The metric ends up measuring relevance × efficacy. (2) The signer weights from v1 (human 1.0, judge 0.7) are not applied.
 
-**v2 formula.** Over resolved **relevant** injections only, with signer weight $w$ (human 1.0, judge/adversary 0.7) and shrinkage constant $k = 1$:
+**Formula (since v2).** Over resolved **relevant** injections only, with signer weight $w$ (human and core 1.0, judge 0.7) and shrinkage constant $k = 1$:
 
 $$U = \frac{\sum w_i\,[\text{catch}_i] \;-\; 1.5\sum w_i\,[\text{miss}_i] \;-\; 3.0\sum w_i\,[\text{contradiction}_i]}{\sum w_i \;+\; k}$$
 
@@ -611,7 +745,8 @@ Plain text: `U = (Σw·catch − 1.5·Σw·miss − 3.0·Σw·contradiction) / (
 
 - With equal weights and `k = 0`, this reduces to the original formula restricted to relevant injections.
 - `k` keeps small samples from scoring as perfect: 3 catches alone never reach 0.80.
-- Range is (−3, 1). Uniqueness on `(lesson_id, task_id)` keeps it bounded.
+- Range is (−3, 1). Uniqueness on `(lesson_id, lesson_tier, task_id)` keeps it bounded.
+- When every outcome has the same weight, `w` cancels between numerator and denominator except against `k`. In effect, judge-only evidence just needs more samples (acting like `k ≈ 1.43`); mixed evidence counts human and core entries more.
 - Break-even for Gate 2: ignoring `k`, U ≥ 0.80 needs C ≥ 11.5·M. A lesson must be right about 92% of the time it matters.
 - **Precision** `P = relevant / total injections` is tracked separately. When P < 0.3 over ≥ 10 injections, the synthesizer proposes a narrower `file_pattern`.
 
@@ -625,14 +760,21 @@ Worked examples (judge-signed, w = 0.7):
 | 12 | 1 | 7.35 / 10.1 = 0.73 | ✗ |
 | 20 | 1 | 12.95 / 15.7 = 0.82 | ✓ |
 | any | any, with ≥1 contradiction | — | ✗ (hard rule) |
+| any | any, with no evidence-backed catch | — | ✗ (hard rule) |
 
-Because Gate 2 already requires zero contradictions, the −3.0 weight matters mainly for **injection ranking**. There it quickly buries a lesson that has been contradicted once, before the circuit breaker quarantines it at two.
+Because Gate 2 already requires zero contradictions, the −3.0 weight matters mainly for **injection ranking** (§6.C). There, a single contradiction drops a lesson below any new lesson of the same specificity, and out of injection entirely unless it has several catches behind it, well before the circuit breaker quarantines it at two.
 
 ### 6.C Injection Ranking & Context Budget
 
-- Candidates are lessons whose `file_pattern` matches any of the task's reservations, plus org lessons whose `tech_stack_tag` is in the project's detected stack.
-- `score = specificity(file_pattern) × max(U, 0.5)`. Specificity is the number of literal (non-wildcard) path segments. New lessons use the 0.5 floor so they can accumulate evidence.
-- Inject the top lessons until a **token budget** (default 1,500 tokens, max 8 lessons) is hit. Everything injected is recorded in `lesson_injections`.
+The **core** assembles injections deterministically; no agent chooses them.
+
+- **Candidates:** project lessons whose `file_pattern` overlaps any of the task's reservations, plus org lessons whose `tech_stack_tag` is in the project's detected stack and whose (repo-agnostic) `file_pattern` overlaps a reservation. Quarantined lessons are never candidates.
+- **Overlap** between a reservation prefix and a glob: the glob matches at least one tracked file under the prefix at the task's `base_commit`, or, when no files match yet, the glob's literal leading segments and the prefix are segment-prefixes of each other.
+- **Ranking score:** `score = specificity × U_rank`, where
+  - `specificity = 1 + (number of literal, non-wildcard path segments)`, so `**/*.sql` scores 1 rather than 0, and `src/db/**/*.ts` scores 3;
+  - `U_rank = (Σw·catch − 1.5·Σw·miss − 3.0·Σw·contradiction + 0.5·k) / (Σw + k)`: the §6.B formula with a prior of 0.5 in place of v2's `max(U, 0.5)` floor. A new lesson scores 0.5. A lesson with 5 judge catches and 1 contradiction scores 0.37. A lesson contradicted on its first relevant use scores −0.94. The old floor gave all three the same 0.5.
+  - Lessons with `U_rank < 0` are not injected. Gate 2 uses the §6.B formula without the prior.
+- Inject the top lessons until a **token budget** (default 1,500 tokens, max 8 lessons) is hit. Ties break by lesson id so ranking is reproducible. Everything injected is recorded in `lesson_injections`.
 - **Conflicts:** at Gate 1, the Judge compares a candidate against active lessons with overlapping patterns. A suspected conflict goes to the human instead of auto-activating.
 
 ### 6.D Trace Fingerprinting (Gate 1 clustering)
@@ -647,12 +789,12 @@ Raw stack traces embed poorly: most `TypeError: Cannot read properties of undefi
 ### 6.E The Three Knowledge Gates
 
 - **Gate 1 (Memory → Project Lesson):** fingerprint cluster ≥ 2 distinct tasks, conflict check passes, activated by Judge or human.
-- **Gate 2 (Project → Org Staging):** ≥ 5 distinct relevant tasks, U ≥ 0.80, zero contradictions. Status becomes `staged_for_org`.
-- **Gate 3 (Org Invariant):** the human signs a promotion manifest (§8.C). Agents cannot write to `global_registry.db`.
+- **Gate 2 (Project → Org Staging):** ≥ 5 distinct relevant tasks, U ≥ 0.80, zero contradictions, and at least one evidence-backed catch (§6.A). Status becomes `staged_for_org`.
+- **Gate 3 (Org Invariant):** the human signs a promotion manifest (§8.C). Each staged lesson's `file_pattern` must be rewritten to be repo-agnostic, using only extension or basename globs such as `**/*.sql` or `**/migrations/*.sql`. Paths like `src/db/**` mean nothing in another repo, and the manifest step rejects them. Agents cannot write to `global_registry.db`.
 
 ### 6.F Contradiction Circuit Breaker
 
-Any project lesson with ≥ 2 contradictions is immediately `quarantined`: it stops being injected and is flagged for human review.
+Any project lesson with ≥ 2 contradictions is immediately `quarantined`: it stops being injected and is flagged for human review. An org lesson with ≥ 2 contradictions summed across registered projects stops being injected everywhere and is flagged for human review.
 
 ---
 
@@ -660,7 +802,7 @@ Any project lesson with ≥ 2 contradictions is immediately `quarantined`: it st
 
 ### Process Supervision (cross-platform)
 
-All sub-processes (Worker, Adversary, test runners) are launched through a `Supervisor` interface:
+All sub-processes (every agent role, test runners, installs) are launched through a `Supervisor` interface:
 
 ```go
 type Supervisor interface {
@@ -683,14 +825,14 @@ Fresh worktrees per task would mean `npm install` / `cargo build` every time. In
 
 - Single-lane uses one persistent worktree (`.arbiter/worktrees/slot-0`). Fleet extends this to a pool of N slots (§12).
 - Between tasks, the slot is reset with `git checkout --detach <base> && git clean -fdx -e node_modules -e target -e .venv ...` (per-ecosystem keep-list), so dependency directories survive.
-- Dependencies reinstall only when the lockfile hash differs from the slot's last install.
+- Dependencies reinstall only when the lockfile hash differs from the slot's last install, **or** when the unseen-state check (§5.3) finds the keep-list dirs changed during an agent run. Keeping these dirs is a speed optimization and must never let one task's edits leak into the next task's tests.
 - Shared caches: pnpm store, `GOCACHE`, `sccache`; per-slot `CARGO_TARGET_DIR`.
 - Windows: recommend placing the repo on a Dev Drive (ReFS) for faster I/O and copy-on-write.
 
 ### Liveness & Leases
 
-- Liveness = process alive **and** activity (stdout or worktree fs writes) within the last 120s. The supervisor observes this itself; the model never has to heartbeat.
-- Standard lease: 15 minutes, renewed automatically while the process is live and active, up to an absolute ceiling (default 60 minutes). Test runs launched by the Runner pause the lease clock.
+- Liveness = process alive **and** activity within the last 120s. Activity means a stdout event or a worktree fs write. Harnesses run with streaming output (§9.A), so a role that only reads and thinks (Ringleader, Judge) still emits an event per turn or tool call. With buffered JSON output it would look dead until it exited. The supervisor observes all of this itself; the model never has to heartbeat.
+- Leases belong to invocations (§4, `invocations.lease_expires_at`). Standard lease: 15 minutes, renewed automatically while the process is live and active, up to an absolute ceiling (default 60 minutes). Test runs launched by the Runner pause the lease clock.
 - **Expiry kills, it doesn't error.** When a lease ends, the supervisor terminates the process and runs the autopsy. The model is never handed an "expired" error it might try to work around.
 - `awaiting_human` freezes all timers.
 
@@ -699,10 +841,10 @@ Fresh worktrees per task would mean `npm install` / `cargo build` every time. In
 When an agent times out or crashes:
 
 1. `Terminate` the container.
-2. Capture the last 50 lines of stdout/stderr and `git diff`, and compute the trace fingerprint.
-3. Evaluate progress deterministically: if the diff is non-empty **and** the project builds/type-checks → checkpoint commit (`checkpoint/<task>/attempt-N`). Otherwise `git reset --hard <base_commit>`.
-4. The Judge writes a one-line root-cause summary into the autopsy memory.
-5. The next attempt's prompt gets: *"WARNING: Previous attempt failed with <summary>. Do NOT repeat that approach."*
+2. Capture the last 50 lines of stdout/stderr and `git diff`. From v0.2, also compute the trace fingerprint (§6.D).
+3. Evaluate progress deterministically: if the diff is non-empty **and** the project builds/type-checks → checkpoint commit (`checkpoint/<task>/attempt-N`), and the next seat starts from it. Otherwise `git reset --hard <base_commit>`.
+4. The seat is marked `expired` (lease) or `revoked` (crash), and the Judge writes a one-line root-cause summary into the autopsy memory (an `autopsy_summary` invocation).
+5. A **new** worker seat with a fresh harness session gets the next attempt, with this in its prompt: *"WARNING: Previous attempt failed with <summary>. Do NOT repeat that approach."* Resuming the crashed session would carry the failed approach forward in context.
 
 ---
 
@@ -710,11 +852,11 @@ When an agent times out or crashes:
 
 ### 8.A Threat Model
 
-Everything runs locally as one OS user. Any process running as that user can read memory, env vars, and files. Cryptography cannot stop a hostile local process, and v2 does not claim otherwise.
+Everything runs locally as one OS user. Any process running as that user can read memory, env vars, and files. Cryptography cannot stop a hostile local process, and this spec does not claim otherwise.
 
 **Defended against:**
-1. *Agent overreach:* scope creep, editing tests to pass, touching the PRD, self-grading. Enforced by submit-time diff checks, planner-only seat minting, and role-restricted outcome authoring.
-2. *Confused or prompt-injected agents* acting outside their role through Arbiter's own APIs. Seats are role- and task-bound and expire with the lease.
+1. *Agent overreach:* scope creep, editing tests to pass (including patching ignored dependency dirs or planting git hooks), touching the PRD, self-grading. Enforced by submit-time diff checks, the unseen-state check (§5.3), per-role tool profiles (§9.A), planner-only seat minting, and role-restricted outcome authoring.
+2. *Confused or prompt-injected agents* acting outside their role through Arbiter's own APIs. Seats are role- and task-bound and end with the task.
 3. *After-the-fact tampering* with history, attribution, or the outcome ledger: hash-chained ledger, signed commits and tags.
 4. *A compromised or remote core forging your approval:* the core never holds your key; human signatures are always produced client-side (§8.C).
 
@@ -726,14 +868,20 @@ v1's per-agent ephemeral Ed25519 keypairs are **removed**. The supervisor held e
 
 - **Credential:** what kind of agent this is, e.g. `cred:claude-code/claude-opus-5-5`, plus one for the human. For agents Arbiter launches, a credential is a **descriptor, not a secret**: the Runner knows which harness and `--model` it started, so `model_provenance = launched`. Secrets exist only for sessions attached from outside (v0.3+), whose model name is `claimed`.
 - **Seat:** an ephemeral, role-bound identity for one task, e.g. `PRD-004/TASK-101/worker.2~7f3a`. It answers *"who did this, in what role, under whom?"*
+- **Seats and invocations:** a seat is one logical agent; an **invocation** is one process launch (§4 `invocations`). A seat usually has several invocations. The worker's implement and fix runs resume the same harness session (`claude -p --resume <harness_session_id>`) so feedback lands in context. The judge's claim checks and verdict run under one judge seat. The Ringleader's plan and every just-in-time spec run under one Ringleader seat. A **new seat** is minted only when:
+  1. the previous seat ended abnormally (crash or lease expiry): fresh session plus autopsy (§7);
+  2. independence requires it: dispute rulings get a fresh judge seat (§5.4);
+  3. the task's first invocation of that role, or a human reset.
+
+  Seats become `closed` when their task reaches `done` or `failed`.
 - **Binding:**
   - `process` (v0.1): the Runner launches the harness for the seat. Every git commit and result from that process belongs to the seat. There is no token for the model to see, leak, or lose.
   - `connection` (v0.3+, MCP): the Runner writes a per-seat MCP config for the harness it launches, with the seat token in an env var (stdio) or `Authorization` header (HTTP). The token authenticates every call and never enters the prompt. For a session you attach by hand, you run `arbiter seat attach`, which prints a one-time code (5-minute TTL) to put in *your* MCP config, not in a prompt.
 - **Minting rule:** only the Ringleader seat or the human can request seats; the core mints them. Workers, adversaries, and judges cannot. Every seat records `parent_seat_id`, which is how the agent tree in §5.0 is built.
 - **Role-filtered tools:** when MCP arrives, `tools/list` returns only the seat's role's tools. A worker never sees `verdict`, so it can't waste turns trying it.
-- **Leases:** codes expire fast (they're used immediately); the seat's lease is renewed by supervisor observation (§7). On expiry the process is killed. Seat ids stay in the ledger permanently. Secrets (attach codes, tokens) never enter the ledger or the repo.
+- **Leases:** codes expire fast (they're used immediately); each invocation's lease is renewed by supervisor observation (§7). On expiry the process is killed and the seat is marked `expired`. Seat ids stay in the ledger permanently. Secrets (attach codes, tokens) never enter the ledger or the repo.
 - **Supervisor key:** one SSH signing key held by the core (`~/.config/arbiter/`, optionally the OS keychain). It signs ledger entries and the task-level commits described in §8.D.
-- **Hash chain:** each ledger `entry_hash` covers the previous one, so deleting or editing any past entry is detectable.
+- **Hash chain:** `entry_hash = sha256(prev_hash || JCS(entry))`, where `entry` is the row as a JSON object with every column except `entry_hash` and `supervisor_signature`, including `chain`, `seq`, `task_id`, `seat_id`, `action`, `payload_json` (as parsed JSON), and `created_at`. `JCS` is RFC 8785 JSON canonicalization. `prev_hash` for `seq = 1` is 64 zeros. There is one chain per PRD (`chain = 'PRD-004'`) plus a `global` chain, so each exported ledger file verifies on its own. Editing, reordering, re-attributing, or deleting any past entry is detectable. This format is frozen once the first ledger is committed; any change needs a new `ledger_version` field, never a silent rehash.
 
 ### 8.C Human Signatures (git-native, minimal prompts)
 
@@ -756,7 +904,7 @@ Task-level merges into the feature branch are signed automatically by the **supe
 
 Goal: years later, someone looking at a commit on GitHub can tell which agents, in which roles, produced and approved it, and check that the record wasn't rewritten.
 
-**1. Signed commits with trailers.** Every task merge is a commit signed by the supervisor key, which you register on GitHub as an SSH *signing* key (e.g. titled `arbiter@<hostname>`). GitHub shows it as **Verified** under your account. The commit message carries trailers:
+**1. Signed commits with trailers.** Every task merge is one squash commit (§5.6) signed by the supervisor key, which you register on GitHub as an SSH *signing* key (e.g. titled `arbiter@<hostname>`). GitHub only shows **Verified** when the *committer* email is a verified email on the account that owns the signing key. So the committer is always you (your `user.email`), and the agents appear in the author field and the trailers. The commit message carries trailers:
 
 ```
 auth: rotate refresh tokens on /auth/refresh
@@ -766,20 +914,48 @@ Arbiter-Task: TASK-101 (spec rev 2)
 Arbiter-Worker: PRD-004/TASK-101/worker.2~7f3a cred:claude-code/claude-opus-5-5 (launched)
 Arbiter-Adversary: PRD-004/TASK-101/adversary.1~b20c cred:claude-code/claude-sonnet-5 (5 attacks, 0 upheld)
 Arbiter-Judge: PRD-004/TASK-101/judge.1~e91d cred:claude-code/claude-opus-5-5 (verdict: low-risk)
-Arbiter-Approved-By: human:Masked-Kunsiquat
+Arbiter-Approved-By: human:Masked-Kunsiquat          (only when the task went through HITL)
 Arbiter-Ledger: .arbiter/ledger/PRD-004.jsonl#seq=148 sha256:9c1e...
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ```
 
 The signature covers the trailers, so attribution can't be edited without breaking **Verified**.
 
-**2. Committed ledger.** Each PRD's `audit_log` entries are exported to `.arbiter/ledger/<PRD>.jsonl` and committed with each merge. The file holds seat mints, registrations, submits, verdicts, rulings, and outcomes: hashes and short summaries only, no transcripts or secrets. The `Arbiter-Ledger` trailer pins the chain head, so the signed commit vouches for the entire history before it.
+**2. Committed ledger.** Each PRD's chain is exported to `.arbiter/ledger/<PRD>.jsonl` (one JSON object per line, in `seq` order, exactly the hashed form plus `entry_hash` and `supervisor_signature`) and committed in each task's squash commit. The file holds the actions in §8.E: hashes and short summaries only, no transcripts or secrets. The `Arbiter-Ledger` trailer pins the chain head, so the signed commit vouches for the entire history before it. The `merge` entry for a commit can't contain that commit's own sha, so it records the tree hash of the merged content, and the next entry records the commit sha.
 
 **3. Human capstone.** The final feature → main merge is signed with *your* key. That key's signature covers everything the supervisor key did on the branch.
 
-**Verification:** `arbiter audit verify [<commit>]` checks commit signatures against `allowed_signers`, recomputes the ledger hash chain, and confirms that each trailer's head hash matches. Plain `git log --show-signature` plus reading the JSONL gets most of the way without Arbiter installed.
+**Verification:** `arbiter audit verify [<commit>]` (v0.1) checks commit signatures against `allowed_signers`, recomputes the ledger hash chain, and confirms that each trailer's head hash matches. It ships with the ledger because it is also the ledger's test oracle. Plain `git log --show-signature` plus reading the JSONL gets most of the way without Arbiter installed.
 
 **What this proves, honestly:** that *your* Arbiter installation recorded these seats doing these things, and that the record hasn't changed since it was signed. It does not cryptographically prove a particular model wrote a particular line; nothing running locally could. This is the same trust level as a signed `Co-Authored-By` trailer, only far more detailed and tamper-evident.
+
+### 8.E Ledger Action Catalog
+
+Every entry has `seat_id` and, where relevant, `task_id`. The payload fields listed are required; payloads never contain secrets, prompts, or transcripts (hashes of them are allowed).
+
+| Action | Seat | Payload |
+|---|---|---|
+| `prd_lock` | human | `tag`, `spec_hash`, `tag_object_sha` |
+| `plan` | ringleader | `plan_hash`, `task_ids[]` |
+| `spec` | ringleader | `task_id`, `spec_revision`, `spec_hash` |
+| `mint` | core | `new_seat_id`, `role`, `parent_seat_id`, `credential_id` |
+| `launch` | core | `invocation_id`, `seat_id`, `purpose`, `prompt_hash`, `injected_lesson_ids[]` |
+| `exit` | core | `invocation_id`, `exit_reason`, `cost_usd` |
+| `result` | the invoking seat | `invocation_id`, `result_hash`, `status` |
+| `submit` | core | `submit_commit`, `base_commit`, `diff_check` (`pass`/violations) |
+| `unseen_state` | core | `changed_paths[]`, `action` (`reinstalled`/`restored`) |
+| `attack_run` | core | `commit`, per-test `{test_id, targets[], class}` |
+| `claim_ruling` | judge | `test_id`, `ruling`, `reason_hash` |
+| `dispute` | worker / judge | `test_id`, `argument_hash` / `ruling` |
+| `verdict` | judge | `verdict`, `blast_radius`, `bundle_hash` |
+| `hitl` | human | `decision`, `note_hash` |
+| `scope_grant` | core | `paths[]`, `trigger` (`worker`/`integration`) |
+| `integration` | core | `result`, `failing_tests[]`, `routing` |
+| `merge` | core | `tree`, `parent`, `trailers_hash`; followed by `merge_commit` with `sha` |
+| `outcome` | judge / core / human | `lesson_id`, `lesson_tier`, `outcome_type`, `evidence_backed` |
+| `autopsy` | core | `invocation_id`, `tail_hash`, `checkpoint_ref` |
+| `task_state` | core / human | `from`, `to`, `reason` |
+| `promotion` | human (global chain) | `manifest_hash`, `lesson_ids[]` |
 
 ---
 
@@ -787,18 +963,54 @@ The signature covers the trailers, so attribution can't be edited without breaki
 
 ### 9.A Agent I/O Contract (v0.1, no MCP)
 
-In v0.1 agents talk to Arbiter only through their process and git. The Runner launches each harness headless (e.g. `claude -p --model <m> --output-format json`) with the role prompt, and reads the result when it exits:
+In v0.1 agents talk to Arbiter only through their process, their working tree, and one JSON result. There is no `submit` or `heartbeat` tool: submitting is exiting, liveness is observed (§7), and Arbiter makes the commits (§5.3).
 
-| Role | Input (prompt) | Output |
+**Launch recipe (Claude Code, the v0.1 harness).** Every invocation runs in the slot (`cwd = .arbiter/worktrees/slot-0`) as:
+
+```
+claude -p --model <model> --output-format stream-json --verbose \
+       [--resume <harness_session_id>] <role tool profile flags>
+```
+
+- **Prompt on stdin, never in argv.** A prompt carrying a diff easily overflows Windows' 32,767-character command-line limit, or 8,191 if the command goes through `cmd.exe`. On Windows, `harness.command` must resolve to a native `.exe`; startup validation (§13) rejects a `.cmd`/`.bat` shim.
+- **Streaming output** gives the supervisor a stdout event per turn and tool call (liveness, §7) and a live feed for the TUI. The final `result` event carries the model's final message, `session_id` (stored as `seats.harness_session_id`), `is_error`, and `total_cost_usd` (stored as `invocations.cost_usd`, §5.8).
+- **Git environment** is overridden per process with `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n` (git ≥ 2.31): `commit.gpgsign=false` and `tag.gpgsign=false` (so a global signing setup never prompts you for an agent's commit), `core.hooksPath=<empty arbiter dir>`, and `user.name`/`user.email` = the seat. `GIT_TERMINAL_PROMPT=0` as well.
+- **Role tool profiles** (defense in depth on top of the diff check):
+
+| Role | Profile | After exit |
 |---|---|---|
-| Ringleader | PRD, code index summary, lesson summaries | JSON: tasks, edges, reservations, symbol deps (schema-validated) |
-| Worker | Task spec, invariants, boundaries, injected lessons, prior autopsy | Commit(s) in the slot + JSON result: `{status, summary, scope_request?}` |
-| Adversary | Task spec, invariants, worker diff, injected lessons | Attack-test commit + JSON: `{attacks: [{test_id, targets}]}` |
-| Judge | Evidence bundle | JSON: verdict, claim rulings, injection resolutions, root-cause summaries |
+| Ringleader | read-only (`--allowedTools "Read,Grep,Glob"`, edits and shell disallowed) | Runner asserts `git status --porcelain` is empty; otherwise the changes are discarded and a violation is logged |
+| Worker | edit + shell (`--permission-mode acceptEdits`, shell allowed so it can run tests) | Snapshot commit + diff check (§5.3) |
+| Adversary | edit + shell | Commit of adversary files + diff check |
+| Judge | read-only | Same assertion as the Ringleader |
 
-- Every JSON result is validated against a schema. Invalid output → one retry with the validation error, then autopsy.
-- There is no `submit` or `heartbeat` tool. Submitting is exiting; liveness is observed (§7).
-- MCP (v0.3+) adds mid-run tools (`reserve`, `get_context`, `ask_judge`) and attached interactive sessions, using `connection` binding (§8.B). The I/O contract above stays valid; MCP is an addition, not a replacement.
+**Result.** The model's final message must be exactly one JSON object; Arbiter strips a single surrounding code fence if present. It's validated against the schema for the invocation's `purpose`. Invalid output → **resume the same session once** with the validation error (the worker's edits are kept), then treat it as a crash (autopsy). Either way it counts as an attempt.
+
+**Output schemas** (fields are required unless marked `?`):
+
+| Role / purpose | Input (prompt) | Output JSON |
+|---|---|---|
+| Ringleader `plan` | PRD, repo file tree, lesson summaries | `{tasks: [{id, title, intent, reservations: [path], depends_on: [id], est_minutes}]}` The core rejects cycles, reservations outside PRD boundaries, and Triage Guard violations, and resumes the session once with the errors. |
+| Ringleader `spec` | Plan, this task's intent and reservations, current code (read via tools) | `{task_id, spec_markdown, reservations?: [path]}` Reservations may narrow, never widen. |
+| Worker `implement` / `fix` | Spec, invariants, ACs, boundaries, reservations, injected lessons (v0.2), prior autopsy or rejection trace | `{status: "done" \| "scope_request" \| "blocked_prd" \| "dispute", summary, scope_request?: {paths: [path], reason}, blocked_reason?, dispute?: {attack_test_id, argument}}` The field matching `status` is required. |
+| Adversary `attack` / `attack_maintenance` | Spec, invariants, ACs, worker diff (or incremental diff, or the failing test plus the interface change), adversary pattern and naming rule | `{status: "done" \| "no_attacks", summary}` Tests themselves are discovered from the runner (§5.4). |
+| Judge `claim_check` | Each ASSERTION_FAIL test: source, failure output, cited invariant/AC text | `{rulings: [{test_id, ruling: "upheld" \| "rejected", reason}]}` |
+| Judge `dispute_ruling` (fresh seat) | Test source, failure, worker argument, cited invariant/AC | `{ruling: "upheld" \| "dismissed" \| "escalated", reason}` |
+| Judge `verdict` | Evidence bundle (below) | `{verdict: "approve" \| "needs_human", reason, injections?: [{lesson_id, lesson_tier, relevance, outcome?, description}]}` There's no "reject": rejections come only from evidence (upheld attacks, gate failures), per the Deterministic Gating axiom. A concern the Judge can't back with evidence goes to the human. |
+| Judge `autopsy_summary` | Output tail, diff stat, exit reason | `{root_cause_summary}` One line, ≤ 200 characters. |
+
+**Judge evidence bundle (`verdict`).** Built by the core, hashed into the ledger (`bundle_hash`), and capped at about 60k tokens (4 characters/token estimate):
+
+1. Task spec, PRD invariants and ACs (never truncated).
+2. Computed blast radius and the reasons for it (never truncated).
+3. Attack results: each test's id, targets, class, claim ruling, and dispute, plus the history of earlier upheld rejections and how each was fixed.
+4. Injected lessons with their text (v0.2+).
+5. The worker diff and the attack-test diff.
+6. Output of passing tests.
+
+When over the cap, items are cut from the bottom up: passing-test output first, then the attack-test diff is replaced by `git diff --stat` lines, then the largest worker file diffs are replaced by stat lines, one at a time. The Judge runs read-only in the slot with `submit_commit` checked out, so it can open any truncated file itself.
+
+MCP (v0.3+) adds mid-run tools (`reserve`, `get_context`, `ask_judge`) and attached interactive sessions, using `connection` binding (§8.B). The I/O contract above stays valid; MCP is an addition, not a replacement.
 
 ### 9.B Human Interface
 
@@ -810,10 +1022,10 @@ Built as a single terminal binary with no web dashboard.
 ┌─ Arbiter: Active Tasks ────────────┬─ Worker Stream [TASK-102] ──────────────────────┐
 │ [IN_PROGRESS] TASK-102: Auth Refresh│ Running: npm run test:auth                      │
 │   Worker: slot-0 | Res: src/auth/   │ PASS src/auth/token.test.ts                     │
-│ [REVIEW]      TASK-101: SQLite Init │ FAIL src/auth/rotation.test.ts (Expected 401)   │
+│ [UNDER_REVIEW] TASK-101: SQLite Init│ FAIL src/auth/rotation.test.ts (Expected 401)   │
 │   Adversary: running 4 attacks      │                                                 │
-│ [HUMAN_GATE]  TASK-99: Schema Migr  │ Adversary generating attack patch...            │
-│ [STALE]       TASK-104: Repo Queries│                                                 │
+│ [AWAITING_HUMAN] TASK-99: Migration │ Adversary generating attack patch...            │
+│ [READY]       TASK-104: Repo Queries│                                                 │
 ├─────────────────────────────────────┼─────────────────────────────────────────────────┤
 │ PRD-004 (2/5 done) | Seats: 4      │ Token Burn: 42,100 / 150,000 | Est: $0.42       │
 │ Lessons Injected: LESSON-12, ORG-04 │ Lease Remaining: 08:42                          │
@@ -827,18 +1039,61 @@ Built as a single terminal binary with no web dashboard.
 - `arbiter prd lock <prd-id>` — commit and create the signed lock tag.
 - `arbiter prd amend <prd-id>` — edit and re-sign (new tag version).
 - `arbiter prd review <prd-id>` — full integration pass, then signed merge into main.
-- `arbiter run <prd-id>` — Ringleader decomposition and DAG dispatch.
+- `arbiter run <prd-id>` — Ringleader plan, then dispatch in DAG order with just-in-time specs. Hosts the core in the foreground (§10.B).
 - `arbiter tasks` — tasks, DAG status, seat tree, leases, reservations.
-- `arbiter seats [<prd-id>]` — print the agent tree with roles, credentials, and outcomes.
+- `arbiter task reset <task-id>` — return a `failed` task to `ready` with a fresh attempt count.
+- `arbiter seats [<prd-id>] [--stats]` — print the agent tree with roles, credentials, invocations, and outcomes; `--stats` adds dismissed-attack and upheld-claim rates per credential.
 - `arbiter seat attach --role <role> --task <task-id>` — (v0.3+) mint a connection seat for a session you run yourself.
 - `arbiter review <task-id>` — diff viewer with HITL prompt.
 - `arbiter lesson list [--injections]` — lessons with U, P, and outcome counts.
 - `arbiter lesson outcome <id> --<catch|miss|contradiction> --task <task-id> -m "<reason>"` — human override for one (lesson, task).
 - `arbiter org stage` — lessons meeting Gate 2.
 - `arbiter org promote [<id>... | --all-staged]` — sign one manifest and promote.
-- `arbiter audit verify` — verify the ledger hash chains against the signed commit trailers.
+- `arbiter audit verify [<commit>]` — (v0.1) verify commit signatures, the ledger hash chains, and the trailer heads.
 - `arbiter prune` — reset dead worktree slots, orphaned branches, dangling reservations.
 - `arbiter serve` — (later) run core + runner headless on a server; clients connect over SSH (§10).
+
+### 9.C Project Configuration (`.arbiter/config.toml`)
+
+Committed with the repo; validated at startup (§13). `arbiter init` writes one from detected ecosystems. Keys needed for v0.1:
+
+```toml
+[harness]
+command = "claude"                 # must resolve to a native executable on Windows (§9.A)
+ringleader_model = "claude-opus-5-5"
+worker_model     = "claude-opus-5-5"
+adversary_model  = "claude-sonnet-5"   # a different model from the worker, where possible (§5.0)
+judge_model      = "claude-opus-5-5"
+
+[limits]
+max_attempts = 6                   # §5.8
+lease_minutes = 15
+lease_ceiling_minutes = 60
+judge_bundle_tokens = 60000        # §9.A
+
+[test]
+all      = "go test -json ./..."             # full suite
+files    = "go test -json {packages}"        # subset; {files} or {packages} is substituted
+reporter = "go-json"                          # go-json | junit-xml | tap
+junit_path = ""                               # when reporter = junit-xml: where the file lands
+
+[adversary]
+pattern = "**/*_adversary_test.go"            # path glob only, no content marker (§5.3)
+                                              # e.g. JS/TS: "**/*.adversary.test.ts", Python: "**/test_adversary_*.py"
+
+[deps]
+install   = "go mod download"
+lockfiles = ["go.sum"]
+keep      = []                                # e.g. ["node_modules", ".venv", "target"]
+
+[blast_radius]
+high_risk = ["**/migrations/**", ".github/**", "**/auth/config*"]   # §5.5, v0.1 path-based
+
+[protected]
+paths = ["internal/gate/**", "internal/ledger/**"]                   # §13: always awaiting_human
+```
+
+The adversary pattern must be one the project's test runner discovers by default (Go needs `_test.go`, pytest needs `test_*.py` or `*_test.py`). Startup validation checks this for known ecosystems.
 
 ---
 
@@ -871,6 +1126,13 @@ Built as a single terminal binary with no web dashboard.
 | **Home server (later)** | `arbiter serve` in an LXC/VM. Repo and worktrees live on the server; you edit via VS Code Remote-SSH; the laptop is a thin client. | Fleet, heavy builds (Gradle, emulators), or a laptop that's struggling. |
 | **Split runners (maybe never)** | Core in one place, runners on other machines | Only if a real need appears. |
 
+**Local process model (v0.1).** Exactly one process hosts the core for a repo at a time:
+
+- The first `arbiter` command that needs the core takes an exclusive lock (`.arbiter/core.lock`, via `LockFileEx` on Windows and `flock` on POSIX), opens `state.db`, and listens on `\\.\pipe\arbiter-<repo-hash>` (Windows) or `.arbiter/core.sock` (POSIX).
+- Any other `arbiter` command first tries to connect to that pipe or socket and acts as a client. Only if nothing is listening does it take the lock and host the core in-process for the duration of the command.
+- `arbiter run` is simply a long-lived host: it keeps the core (and the Runner) up until the PRD finishes or hits `awaiting_human`. `arbiter tasks` in another terminal connects to it. The CLI never opens `state.db` directly, even when it hosts the core in-process.
+- If the host crashes, the OS releases the lock and the Job Object kills its agents (§7). On the next start the core marks open invocations `killed` and runs autopsies on them.
+
 Remote-access rules, decided now so the server mode stays simple:
 - **Transport is SSH** (or Tailscale), e.g. `ssh box arbiter tasks`, the way git works. Human authentication reuses your SSH keys; there is no separate human API-key system and no built-in public HTTP listener. Internet exposure, if ever wanted, is a reverse proxy's job.
 - **One binary, one port** (for MCP over HTTP, when enabled). There's no separate web UI process to collide with. Startup fails loudly on a port conflict or invalid config.
@@ -880,7 +1142,8 @@ Remote-access rules, decided now so the server mode stays simple:
 
 - **Core language: Go.** Windows Job Objects (`golang.org/x/sys/windows`), POSIX process groups, and single static binary distribution are all native. From Node, Job Objects would need a native addon. TUI via bubbletea.
 - **Database:** SQLite (WAL, FTS5) via `modernc.org/sqlite` (pure Go, no cgo, easier cross-compile).
-- **Code intelligence:** Tree-sitter for symbol extraction, signature hashing, and blast radius.
+- **Code intelligence (v0.2+):** Tree-sitter for symbol extraction, signature hashing, and blast radius. Its Go bindings require cgo, which on Windows means a gcc toolchain (e.g. MSYS2/mingw-w64) and gives up the pure-Go build `modernc.org/sqlite` was chosen for. That trade is made deliberately in v0.2; v0.1 stays cgo-free with path-based blast radius (§5.5).
+- **Canonical JSON:** RFC 8785 (JCS) for ledger hashing (§8.B).
 - **Harness integration:** headless launch with the §9.A I/O contract in v0.1. An MCP server (stdio + HTTP) arrives in v0.3 with connection-bound seats and role-filtered tools. Enforcement never depends on the harness calling Arbiter tools (§5.3).
 - **Embeddings (v0.3, optional):** local `bge-small` / `nomic-embed-text` via ONNX Runtime, applied to root-cause summaries only.
 - **Crypto:** Go stdlib `crypto/ed25519` / SSH signing for the supervisor key; OpenSSH / `ssh-keygen -Y` and git SSH signing for humans, client-side.
@@ -894,9 +1157,9 @@ Build in this order. Each stage should be usable on its own.
 
 | Stage | Scope | Explicitly deferred |
 |---|---|---|
-| **v0.1: Single lane** | One PRD, tasks run **sequentially** in DAG order, one worktree slot, local mode. Credentials + process-bound seats + agent tree. Worker → Adversary (Attack Validation Protocol) → Judge → integration gate, via the §9.A I/O contract. Submit-time diff check. Signed PRD lock tag, supervisor-signed task commits with trailers, committed ledger, client-signed final merge. Windows + Linux supervisor. Tier 1 autopsies. CLI only. One harness (Claude Code headless). | MCP, lessons, TUI, org tier, server mode, Fleet |
-| **v0.2: Memory** | Fingerprinting, Gate 1, `lesson_injections`, Judge outcome resolution, U and P, ranking + token budget, circuit breaker, symbol-drift staleness + re-spec. | Org tier, embeddings |
-| **v0.3: Connect & polish** | MCP server (connection-bound seats, role-filtered tools, `seat attach`), TUI with agent tree view, Tier 3 org promotion, `audit verify`, summary embeddings, additional harnesses. | |
+| **v0.1: Single lane** | One PRD, tasks run **sequentially** in DAG order, one worktree slot, local mode. Ringleader plan + just-in-time specs. Credentials, process-bound seats with invocations, agent tree. Worker → Adversary (Attack Validation Protocol) → Judge → integration gate, via the §9.A I/O contract and launch recipe. Arbiter-made submit commits, diff check, unseen-state check. Path-based blast radius. Attempt ceiling + budget. Signed PRD lock tag, supervisor-signed squash commits with trailers, committed per-PRD ledger, minimal `audit verify`, client-signed final merge. Project config (§9.C). Windows + Linux supervisor. Tier 1 autopsies (raw tail + summary). CLI only. One harness (Claude Code headless). | MCP, lessons, TUI, org tier, tree-sitter, server mode, Fleet |
+| **v0.2: Memory** | Fingerprinting, Gate 1, `lesson_injections`, Judge + core outcome resolution, U, U_rank and P, ranking + token budget, circuit breaker. Tree-sitter symbol index (cgo decision) for symbol-based blast radius. | Org tier, embeddings |
+| **v0.3: Connect & polish** | MCP server (connection-bound seats, role-filtered tools, `seat attach`), TUI with agent tree view, Tier 3 org promotion, summary embeddings, additional harnesses. | |
 | **Server mode** | `arbiter serve`, SSH transport, client-side signing over the wire. | |
 | **Fleet (power users)** | See §12. Pairs naturally with server mode. | |
 | **Later** | OS-level sandboxing, macOS shim. | |
@@ -907,11 +1170,15 @@ Sequential execution sidesteps deadlocks, semantic merge conflicts, and worktree
 
 ## 12. Fleet (Parallel Execution, deferred)
 
-An opt-in module (`arbiter run --fleet N`), realistically run in server mode (§10.B). **The Fleet spawner is a Runner extension and holds no authority of its own.** It cannot mint seats, approve work, or merge. It spawns, waits, and reaps processes, and asks the core for everything else. This keeps every core guarantee unchanged under parallelism. The schema already supports it (`reservations`, `worktree_slot`, `task_edges`), so no migration is needed.
+An opt-in module (`arbiter run --fleet N`), realistically run in server mode (§10.B). **The Fleet spawner is a Runner extension and holds no authority of its own.** It cannot mint seats, approve work, or merge. It spawns, waits, and reaps processes, and asks the core for everything else. This keeps every core guarantee unchanged under parallelism. The schema already supports it (`reservations`, `worktree_slot`, `task_edges`, `task_symbol_deps`, the `stale` state), so no migration is needed.
 
 **Scheduling & reservations (deadlock freedom)**
 - A task is dispatched only if it is `ready`, a pool slot is free, and its whole reservation set can be acquired **atomically** (one SQLite transaction, all or nothing). No task holds some reservations while waiting for others, so circular wait is impossible.
-- Two reservations conflict if one path prefix is a prefix of the other.
+- Two reservations conflict if one path prefix is a segment-prefix of the other.
+
+**Interface drift (why staleness lives here)**
+- Just-in-time specs (§5.1) are still written at dispatch, but under Fleet other tasks merge while a specced task waits or runs. When writing a spec, the core records `task_symbol_deps`: the existing symbols the spec references, with their tree-sitter signature hashes (v0.2 index).
+- After every merge, the core diffs exported-symbol signature hashes. A `ready` task with a changed dependency becomes `stale`, and its Ringleader seat rewrites the spec (`spec_revision += 1`), with no human signature because the PRD is unchanged. A running task with a changed dependency must rebase, and pass a fresh drift check, before its result is accepted.
 - **Mid-flight expansion:** a free path inside the PRD boundaries is granted. A held path is not waited on: the task checkpoints, releases everything, and re-enters `ready` with the enlarged set.
 
 **Worktree pool**
@@ -934,7 +1201,8 @@ After each wave, the spawner reports:
 
 Arbiter will eventually be used to develop itself. That creates a specific risk: a bug in a gate could approve the "fix" for that same bug.
 
-- **Gate code is human-owned.** The diff check, attack validation, integration gate, seat minting, ledger, and signing live in a protected path (e.g. `internal/gate/**`, `internal/ledger/**`). Agents may *propose* changes there, but every such change goes to `awaiting_human` regardless of blast radius and needs real tests.
+- **Gate code is human-owned.** The diff check, unseen-state check, attack classification, integration gate, seat minting, ledger, and signing live in protected paths (`[protected]` in §9.C, e.g. `internal/gate/**`, `internal/ledger/**`). Agents may *propose* changes there, but every such change goes to `awaiting_human` regardless of blast radius and needs real tests.
+- **Arbiter's own adversary tests use `*_adversary_test.go`**, so `go test` discovers them (§9.C).
 - **Dogfood with a pinned binary.** When Arbiter works on its own repo, it runs a pinned, known-good release (`stage0`), never the build under change. Promote a new stage0 only after it has passed CI and some real use. Compilers bootstrap the same way.
 - **Main stays green.** Nothing merges to `main` unless CI passes, which is exactly the rule Arbiter enforces on everyone else.
-- **Config is validated at startup.** Port conflicts, missing keys, or bad paths fail loudly instead of producing a half-working install.
+- **Config is validated at startup.** Port conflicts, missing keys, bad paths, a harness command that resolves to a `.cmd`/`.bat` shim on Windows, git older than 2.31, or an adversary pattern the test runner won't discover all fail loudly instead of producing a half-working install.
