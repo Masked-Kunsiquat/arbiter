@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "issue-*"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  test:
+    name: Test (Go ${{ matrix.go }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ["1.27"]
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: true
+
+      - name: Verify dependencies
+        run: go mod verify
+
+      - name: Vet
+        run: go vet ./cmd/... ./internal/...
+
+      - name: Test
+        # Scope is ./cmd/... ./internal/... intentionally.
+        # agent/skills/ contains reference snippets with external imports
+        # that are not part of go.mod (they're documentation, not code).
+        run: go test -race -count=1 ./cmd/... ./internal/...
