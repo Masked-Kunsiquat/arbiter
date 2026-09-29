@@ -1,0 +1,4 @@
+# Arbiter runtime state
+.arbiter/*.db
+.arbiter/*.db-*
+.arbiter/worktrees/
