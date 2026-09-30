@@ -136,7 +136,7 @@ func refAppendString(b []byte, s string) ([]byte, error) {
 	}
 	const hex = "0123456789abcdef"
 	b = append(b, '"')
-	for i := 0; i < len(s); i++ {
+	for i := range len(s) {
 		c := s[i]
 		switch {
 		case c == '"' || c == '\\':

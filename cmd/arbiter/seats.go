@@ -78,15 +78,15 @@ func runSeats(ctx context.Context, args []string) error {
 // mistyped flag like "--stat".
 func parseSeatsArgs(args []string) (stats bool, prdFilter string, err error) {
 	var positional []string
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
+	for _, arg := range args {
+		switch arg {
 		case "--stats", "-stats":
 			stats = true
 		default:
-			if strings.HasPrefix(args[i], "-") {
-				return false, "", fmt.Errorf("unknown flag %q", args[i])
+			if strings.HasPrefix(arg, "-") {
+				return false, "", fmt.Errorf("unknown flag %q", arg)
 			}
-			positional = append(positional, args[i])
+			positional = append(positional, arg)
 		}
 	}
 	switch len(positional) {

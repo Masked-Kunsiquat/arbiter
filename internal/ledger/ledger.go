@@ -97,8 +97,10 @@ func (e *Entry) record() map[string]any {
 	return r
 }
 
-var recordKeys = []string{"action", "chain", "created_at", "entry_hash", "payload_json",
-	"prev_hash", "seat_id", "seq", "supervisor_signature", "task_id", "v"}
+var recordKeys = []string{
+	"action", "chain", "created_at", "entry_hash", "payload_json",
+	"prev_hash", "seat_id", "seq", "supervisor_signature", "task_id", "v",
+}
 
 // ComputeHash returns sha256(JCS(entry)) as lowercase hex.
 func ComputeHash(e *Entry) (string, error) {
@@ -183,8 +185,12 @@ func WriteJSONL(w io.Writer, entries []Entry) error {
 		if err != nil {
 			return fmt.Errorf("ledger: seq %d: %w", entries[i].Seq, err)
 		}
-		bw.Write(line)
-		bw.WriteByte('\n')
+		if _, err := bw.Write(line); err != nil {
+			return err
+		}
+		if err := bw.WriteByte('\n'); err != nil {
+			return err
+		}
 	}
 	return bw.Flush()
 }

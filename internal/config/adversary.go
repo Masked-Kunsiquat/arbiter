@@ -19,7 +19,7 @@ var adversaryPatternRules = map[string]func(base string) bool{
 	},
 	"python": func(base string) bool {
 		return (strings.HasPrefix(base, "test_") && strings.HasSuffix(base, ".py")) ||
-			(strings.HasSuffix(base, "_test.py"))
+			strings.HasSuffix(base, "_test.py")
 	},
 	"node": func(base string) bool {
 		return strings.Contains(base, ".test.") || strings.Contains(base, ".spec.")

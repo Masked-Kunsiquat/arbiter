@@ -204,16 +204,9 @@ func TestFindStateDB_SurfacesNonNotExistError(t *testing.T) {
 	}
 	t.Cleanup(func() { os.Chmod(arbiterDir, 0o755) })
 
-	oldWD, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("Getwd: %v", err)
-	}
-	if err := os.Chdir(dir); err != nil {
-		t.Fatalf("Chdir: %v", err)
-	}
-	t.Cleanup(func() { os.Chdir(oldWD) })
+	t.Chdir(dir)
 
-	_, err = findStateDB()
+	_, err := findStateDB()
 	if err == nil {
 		t.Fatal("expected an error surfaced from a permission-denied stat, got nil")
 	}

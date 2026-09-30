@@ -14,6 +14,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 )
 
@@ -62,7 +63,7 @@ type Credential struct {
 // JSON array per the schema; it is empty (not present) for a human credential.
 func RegisterCredential(ctx context.Context, db *sql.DB, c Credential) error {
 	if c.ID == "" {
-		return fmt.Errorf("seat: credential id is required")
+		return errors.New("seat: credential id is required")
 	}
 	if c.Kind != KindHuman && c.Kind != KindAgent {
 		return fmt.Errorf("seat: invalid credential kind %q", c.Kind)

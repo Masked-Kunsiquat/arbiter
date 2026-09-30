@@ -130,18 +130,18 @@ func generateAndSave(configDir, path string) (ssh.Signer, error) {
 	}
 
 	if err := os.Link(tmpPath, path); err != nil {
-		if errors.Is(err, os.ErrExist) {
-			// Someone else published first; use their key, not ours.
-			info, statErr := os.Stat(path)
-			if statErr != nil {
-				return nil, fmt.Errorf("supervisorkey: %s appeared but could not be read: %w", path, statErr)
-			}
-			if err := checkPermissions(info); err != nil {
-				return nil, err
-			}
-			return loadKey(path)
+		if !errors.Is(err, os.ErrExist) {
+			return nil, fmt.Errorf("supervisorkey: publishing %s: %w", path, err)
 		}
-		return nil, fmt.Errorf("supervisorkey: publishing %s: %w", path, err)
+		// Someone else published first; use their key, not ours.
+		info, statErr := os.Stat(path)
+		if statErr != nil {
+			return nil, fmt.Errorf("supervisorkey: %s appeared but could not be read: %w", path, statErr)
+		}
+		if err := checkPermissions(info); err != nil {
+			return nil, err
+		}
+		return loadKey(path)
 	}
 
 	signer, err := ssh.NewSignerFromKey(priv)

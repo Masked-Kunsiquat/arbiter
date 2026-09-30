@@ -1,10 +1,12 @@
 package config
 
 import (
+	"context"
 	"fmt"
 	"os/exec"
 	"regexp"
 	"strconv"
+	"time"
 )
 
 // MinGitVersion is the minimum git version required (spec §9.A): the
@@ -39,7 +41,10 @@ var gitVersionRe = regexp.MustCompile(`(\d+)\.(\d+)(?:\.(\d+))?`)
 // CheckGitVersion runs `git --version` and fails if it's older than
 // MinGitVersion or if git isn't on PATH at all.
 func CheckGitVersion() (GitVersion, error) {
-	out, err := exec.Command("git", "--version").Output()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	out, err := exec.CommandContext(ctx, "git", "--version").Output()
 	if err != nil {
 		return GitVersion{}, fmt.Errorf("config: running git --version: %w", err)
 	}

@@ -156,24 +156,30 @@ func dfsCycleCheck(ctx context.Context, tx *sql.Tx, start, target string) (bool,
 		}
 		visited[node] = true
 
-		rows, err := tx.QueryContext(ctx,
-			`SELECT depends_on FROM task_edges WHERE task_id = ?`, node,
-		)
-		if err != nil {
-			return false, fmt.Errorf("querying edges from %q: %w", node, err)
-		}
-		var next []string
-		for rows.Next() {
-			var dep string
-			if err := rows.Scan(&dep); err != nil {
-				rows.Close()
-				return false, fmt.Errorf("scanning edge: %w", err)
+		next, err := func() ([]string, error) {
+			rows, err := tx.QueryContext(ctx,
+				`SELECT depends_on FROM task_edges WHERE task_id = ?`, node,
+			)
+			if err != nil {
+				return nil, fmt.Errorf("querying edges from %q: %w", node, err)
 			}
-			next = append(next, dep)
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return false, fmt.Errorf("iterating edges from %q: %w", node, err)
+			defer rows.Close()
+
+			var deps []string
+			for rows.Next() {
+				var dep string
+				if err := rows.Scan(&dep); err != nil {
+					return nil, fmt.Errorf("scanning edge: %w", err)
+				}
+				deps = append(deps, dep)
+			}
+			if err := rows.Err(); err != nil {
+				return nil, fmt.Errorf("iterating edges from %q: %w", node, err)
+			}
+			return deps, nil
+		}()
+		if err != nil {
+			return false, err
 		}
 		stack = append(stack, next...)
 	}

@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: ["main", "issue-*"]
+    branches: ["main", "issue-*", "ci/*"]
   pull_request:
-    branches: ["main"]
+    branches: ["main", "issue-*"]
 
 # Minimal permissions: read source, nothing else.
 permissions:
@@ -41,3 +41,23 @@ jobs:
         # agent/skills/ contains reference snippets with external imports
         # that are not part of go.mod (they're documentation, not code).
         run: go test -race -count=1 ./cmd/... ./internal/...
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27"
+          cache: true
+
+      - name: Install golangci-lint
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0
+
+      - name: golangci-lint
+        run: golangci-lint run --timeout=5m ./cmd/... ./internal/...
