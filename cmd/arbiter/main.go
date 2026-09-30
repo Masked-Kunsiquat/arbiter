@@ -10,6 +10,9 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
+
+	"github.com/Masked-Kunsiquat/arbiter/internal/config"
 )
 
 func main() {
@@ -28,6 +31,9 @@ func run(ctx context.Context, args []string) error {
 	case "init":
 		return runInit(ctx, args[1:])
 	case "seats":
+		if err := loadAndValidateConfig(); err != nil {
+			return err
+		}
 		return runSeats(ctx, args[1:])
 	case "-h", "--help", "help":
 		printUsage()
@@ -35,6 +41,23 @@ func run(ctx context.Context, args []string) error {
 	default:
 		return fmt.Errorf("unknown command %q (see 'arbiter help')", args[0])
 	}
+}
+
+func loadAndValidateConfig() error {
+	dbPath, err := findStateDB()
+	if err != nil {
+		return err
+	}
+	arbiterDir := filepath.Dir(dbPath)
+	cfgPath := config.ConfigPath(arbiterDir)
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		return err
+	}
+	if err := config.Validate(cfg, ""); err != nil {
+		return fmt.Errorf("startup config validation failed:\n%w", err)
+	}
+	return nil
 }
 
 func printUsage() {

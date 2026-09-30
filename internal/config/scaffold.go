@@ -2,11 +2,13 @@ package config
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 
 	"github.com/BurntSushi/toml"
+	"github.com/Masked-Kunsiquat/arbiter/internal/db"
 	"github.com/Masked-Kunsiquat/arbiter/internal/stack"
 )
 
@@ -18,8 +20,9 @@ var scaffoldDirs = []string{"worktrees", "prds", "ledger"}
 // route to awaiting_human, regardless of blast radius.
 var DefaultProtectedPaths = []string{"internal/gate/**", "internal/ledger/**"}
 
-// Scaffold creates .arbiter/{worktrees,prds,ledger}/ under repoRoot. It is
-// idempotent: existing directories are left as-is.
+// Scaffold creates .arbiter/{worktrees,prds,ledger}/ and initializes
+// .arbiter/state.db under repoRoot. It is idempotent: existing directories
+// and database schema are left as-is.
 func Scaffold(repoRoot string) (arbiterDir string, err error) {
 	arbiterDir = filepath.Join(repoRoot, ".arbiter")
 	for _, name := range scaffoldDirs {
@@ -28,6 +31,16 @@ func Scaffold(repoRoot string) (arbiterDir string, err error) {
 			return "", fmt.Errorf("config: creating %s: %w", dir, err)
 		}
 	}
+
+	dbPath := filepath.Join(arbiterDir, "state.db")
+	adb, err := db.Open(context.Background(), dbPath)
+	if err != nil {
+		return "", fmt.Errorf("config: initializing %s: %w", dbPath, err)
+	}
+	if err := adb.Close(); err != nil {
+		return "", fmt.Errorf("config: closing %s: %w", dbPath, err)
+	}
+
 	return arbiterDir, nil
 }
 

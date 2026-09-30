@@ -95,6 +95,9 @@ func TestScaffold_CreatesExpectedDirsAndIsIdempotent(t *testing.T) {
 			t.Errorf("%s is not a directory", name)
 		}
 	}
+	if _, err := os.Stat(filepath.Join(arbiterDir, "state.db")); err != nil {
+		t.Errorf("stat state.db: %v", err)
+	}
 
 	// Re-running must not fail or wipe anything.
 	marker := filepath.Join(arbiterDir, "prds", "keep-me.md")
