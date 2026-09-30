@@ -42,6 +42,37 @@ jobs:
         # that are not part of go.mod (they're documentation, not code).
         run: go test -race -count=1 ./cmd/... ./internal/...
 
+  alpine:
+    # Guards portability: Arbiter must stay cgo-free so a static binary runs
+    # on musl (Alpine) and fits a lightweight Docker image. CGO_ENABLED=0
+    # makes any new cgo-only dependency fail the build here. No -race: the
+    # race detector needs cgo; the matrix above covers it.
+    name: Test (Go 1.27, alpine, CGO_ENABLED=0)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Runs in docker rather than a job-level `container:` because
+      # JavaScript actions (checkout, setup-go) don't reliably run in
+      # musl containers. git and ssh-keygen are needed by the tests.
+      - name: Build and test on Alpine
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src -e CGO_ENABLED=0 golang:1.27-alpine sh -euc '
+            apk add --no-cache git openssh-keygen >/dev/null
+            git config --global --add safe.directory /src
+            go mod verify
+            go vet ./cmd/... ./internal/...
+            go build -o /tmp/arbiter ./cmd/arbiter
+            /tmp/arbiter help >/dev/null
+            adduser -D tester
+            # Non-root so permission-based tests (findStateDB) run, not skip.
+            chown -R tester /src
+            su tester -c "cd /src && HOME=/home/tester CGO_ENABLED=0 PATH=$PATH go test -count=1 ./cmd/... ./internal/..."
+          '
+
   lint:
     name: Lint
     runs-on: ubuntu-latest
