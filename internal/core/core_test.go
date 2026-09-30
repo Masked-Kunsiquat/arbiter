@@ -277,7 +277,12 @@ func TestConnect_WaitsForHostStartingUp(t *testing.T) {
 		time.Sleep(300 * time.Millisecond)
 		_ = l.Release()
 		h, err := Open(context.Background(), dir)
-		if err != nil {
+		switch {
+		case errors.Is(err, corelock.ErrLocked):
+			// Connect's retry won the lock in the gap after Release; it
+			// hosts instead, which is also correct.
+			h = nil
+		case err != nil:
 			t.Errorf("Open: %v", err)
 		}
 		hostReady <- h

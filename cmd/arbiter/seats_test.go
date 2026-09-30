@@ -20,9 +20,15 @@ import (
 // none is running) and print the agent tree.
 func TestRunSeats_ThroughCore(t *testing.T) {
 	ctx := context.Background()
-	repo := t.TempDir()
+	// Short root rather than t.TempDir: the path embeds the test name and
+	// can overflow the ~104-byte Unix socket path limit for core.sock.
+	repo, err := os.MkdirTemp("", "arb") //nolint:usetesting // see above
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(repo) })
 	arbiterDir := filepath.Join(repo, ".arbiter")
-	if err := os.MkdirAll(arbiterDir, 0o755); err != nil {
+	if err = os.MkdirAll(arbiterDir, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
 	adb, err := db.Open(ctx, filepath.Join(arbiterDir, "state.db"))
