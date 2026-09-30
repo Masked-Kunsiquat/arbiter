@@ -49,7 +49,7 @@ func listSeats(ctx context.Context, raw *sql.DB, prdFilter string) ([]SeatInfo, 
 	seats := []SeatInfo{}
 	for sqlRows.Next() {
 		var (
-			s                               SeatInfo
+			s                                SeatInfo
 			taskID, parentID, harness, model sql.NullString
 		)
 		if err := sqlRows.Scan(&s.ID, &s.Role, &taskID, &s.PRDID, &parentID, &s.CredentialID,

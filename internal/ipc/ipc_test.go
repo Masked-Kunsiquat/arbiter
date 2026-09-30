@@ -18,7 +18,7 @@ import (
 // name, and a long path can overflow the ~104-byte Unix socket path limit.
 func newArbiterDir(t *testing.T) string {
 	t.Helper()
-	root, err := os.MkdirTemp("", "arb")
+	root, err := os.MkdirTemp("", "arb") //nolint:usetesting // t.TempDir embeds the test name; Unix socket paths must stay short
 	if err != nil {
 		t.Fatalf("MkdirTemp: %v", err)
 	}

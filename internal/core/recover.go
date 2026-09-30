@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 
 	"github.com/Masked-Kunsiquat/arbiter/internal/db"
@@ -24,25 +25,9 @@ func recoverInvocations(ctx context.Context, d *db.DB) ([]string, error) {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	rows, err := tx.QueryContext(ctx, `SELECT id FROM invocations WHERE ended_at IS NULL ORDER BY started_at, id`)
+	ids, err := openInvocationIDs(ctx, tx)
 	if err != nil {
-		return nil, fmt.Errorf("core: recovery: listing open invocations: %w", err)
-	}
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			_ = rows.Close()
-			return nil, fmt.Errorf("core: recovery: scanning invocation id: %w", err)
-		}
-		ids = append(ids, id)
-	}
-	if err := rows.Err(); err != nil {
-		_ = rows.Close()
-		return nil, fmt.Errorf("core: recovery: listing open invocations: %w", err)
-	}
-	if err := rows.Close(); err != nil {
-		return nil, fmt.Errorf("core: recovery: listing open invocations: %w", err)
+		return nil, err
 	}
 	if len(ids) == 0 {
 		return nil, nil
@@ -56,6 +41,26 @@ func recoverInvocations(ctx context.Context, d *db.DB) ([]string, error) {
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("core: recovery: commit: %w", err)
+	}
+	return ids, nil
+}
+
+func openInvocationIDs(ctx context.Context, tx *sql.Tx) ([]string, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM invocations WHERE ended_at IS NULL ORDER BY started_at, id`)
+	if err != nil {
+		return nil, fmt.Errorf("core: recovery: listing open invocations: %w", err)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("core: recovery: scanning invocation id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("core: recovery: listing open invocations: %w", err)
 	}
 	return ids, nil
 }

@@ -20,7 +20,8 @@ func listen(path string) (net.Listener, error) {
 	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return nil, err
 	}
-	ln, err := net.Listen("unix", path)
+	var lc net.ListenConfig
+	ln, err := lc.Listen(context.Background(), "unix", path)
 	if err != nil {
 		return nil, err
 	}
