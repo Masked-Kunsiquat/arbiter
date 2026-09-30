@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -11,50 +10,27 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/Masked-Kunsiquat/arbiter/internal/db"
+	"github.com/Masked-Kunsiquat/arbiter/internal/core"
 )
 
-// seatRow is one seats table row, joined with its credential for display.
-type seatRow struct {
-	id           string
-	role         string
-	taskID       sql.NullString
-	prdID        string
-	parentID     sql.NullString
-	credentialID string
-	status       string
-	harness      sql.NullString
-	model        sql.NullString
-
-	invocationCount int
-	totalCostUSD    float64
-}
-
 // runSeats implements `arbiter seats [<prd-id>] [--stats]` (spec §9.B).
-//
-// v0.1 scaffold note: this opens .arbiter/state.db directly. Spec §10.B says
-// the CLI should instead talk to a running core over its IPC pipe/socket and
-// never open state.db itself; that core process doesn't exist yet (issue
-// #15). This direct-read path is a stopgap to unblock the command, not the
-// final architecture.
+// Like every command, it asks the core rather than reading state.db: it
+// connects to the running core, or hosts one in-process for the duration
+// of the command if none is running (§10.B).
 func runSeats(ctx context.Context, args []string) error {
 	stats, prdFilter, err := parseSeatsArgs(args)
 	if err != nil {
 		return err
 	}
 
-	dbPath, err := findStateDB()
+	sess, err := connectCore(ctx)
 	if err != nil {
 		return err
 	}
-	adb, err := db.Open(ctx, dbPath)
-	if err != nil {
-		return fmt.Errorf("opening %s: %w", dbPath, err)
-	}
-	defer adb.Close()
+	defer sess.Close()
 
-	rows, err := loadSeats(ctx, adb.SQLDB(), prdFilter)
-	if err != nil {
+	var rows []core.SeatInfo
+	if err := sess.Call(ctx, core.MethodSeatsList, core.ListSeatsParams{PRDID: prdFilter}, &rows); err != nil {
 		return err
 	}
 	if len(rows) == 0 {
@@ -125,42 +101,6 @@ func findStateDB() (string, error) {
 	}
 }
 
-func loadSeats(ctx context.Context, raw *sql.DB, prdFilter string) ([]seatRow, error) {
-	query := `
-		SELECT s.id, s.role, s.task_id, s.prd_id, s.parent_seat_id, s.credential_id, s.status,
-		       c.harness, c.model,
-		       (SELECT COUNT(*) FROM invocations i WHERE i.seat_id = s.id),
-		       (SELECT COALESCE(SUM(i.cost_usd), 0) FROM invocations i WHERE i.seat_id = s.id)
-		FROM seats s
-		LEFT JOIN credentials c ON c.id = s.credential_id`
-	args := []any{}
-	if prdFilter != "" {
-		query += " WHERE s.prd_id = ?"
-		args = append(args, prdFilter)
-	}
-	query += " ORDER BY s.prd_id, s.id"
-
-	sqlRows, err := raw.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("querying seats: %w", err)
-	}
-	defer sqlRows.Close()
-
-	var rows []seatRow
-	for sqlRows.Next() {
-		var r seatRow
-		if err := sqlRows.Scan(&r.id, &r.role, &r.taskID, &r.prdID, &r.parentID, &r.credentialID,
-			&r.status, &r.harness, &r.model, &r.invocationCount, &r.totalCostUSD); err != nil {
-			return nil, fmt.Errorf("scanning seat row: %w", err)
-		}
-		rows = append(rows, r)
-	}
-	if err := sqlRows.Err(); err != nil {
-		return nil, fmt.Errorf("reading seats: %w", err)
-	}
-	return rows, nil
-}
-
 // printTree renders seats as an indented tree by parent_seat_id, grouped and
 // sorted by PRD, mirroring the shape in spec §5.0.
 //
@@ -169,53 +109,53 @@ func loadSeats(ctx context.Context, raw *sql.DB, prdFilter string) ([]seatRow, e
 // drop its children: a row whose parent isn't in the filtered set (because
 // the filter excluded it, not because it's truly a ringleader) still
 // renders, just as its own root, instead of vanishing.
-func printTree(rows []seatRow) {
-	byID := map[string]seatRow{}
+func printTree(rows []core.SeatInfo) {
+	byID := map[string]core.SeatInfo{}
 	for _, r := range rows {
-		byID[r.id] = r
+		byID[r.ID] = r
 	}
 
-	byParent := map[string][]seatRow{}
-	var roots []seatRow
+	byParent := map[string][]core.SeatInfo{}
+	var roots []core.SeatInfo
 	for _, r := range rows {
-		if r.parentID.Valid && r.parentID.String != "" {
-			if _, ok := byID[r.parentID.String]; ok {
-				byParent[r.parentID.String] = append(byParent[r.parentID.String], r)
+		if r.ParentSeatID != "" {
+			if _, ok := byID[r.ParentSeatID]; ok {
+				byParent[r.ParentSeatID] = append(byParent[r.ParentSeatID], r)
 				continue
 			}
 		}
 		roots = append(roots, r)
 	}
-	sort.Slice(roots, func(i, j int) bool { return roots[i].id < roots[j].id })
+	sort.Slice(roots, func(i, j int) bool { return roots[i].ID < roots[j].ID })
 
 	var currentPRD string
 	for _, root := range roots {
-		if root.prdID != currentPRD {
+		if root.PRDID != currentPRD {
 			if currentPRD != "" {
 				fmt.Println()
 			}
-			fmt.Printf("%s\n", root.prdID)
-			currentPRD = root.prdID
+			fmt.Printf("%s\n", root.PRDID)
+			currentPRD = root.PRDID
 		}
 		printNode(root, byParent, 0)
 	}
 }
 
-func printNode(r seatRow, byParent map[string][]seatRow, depth int) {
+func printNode(r core.SeatInfo, byParent map[string][]core.SeatInfo, depth int) {
 	indent := strings.Repeat("  ", depth)
-	label := r.role
-	if r.taskID.Valid {
-		label = r.taskID.String + "/" + r.role
+	label := r.Role
+	if r.TaskID != "" {
+		label = r.TaskID + "/" + r.Role
 	}
-	cred := r.credentialID
-	if r.harness.Valid && r.model.Valid {
-		cred = fmt.Sprintf("%s (%s/%s)", r.credentialID, r.harness.String, r.model.String)
+	cred := r.CredentialID
+	if r.Harness != "" && r.Model != "" {
+		cred = fmt.Sprintf("%s (%s/%s)", r.CredentialID, r.Harness, r.Model)
 	}
 	fmt.Printf("%s└── %s [%s]  id=%s  %s  invocations=%d cost=$%.2f\n",
-		indent, label, r.status, r.id, cred, r.invocationCount, r.totalCostUSD)
+		indent, label, r.Status, r.ID, cred, r.InvocationCount, r.TotalCostUSD)
 
-	children := byParent[r.id]
-	sort.Slice(children, func(i, j int) bool { return children[i].id < children[j].id })
+	children := byParent[r.ID]
+	sort.Slice(children, func(i, j int) bool { return children[i].ID < children[j].ID })
 	for _, c := range children {
 		printNode(c, byParent, depth+1)
 	}
