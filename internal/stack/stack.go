@@ -141,11 +141,11 @@ func rustEcosystem() Ecosystem {
 		"Bash(git status*)", "Bash(git diff*)",
 		"PowerShell(cargo test*)", "PowerShell(cargo build*)", "PowerShell(cargo check*)",
 	}
-	e.Test.Build = "cargo check"
+	e.Test.Build = "cargo test --no-run"
 	e.Test.All = "cargo test"
-	e.Test.Files = "cargo test -- {files}"
+	e.Test.Files = "cargo test --test {test}"
 	e.Test.Reporter = "tap"
-	e.Adversary.Pattern = "**/*_adversary_test.rs"
+	e.Adversary.Pattern = "tests/**/*_adversary_test.rs"
 	e.Deps.Install = "cargo fetch"
 	e.Deps.Lockfiles = []string{"Cargo.lock"}
 	e.Deps.Keep = []string{"target"}

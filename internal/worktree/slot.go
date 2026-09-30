@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -59,11 +60,42 @@ type GitRunner func(ctx context.Context, dir string, args ...string) (string, er
 // CommandRunner executes a shell command in dir with the provided environment.
 type CommandRunner func(ctx context.Context, dir string, command string, env []string) error
 
+// EmptyHooksDir returns an absolute path to a guaranteed-empty hooks directory
+// to ensure git never executes user or repository hooks during Arbiter operations
+// (spec §5.3: "-c core.hooksPath=<empty arbiter dir> -c core.fsmonitor=false").
+func EmptyHooksDir(baseDir string) string {
+	var targetDir string
+	if baseDir != "" {
+		current := filepath.Clean(baseDir)
+		for range 5 {
+			cand := filepath.Join(current, ".arbiter")
+			if fi, err := os.Stat(cand); err == nil && fi.IsDir() {
+				targetDir = filepath.Join(cand, "empty-hooks")
+				break
+			}
+			parent := filepath.Dir(current)
+			if parent == current {
+				break
+			}
+			current = parent
+		}
+	}
+	if targetDir == "" {
+		targetDir = filepath.Join(os.TempDir(), "arbiter-empty-hooks")
+	}
+	_ = os.MkdirAll(targetDir, 0o755)
+	return targetDir
+}
+
 // DefaultGitRunner executes git with Arbiter's mandatory security overrides
 // (spec §5.3: "Separately, every git command Arbiter runs itself passes
 // -c core.hooksPath=<empty arbiter dir> -c core.fsmonitor=false").
 func DefaultGitRunner(ctx context.Context, dir string, args ...string) (string, error) {
-	fullArgs := append([]string{"-c", "core.hooksPath=", "-c", "core.fsmonitor=false"}, args...)
+	emptyHooks := EmptyHooksDir(dir)
+	fullArgs := append([]string{
+		"-c", "core.hooksPath=" + filepath.ToSlash(emptyHooks),
+		"-c", "core.fsmonitor=false",
+	}, args...)
 	cmd := exec.CommandContext(ctx, "git", fullArgs...)
 	cmd.Dir = dir
 	cmd.Env = os.Environ()
@@ -165,11 +197,21 @@ func (s *Slot) Reset(ctx context.Context, baseCommit string, keepList []string) 
 		if keep == "" {
 			continue
 		}
+		if !filepath.IsLocal(keep) || strings.HasPrefix(keep, "-") {
+			return fmt.Errorf("worktree: keep path %q is not a local path", keep)
+		}
 		cleanArgs = append(cleanArgs, "-e", filepath.Clean(keep))
 	}
 
 	if _, err := s.Git(ctx, s.Path, cleanArgs...); err != nil {
 		return fmt.Errorf("worktree: clean slot with keep-list %v: %w", keepList, err)
+	}
+
+	// If target is not kept, wipe per-slot CargoTargetDir to prevent artifact leakage
+	if !slices.Contains(keepList, "target") {
+		if ct := s.CacheConfig().CargoTargetDir; ct != "" {
+			_ = os.RemoveAll(ct)
+		}
 	}
 
 	// Update base commit in metadata
@@ -218,6 +260,27 @@ func (s *Slot) ComputeLockfileHash(lockfiles []string) (string, error) {
 	return ComputeLockfileHash(s.Path, lockfiles)
 }
 
+func wipeTaintedKeepDirs(slotPath string, keepList []string, cargoTargetDir string) error {
+	for _, keep := range keepList {
+		if keep == "" {
+			continue
+		}
+		if !filepath.IsLocal(keep) || strings.HasPrefix(keep, "-") {
+			return fmt.Errorf("worktree: keep path %q is not a local path", keep)
+		}
+		targetDir := filepath.Join(slotPath, filepath.Clean(keep))
+		if err := os.RemoveAll(targetDir); err != nil {
+			return fmt.Errorf("worktree: removing tainted keep dir %s: %w", targetDir, err)
+		}
+	}
+	if slices.Contains(keepList, "target") && cargoTargetDir != "" {
+		if err := os.RemoveAll(cargoTargetDir); err != nil {
+			return fmt.Errorf("worktree: removing tainted cargo target dir %s: %w", cargoTargetDir, err)
+		}
+	}
+	return nil
+}
+
 // ReinstallDeps installs dependencies in the slot if needed (spec §7:
 // "Dependencies reinstall only when the lockfile hash differs from the slot's
 // last install, or when the unseen-state check (§5.3) finds the keep-list dirs
@@ -247,17 +310,8 @@ func (s *Slot) ReinstallDeps(ctx context.Context, depsCfg *config.Deps, force bo
 	// If keep-list directories were altered during an agent run, wipe them
 	// before reinstalling from the lockfile (spec §5.3).
 	if unseenChanges {
-		for _, keep := range depsCfg.Keep {
-			if keep == "" {
-				continue
-			}
-			if !filepath.IsLocal(keep) {
-				return false, fmt.Errorf("worktree: keep path %q is not a local path", keep)
-			}
-			targetDir := filepath.Join(s.Path, filepath.Clean(keep))
-			if err := os.RemoveAll(targetDir); err != nil {
-				return false, fmt.Errorf("worktree: removing tainted keep dir %s: %w", targetDir, err)
-			}
+		if err := wipeTaintedKeepDirs(s.Path, depsCfg.Keep, s.CacheConfig().CargoTargetDir); err != nil {
+			return false, err
 		}
 	}
 
@@ -285,12 +339,24 @@ func (s *Slot) ReinstallDeps(ctx context.Context, depsCfg *config.Deps, force bo
 
 // TakeSnapshot records the unseen-state snapshot for this slot (spec §5.3).
 func (s *Slot) TakeSnapshot(keepList, lockfiles []string) (*Snapshot, error) {
-	return TakeSnapshot(s.Path, s.RepoRoot, keepList, lockfiles)
+	var extraDirs []string
+	if slices.Contains(keepList, "target") {
+		if ct := s.CacheConfig().CargoTargetDir; ct != "" {
+			extraDirs = append(extraDirs, ct)
+		}
+	}
+	return TakeSnapshot(s.Path, s.RepoRoot, keepList, lockfiles, extraDirs...)
 }
 
 // CheckUnseenState verifies and restores unseen state against snap (spec §5.3).
 func (s *Slot) CheckUnseenState(keepList, lockfiles []string, snap *Snapshot) (*UnseenReport, error) {
-	return CheckUnseenState(s.Path, s.RepoRoot, keepList, lockfiles, snap)
+	var extraDirs []string
+	if slices.Contains(keepList, "target") {
+		if ct := s.CacheConfig().CargoTargetDir; ct != "" {
+			extraDirs = append(extraDirs, ct)
+		}
+	}
+	return CheckUnseenState(s.Path, s.RepoRoot, keepList, lockfiles, snap, extraDirs...)
 }
 
 // CacheConfig returns the shared and per-slot cache configuration for this slot.

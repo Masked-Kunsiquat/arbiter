@@ -2,6 +2,8 @@ package worktree_test
 
 import (
 	"context"
+	"errors"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -178,13 +180,24 @@ func TestComputeLockfileHash(t *testing.T) {
 		t.Errorf("emptyHash length = %d, want 64", len(emptyHash))
 	}
 
-	// Non-existent lockfile returns same empty hash
+	// Non-existent lockfile returns deterministic hash for absent record (differing from empty list)
 	nonExistentHash, err := worktree.ComputeLockfileHash(dir, []string{"nonexistent.lock"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if nonExistentHash != emptyHash {
-		t.Errorf("nonExistentHash = %q, want %q", nonExistentHash, emptyHash)
+	if len(nonExistentHash) != 64 {
+		t.Errorf("nonExistentHash length = %d, want 64", len(nonExistentHash))
+	}
+	if nonExistentHash == emptyHash {
+		t.Errorf("nonExistentHash should differ from emptyHash (absent record tracked deterministically)")
+	}
+	nonExistentHash2, _ := worktree.ComputeLockfileHash(dir, []string{"nonexistent.lock"})
+	if nonExistentHash2 != nonExistentHash {
+		t.Errorf("nonExistentHash should be deterministic: %s vs %s", nonExistentHash2, nonExistentHash)
+	}
+	otherAbsentHash, _ := worktree.ComputeLockfileHash(dir, []string{"other.lock"})
+	if otherAbsentHash == nonExistentHash {
+		t.Errorf("different absent lockfiles should produce different hashes")
 	}
 
 	// Create go.sum
@@ -679,5 +692,285 @@ func TestWorktreePool(t *testing.T) {
 	s1 := pool.Slot(1)
 	if s1.Index != 1 {
 		t.Errorf("Slot(1) Index = %d, want 1", s1.Index)
+	}
+}
+
+func TestUnseenState_SpoofedSizeAndModTime(t *testing.T) {
+	repoRoot, initialCommit := initGitRepo(t)
+	ctx := context.Background()
+
+	slot := worktree.NewSlot(repoRoot, 0)
+	if err := slot.EnsureWorktree(ctx, initialCommit); err != nil {
+		t.Fatal(err)
+	}
+
+	keepDir := filepath.Join(slot.Path, "node_modules", "pkg")
+	if err := os.MkdirAll(keepDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fileA := filepath.Join(keepDir, "index.js")
+	originalContent := []byte("console.log('original');\n")
+	if err := os.WriteFile(fileA, originalContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	keepList := []string{"node_modules"}
+	snap, err := slot.TakeSnapshot(keepList, nil)
+	if err != nil {
+		t.Fatalf("TakeSnapshot: %v", err)
+	}
+
+	fi, err := os.Stat(fileA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	origModTime := fi.ModTime()
+
+	// Adversary pads content so size is identical and restores mtime via os.Chtimes
+	spoofedContent := []byte("console.log('tampered');\n") // exactly 25 bytes, same as original
+	if len(spoofedContent) != len(originalContent) {
+		t.Fatalf("test setup error: len %d != %d", len(spoofedContent), len(originalContent))
+	}
+	if err := os.WriteFile(fileA, spoofedContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(fileA, origModTime, origModTime); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify that CheckUnseenState detects change via checksum
+	rep, err := slot.CheckUnseenState(keepList, nil, snap)
+	if err != nil {
+		t.Fatalf("CheckUnseenState: %v", err)
+	}
+	if !rep.KeepListChanged {
+		t.Errorf("expected KeepListChanged = true for spoofed size/mtime dependency file, got false")
+	}
+}
+
+func TestUnseenState_WorktreeGitPointerAndConfigTampering(t *testing.T) {
+	repoRoot, initialCommit := initGitRepo(t)
+	ctx := context.Background()
+
+	slot := worktree.NewSlot(repoRoot, 0)
+	if err := slot.EnsureWorktree(ctx, initialCommit); err != nil {
+		t.Fatal(err)
+	}
+
+	snap, err := slot.TakeSnapshot(nil, nil)
+	if err != nil {
+		t.Fatalf("TakeSnapshot: %v", err)
+	}
+
+	// 1. Worker replaces slot-0/.git with a directory containing malicious config
+	slotGitPath := filepath.Join(slot.Path, ".git")
+	_ = os.Remove(slotGitPath)
+	if err := os.Mkdir(slotGitPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	rep, err := slot.CheckUnseenState(nil, nil, snap)
+	if err != nil {
+		t.Fatalf("CheckUnseenState: %v", err)
+	}
+	if !rep.Violation || !rep.GitConfigChanged {
+		t.Errorf("replacing .git pointer with directory: want Violation=true, GitConfigChanged=true; got Violation=%v, GitConfigChanged=%v", rep.Violation, rep.GitConfigChanged)
+	}
+
+	// Verify .git was restored to a file
+	fi, err := os.Lstat(slotGitPath)
+	if err != nil || fi.IsDir() {
+		t.Errorf("expected slot .git to be restored to pointer file, got isDir=%v, err=%v", fi != nil && fi.IsDir(), err)
+	}
+
+	// 2. Worker plants config.worktree in worktree admin dir
+	adminDir := filepath.Join(repoRoot, ".git", "worktrees", "slot-0")
+	cfgWorktree := filepath.Join(adminDir, "config.worktree")
+	if err := os.WriteFile(cfgWorktree, []byte("[core]\nhooksPath = /evil\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	rep, err = slot.CheckUnseenState(nil, nil, snap)
+	if err != nil {
+		t.Fatalf("CheckUnseenState: %v", err)
+	}
+	if !rep.Violation || !rep.GitConfigChanged {
+		t.Errorf("planting config.worktree: want Violation=true, GitConfigChanged=true; got Violation=%v, GitConfigChanged=%v", rep.Violation, rep.GitConfigChanged)
+	}
+	if _, err := os.Stat(cfgWorktree); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("expected planted config.worktree to be removed, but file still exists")
+	}
+}
+
+func TestUnseenState_CargoTargetDirTrackingAndWipe(t *testing.T) {
+	repoRoot, initialCommit := initGitRepo(t)
+	ctx := context.Background()
+
+	slot := worktree.NewSlot(repoRoot, 0)
+	if err := slot.EnsureWorktree(ctx, initialCommit); err != nil {
+		t.Fatal(err)
+	}
+
+	cache := slot.CacheConfig()
+	targetArtifactDir := filepath.Join(cache.CargoTargetDir, "debug")
+	if err := os.MkdirAll(targetArtifactDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	artifact := filepath.Join(targetArtifactDir, "libapp.rlib")
+	if err := os.WriteFile(artifact, []byte("clean artifact\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	depsCfg := &config.Deps{
+		Install:   "echo building",
+		Lockfiles: []string{"Cargo.lock"},
+		Keep:      []string{"target"},
+	}
+	cargoLock := filepath.Join(slot.Path, "Cargo.lock")
+	if err := os.WriteFile(cargoLock, []byte("[lock]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	slot.Cmd = func(_ context.Context, dir, command string, env []string) error {
+		return nil
+	}
+
+	// Install once to set initial hash
+	if _, err := slot.ReinstallDeps(ctx, depsCfg, false, false); err != nil {
+		t.Fatal(err)
+	}
+
+	// Snapshot with target in keepList
+	snap, err := slot.TakeSnapshot(depsCfg.Keep, depsCfg.Lockfiles)
+	if err != nil {
+		t.Fatalf("TakeSnapshot: %v", err)
+	}
+
+	// Worker poisons the build artifact in CARGO_TARGET_DIR
+	if err := os.WriteFile(artifact, []byte("poisoned artifact\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// CheckUnseenState must catch changes in CargoTargetDir
+	rep, err := slot.CheckUnseenState(depsCfg.Keep, depsCfg.Lockfiles, snap)
+	if err != nil {
+		t.Fatalf("CheckUnseenState: %v", err)
+	}
+	if !rep.KeepListChanged {
+		t.Errorf("modifying CargoTargetDir artifact: want KeepListChanged = true, got false")
+	}
+
+	// Reinstall with unseenChanges = true must wipe CargoTargetDir
+	if _, err := slot.ReinstallDeps(ctx, depsCfg, false, true); err != nil {
+		t.Fatalf("ReinstallDeps with unseenChanges: %v", err)
+	}
+	if _, err := os.Stat(artifact); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("expected tainted artifact in CargoTargetDir to be removed, but still exists")
+	}
+
+	// Reset with keepList omitting target must wipe CargoTargetDir
+	if err := os.MkdirAll(targetArtifactDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(artifact, []byte("stale artifact\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := slot.Reset(ctx, initialCommit, nil); err != nil {
+		t.Fatalf("Reset: %v", err)
+	}
+	if _, err := os.Stat(artifact); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("expected CargoTargetDir to be wiped on Reset when target is not kept")
+	}
+}
+
+func TestDefaultGitRunner_CoreHooksPathOverride(t *testing.T) {
+	repoRoot, initialCommit := initGitRepo(t)
+	ctx := context.Background()
+
+	slot := worktree.NewSlot(repoRoot, 0)
+	if err := slot.EnsureWorktree(ctx, initialCommit); err != nil {
+		t.Fatal(err)
+	}
+
+	emptyHooks := worktree.EmptyHooksDir(slot.Path)
+	if emptyHooks == "" {
+		t.Fatal("EmptyHooksDir returned empty string")
+	}
+	fi, err := os.Stat(emptyHooks)
+	if err != nil || !fi.IsDir() {
+		t.Fatalf("EmptyHooksDir %s does not exist or is not a directory: %v", emptyHooks, err)
+	}
+
+	out, err := slot.Git(ctx, slot.Path, "status")
+	if err != nil {
+		t.Fatalf("slot.Git status with empty hooksPath failed: %v, out: %s", err, out)
+	}
+}
+
+func TestScanKeepFiles_ValidationAndSymlinks(t *testing.T) {
+	repoRoot, initialCommit := initGitRepo(t)
+	ctx := context.Background()
+
+	slot := worktree.NewSlot(repoRoot, 0)
+	if err := slot.EnsureWorktree(ctx, initialCommit); err != nil {
+		t.Fatal(err)
+	}
+
+	badKeepLists := [][]string{
+		{"../escaping"},
+		{"-flag"},
+		{"nested/../../escaping"},
+	}
+	for _, bad := range badKeepLists {
+		if _, err := slot.TakeSnapshot(bad, nil); err == nil {
+			t.Errorf("TakeSnapshot with %v: want error, got nil", bad)
+		}
+		if err := slot.Reset(ctx, initialCommit, bad); err == nil {
+			t.Errorf("Reset with %v: want error, got nil", bad)
+		}
+	}
+}
+
+func TestCheckAndRestoreHooks_Hardened(t *testing.T) {
+	repoRoot, initialCommit := initGitRepo(t)
+	ctx := context.Background()
+
+	slot := worktree.NewSlot(repoRoot, 0)
+	if err := slot.EnsureWorktree(ctx, initialCommit); err != nil {
+		t.Fatal(err)
+	}
+
+	hooksDir := filepath.Join(repoRoot, ".git", "hooks")
+	if err := os.MkdirAll(hooksDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	hookPath := filepath.Join(hooksDir, "pre-commit")
+	if err := os.WriteFile(hookPath, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	snap, err := slot.TakeSnapshot(nil, nil)
+	if err != nil {
+		t.Fatalf("TakeSnapshot: %v", err)
+	}
+
+	// Adversary replaces hook with a directory of the same name
+	_ = os.Remove(hookPath)
+	if err := os.Mkdir(hookPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	rep, err := slot.CheckUnseenState(nil, nil, snap)
+	if err != nil {
+		t.Fatalf("CheckUnseenState: %v", err)
+	}
+	if !rep.Violation || !rep.GitHooksChanged {
+		t.Errorf("replacing hook with directory: want Violation=true, GitHooksChanged=true")
+	}
+
+	// Verify hook was restored to a file
+	fi, err := os.Stat(hookPath)
+	if err != nil || fi.IsDir() {
+		t.Fatalf("expected hook to be restored to file, got isDir=%v, err=%v", fi != nil && fi.IsDir(), err)
 	}
 }

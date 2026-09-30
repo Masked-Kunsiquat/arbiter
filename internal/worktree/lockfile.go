@@ -88,8 +88,6 @@ func ComputeLockfileHash(slotDir string, lockfiles []string) (string, error) {
 	slices.Sort(sorted)
 
 	hasher := sha256.New()
-	found := false
-
 	for _, name := range sorted {
 		fullPath := filepath.Join(slotDir, name)
 		data, err := os.ReadFile(fullPath)
@@ -100,15 +98,9 @@ func ComputeLockfileHash(slotDir string, lockfiles []string) (string, error) {
 			}
 			return "", fmt.Errorf("worktree: reading lockfile %s: %w", name, err)
 		}
-		found = true
 		hasher.Write([]byte(name + ":present\x00"))
 		hasher.Write(data)
 		hasher.Write([]byte{0})
-	}
-
-	if !found {
-		h := sha256.Sum256(nil)
-		return hex.EncodeToString(h[:]), nil
 	}
 
 	return hex.EncodeToString(hasher.Sum(nil)), nil
