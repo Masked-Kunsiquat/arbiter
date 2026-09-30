@@ -23,7 +23,7 @@ type CacheConfig struct {
 // Shared caches (Go, sccache, pnpm) reside under .arbiter/cache/ so they are
 // shared across slots and task runs. CARGO_TARGET_DIR is segregated per slot
 // to prevent cargo build lock contention.
-func DefaultCacheConfig(arbiterDir string, slotDir string, slotIndex int) CacheConfig {
+func DefaultCacheConfig(arbiterDir string, slotIndex int) CacheConfig {
 	cacheBase := filepath.Join(arbiterDir, "cache")
 	return CacheConfig{
 		GoCacheDir:     filepath.Join(cacheBase, "go-build"),

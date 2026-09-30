@@ -1,4 +1,4 @@
-﻿package worktree
+package worktree
 
 import (
 	"crypto/sha256"

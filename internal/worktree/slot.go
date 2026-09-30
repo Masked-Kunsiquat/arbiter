@@ -1,4 +1,4 @@
-﻿package worktree
+package worktree
 
 import (
 	"context"
@@ -292,7 +292,7 @@ func (s *Slot) CheckUnseenState(keepList, lockfiles []string, snap *Snapshot) (*
 
 // CacheConfig returns the shared and per-slot cache configuration for this slot.
 func (s *Slot) CacheConfig() CacheConfig {
-	return DefaultCacheConfig(s.ArbiterDir, s.Path, s.Index)
+	return DefaultCacheConfig(s.ArbiterDir, s.Index)
 }
 
 // Env overlays the slot's shared caches and per-slot CARGO_TARGET_DIR onto baseEnv.

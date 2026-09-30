@@ -1,4 +1,4 @@
-﻿package worktree_test
+package worktree_test
 
 import (
 	"context"
@@ -563,11 +563,9 @@ func TestUnseenState_GitConfigAndHooksTampering(t *testing.T) {
 
 func TestSharedCacheEnv(t *testing.T) {
 	arbiterDir := filepath.Join(string(filepath.Separator), "repo", ".arbiter")
-	slot0 := filepath.Join(arbiterDir, "worktrees", "slot-0")
-	slot1 := filepath.Join(arbiterDir, "worktrees", "slot-1")
 
-	cfg0 := worktree.DefaultCacheConfig(arbiterDir, slot0, 0)
-	cfg1 := worktree.DefaultCacheConfig(arbiterDir, slot1, 1)
+	cfg0 := worktree.DefaultCacheConfig(arbiterDir, 0)
+	cfg1 := worktree.DefaultCacheConfig(arbiterDir, 1)
 
 	// Shared caches must be identical
 	if cfg0.GoCacheDir != cfg1.GoCacheDir {
@@ -617,7 +615,7 @@ func TestSharedCacheEnv(t *testing.T) {
 
 	// Test EnsureDirs creates directories on disk
 	tempDir := t.TempDir()
-	tempCache := worktree.DefaultCacheConfig(tempDir, filepath.Join(tempDir, "slot-0"), 0)
+	tempCache := worktree.DefaultCacheConfig(tempDir, 0)
 	if err := tempCache.EnsureDirs(); err != nil {
 		t.Fatalf("EnsureDirs: %v", err)
 	}

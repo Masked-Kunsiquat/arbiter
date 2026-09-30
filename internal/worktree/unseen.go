@@ -1,4 +1,4 @@
-﻿package worktree
+package worktree
 
 import (
 	"bytes"
@@ -59,41 +59,34 @@ func (r *UnseenReport) ShouldReinstall(lastInstallHash string) bool {
 func resolveGitDir(repoRoot string) string {
 	gitPath := filepath.Join(repoRoot, ".git")
 	fi, err := os.Stat(gitPath)
+	if err != nil || fi.IsDir() {
+		return gitPath
+	}
+	data, err := os.ReadFile(gitPath)
 	if err != nil {
 		return gitPath
 	}
-	if !fi.IsDir() {
-		data, err := os.ReadFile(gitPath)
-		if err == nil {
-			content := strings.TrimSpace(string(data))
-			if strings.HasPrefix(content, "gitdir:") {
-				target := strings.TrimSpace(strings.TrimPrefix(content, "gitdir:"))
-				if !filepath.IsAbs(target) {
-					target = filepath.Join(repoRoot, target)
-				}
-				commondirFile := filepath.Join(target, "commondir")
-				if cdData, cdErr := os.ReadFile(commondirFile); cdErr == nil {
-					cdTarget := strings.TrimSpace(string(cdData))
-					if !filepath.IsAbs(cdTarget) {
-						cdTarget = filepath.Join(target, cdTarget)
-					}
-					return filepath.Clean(cdTarget)
-				}
-				return filepath.Clean(target)
-			}
-		}
+	content := strings.TrimSpace(string(data))
+	if !strings.HasPrefix(content, "gitdir:") {
+		return gitPath
 	}
-	return gitPath
+	target := strings.TrimSpace(strings.TrimPrefix(content, "gitdir:"))
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(repoRoot, target)
+	}
+	commondirFile := filepath.Join(target, "commondir")
+	cdData, err := os.ReadFile(commondirFile)
+	if err != nil {
+		return filepath.Clean(target)
+	}
+	cdTarget := strings.TrimSpace(string(cdData))
+	if !filepath.IsAbs(cdTarget) {
+		cdTarget = filepath.Join(target, cdTarget)
+	}
+	return filepath.Clean(cdTarget)
 }
 
-// TakeSnapshot records a snapshot of slotDir and the repo's shared git configuration
-// before an agent run starts.
-func TakeSnapshot(slotDir, repoRoot string, keepList, lockfiles []string) (*Snapshot, error) {
-	lockHash, err := ComputeLockfileHash(slotDir, lockfiles)
-	if err != nil {
-		return nil, fmt.Errorf("worktree: snapshot lockfile hash: %w", err)
-	}
-
+func scanKeepFiles(slotDir string, keepList []string) (map[string]FileMeta, error) {
 	keepFiles := make(map[string]FileMeta)
 	for _, keep := range keepList {
 		keepClean := filepath.Clean(keep)
@@ -142,6 +135,49 @@ func TakeSnapshot(slotDir, repoRoot string, keepList, lockfiles []string) (*Snap
 			return nil, fmt.Errorf("worktree: scanning keep dir %s: %w", keepDir, err)
 		}
 	}
+	return keepFiles, nil
+}
+
+func snapshotGitHooks(hooksDir string) map[string]*GitFileBackup {
+	gitHooks := make(map[string]*GitFileBackup)
+	entries, err := os.ReadDir(hooksDir)
+	if err != nil {
+		return gitHooks
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		hp := filepath.Join(hooksDir, e.Name())
+		data, err := os.ReadFile(hp)
+		if err != nil {
+			continue
+		}
+		mode := os.FileMode(0o755)
+		if info, err := e.Info(); err == nil {
+			mode = info.Mode()
+		}
+		gitHooks[e.Name()] = &GitFileBackup{
+			RelPath: e.Name(),
+			Content: data,
+			Mode:    mode,
+		}
+	}
+	return gitHooks
+}
+
+// TakeSnapshot records a snapshot of slotDir and the repo's shared git configuration
+// before an agent run starts.
+func TakeSnapshot(slotDir, repoRoot string, keepList, lockfiles []string) (*Snapshot, error) {
+	lockHash, err := ComputeLockfileHash(slotDir, lockfiles)
+	if err != nil {
+		return nil, fmt.Errorf("worktree: snapshot lockfile hash: %w", err)
+	}
+
+	keepFiles, err := scanKeepFiles(slotDir, keepList)
+	if err != nil {
+		return nil, err
+	}
 
 	gitDir := resolveGitDir(repoRoot)
 
@@ -162,30 +198,7 @@ func TakeSnapshot(slotDir, repoRoot string, keepList, lockfiles []string) (*Snap
 	}
 
 	// Snapshot .git/hooks/
-	gitHooks := make(map[string]*GitFileBackup)
-	hooksDir := filepath.Join(gitDir, "hooks")
-	if entries, err := os.ReadDir(hooksDir); err == nil {
-		for _, e := range entries {
-			if e.IsDir() {
-				continue
-			}
-			hp := filepath.Join(hooksDir, e.Name())
-			data, err := os.ReadFile(hp)
-			if err != nil {
-				continue
-			}
-			info, err := e.Info()
-			mode := os.FileMode(0o755)
-			if err == nil {
-				mode = info.Mode()
-			}
-			gitHooks[e.Name()] = &GitFileBackup{
-				RelPath: e.Name(),
-				Content: data,
-				Mode:    mode,
-			}
-		}
-	}
+	gitHooks := snapshotGitHooks(filepath.Join(gitDir, "hooks"))
 
 	return &Snapshot{
 		LockfileHash: lockHash,
@@ -193,6 +206,77 @@ func TakeSnapshot(slotDir, repoRoot string, keepList, lockfiles []string) (*Snap
 		GitConfig:    gitConfigBackup,
 		GitHooks:     gitHooks,
 	}, nil
+}
+
+func diffKeepFiles(snapFiles, currFiles map[string]FileMeta, report *UnseenReport) {
+	changedPathsMap := make(map[string]bool)
+	for path, curr := range currFiles {
+		old, found := snapFiles[path]
+		if !found || curr.Size != old.Size || !curr.ModTime.Equal(old.ModTime) {
+			report.KeepListChanged = true
+			changedPathsMap[path] = true
+		}
+	}
+	for path := range snapFiles {
+		if _, found := currFiles[path]; !found {
+			report.KeepListChanged = true
+			changedPathsMap[path] = true
+		}
+	}
+	for path := range changedPathsMap {
+		report.ChangedKeepPaths = append(report.ChangedKeepPaths, path)
+	}
+	slices.Sort(report.ChangedKeepPaths)
+}
+
+func checkAndRestoreHooks(hooksDir string, snapHooks map[string]*GitFileBackup, report *UnseenReport) {
+	currHooks := make(map[string]bool)
+	entries, err := os.ReadDir(hooksDir)
+	if err != nil {
+		entries = nil
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		currHooks[name] = true
+		hp := filepath.Join(hooksDir, name)
+
+		old, existed := snapHooks[name]
+		if !existed {
+			// Newly planted hook
+			report.GitHooksChanged = true
+			report.Violation = true
+			if rmErr := os.Remove(hp); rmErr == nil {
+				report.RestoredPaths = append(report.RestoredPaths, filepath.ToSlash(filepath.Join(".git/hooks", name)))
+			}
+			continue
+		}
+
+		// Existed, check content
+		currData, err := os.ReadFile(hp)
+		if err != nil || !bytes.Equal(currData, old.Content) {
+			report.GitHooksChanged = true
+			report.Violation = true
+			if werr := os.WriteFile(hp, old.Content, old.Mode); werr == nil {
+				report.RestoredPaths = append(report.RestoredPaths, filepath.ToSlash(filepath.Join(".git/hooks", name)))
+			}
+		}
+	}
+
+	// Check for hooks that were deleted
+	for name, old := range snapHooks {
+		if currHooks[name] {
+			continue
+		}
+		report.GitHooksChanged = true
+		report.Violation = true
+		hp := filepath.Join(hooksDir, name)
+		if werr := os.WriteFile(hp, old.Content, old.Mode); werr == nil {
+			report.RestoredPaths = append(report.RestoredPaths, filepath.ToSlash(filepath.Join(".git/hooks", name)))
+		}
+	}
 }
 
 // CheckUnseenState compares the current state of slotDir and the shared git
@@ -217,80 +301,11 @@ func CheckUnseenState(slotDir, repoRoot string, keepList, lockfiles []string, sn
 	}
 
 	// 2. Check keep-list directories
-	currKeepFiles := make(map[string]FileMeta)
-	for _, keep := range keepList {
-		keepClean := filepath.Clean(keep)
-		keepDir := filepath.Join(slotDir, keepClean)
-		fi, err := os.Stat(keepDir)
-		if err != nil {
-			if errors.Is(err, fs.ErrNotExist) {
-				continue
-			}
-			return nil, fmt.Errorf("worktree: stat keep dir %s: %w", keepDir, err)
-		}
-		if !fi.IsDir() {
-			rel, _ := filepath.Rel(slotDir, keepDir)
-			currKeepFiles[filepath.ToSlash(rel)] = FileMeta{
-				RelPath: filepath.ToSlash(rel),
-				Size:    fi.Size(),
-				ModTime: fi.ModTime(),
-			}
-			continue
-		}
-
-		err = filepath.WalkDir(keepDir, func(path string, d fs.DirEntry, walkErr error) error {
-			if walkErr != nil {
-				return walkErr
-			}
-			if d.IsDir() {
-				return nil
-			}
-			info, err := d.Info()
-			if err != nil {
-				return err
-			}
-			rel, err := filepath.Rel(slotDir, path)
-			if err != nil {
-				return err
-			}
-			normalized := filepath.ToSlash(rel)
-			currKeepFiles[normalized] = FileMeta{
-				RelPath: normalized,
-				Size:    info.Size(),
-				ModTime: info.ModTime(),
-			}
-			return nil
-		})
-		if err != nil {
-			return nil, fmt.Errorf("worktree: scanning keep dir %s: %w", keepDir, err)
-		}
+	currKeepFiles, err := scanKeepFiles(slotDir, keepList)
+	if err != nil {
+		return nil, err
 	}
-
-	// Look for added or modified keep files
-	changedPathsMap := make(map[string]bool)
-	for path, curr := range currKeepFiles {
-		old, found := snap.KeepFiles[path]
-		if !found {
-			report.KeepListChanged = true
-			changedPathsMap[path] = true
-			continue
-		}
-		if curr.Size != old.Size || !curr.ModTime.Equal(old.ModTime) {
-			report.KeepListChanged = true
-			changedPathsMap[path] = true
-		}
-	}
-	// Look for deleted keep files
-	for path := range snap.KeepFiles {
-		if _, found := currKeepFiles[path]; !found {
-			report.KeepListChanged = true
-			changedPathsMap[path] = true
-		}
-	}
-	for path := range changedPathsMap {
-		report.ChangedKeepPaths = append(report.ChangedKeepPaths, path)
-	}
-	slices.Sort(report.ChangedKeepPaths)
+	diffKeepFiles(snap.KeepFiles, currKeepFiles, report)
 
 	// 3. Check and restore .git/config
 	gitDir := resolveGitDir(repoRoot)
@@ -307,51 +322,7 @@ func CheckUnseenState(slotDir, repoRoot string, keepList, lockfiles []string, sn
 	}
 
 	// 4. Check and restore .git/hooks/
-	hooksDir := filepath.Join(gitDir, "hooks")
-	currHooks := make(map[string]bool)
-	if entries, err := os.ReadDir(hooksDir); err == nil {
-		for _, e := range entries {
-			if e.IsDir() {
-				continue
-			}
-			name := e.Name()
-			currHooks[name] = true
-			hp := filepath.Join(hooksDir, name)
-
-			old, existed := snap.GitHooks[name]
-			if !existed {
-				// Newly planted hook
-				report.GitHooksChanged = true
-				report.Violation = true
-				if rmErr := os.Remove(hp); rmErr == nil {
-					report.RestoredPaths = append(report.RestoredPaths, filepath.ToSlash(filepath.Join(".git/hooks", name)))
-				}
-				continue
-			}
-
-			// Existed, check content
-			currData, err := os.ReadFile(hp)
-			if err != nil || !bytes.Equal(currData, old.Content) {
-				report.GitHooksChanged = true
-				report.Violation = true
-				if werr := os.WriteFile(hp, old.Content, old.Mode); werr == nil {
-					report.RestoredPaths = append(report.RestoredPaths, filepath.ToSlash(filepath.Join(".git/hooks", name)))
-				}
-			}
-		}
-	}
-
-	// Check for hooks that were deleted
-	for name, old := range snap.GitHooks {
-		if !currHooks[name] {
-			report.GitHooksChanged = true
-			report.Violation = true
-			hp := filepath.Join(hooksDir, name)
-			if werr := os.WriteFile(hp, old.Content, old.Mode); werr == nil {
-				report.RestoredPaths = append(report.RestoredPaths, filepath.ToSlash(filepath.Join(".git/hooks", name)))
-			}
-		}
-	}
+	checkAndRestoreHooks(filepath.Join(gitDir, "hooks"), snap.GitHooks, report)
 	slices.Sort(report.RestoredPaths)
 
 	return report, nil
