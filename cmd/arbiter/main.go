@@ -3,7 +3,11 @@
 // This is a v0.1 bootstrap scaffold: only enough of the command tree exists
 // to unblock work that depends on a CLI entrypoint (e.g. `arbiter seats`,
 // issue #5; `arbiter init`, issue #1). PRD lifecycle commands and the
-// core/Runner process (issue #15) are not implemented yet.
+// Runner (issue #15) are not implemented yet.
+//
+// Commands reach state through the core, never by opening state.db
+// themselves: connectCore attaches to the core already running for the
+// repo, or hosts one in-process for the duration of the command (§10.B).
 package main
 
 import (
@@ -13,6 +17,7 @@ import (
 	"path/filepath"
 
 	"github.com/Masked-Kunsiquat/arbiter/internal/config"
+	"github.com/Masked-Kunsiquat/arbiter/internal/core"
 )
 
 func main() {
@@ -58,6 +63,17 @@ func loadAndValidateConfig() error {
 		return fmt.Errorf("startup config validation failed:\n%w", err)
 	}
 	return nil
+}
+
+// connectCore connects to the core for the enclosing repo (found by
+// walking up to .arbiter/state.db), hosting it in-process if no other
+// arbiter process is. The caller must Close the session.
+func connectCore(ctx context.Context) (*core.Session, error) {
+	dbPath, err := findStateDB()
+	if err != nil {
+		return nil, err
+	}
+	return core.Connect(ctx, filepath.Dir(dbPath))
 }
 
 func printUsage() {
