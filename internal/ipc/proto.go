@@ -211,7 +211,7 @@ func Handshake(ctx context.Context, conn net.Conn, repoHash string) (*Client, er
 	}
 	switch {
 	case err != nil:
-		err = fmt.Errorf("ipc: handshake: %w", err)
+		err = fmt.Errorf("ipc: handshake: %w", contextCause(ctx, err))
 	case w.Error != "":
 		err = fmt.Errorf("%w: %s", ErrHandshakeRefused, w.Error)
 	case w.Protocol != ProtocolVersion || w.RepoHash != repoHash:
@@ -260,9 +260,7 @@ func (c *Client) Call(ctx context.Context, method string, params, result any) er
 		err = fmt.Errorf("response id %d for request %d", resp.ID, req.ID)
 	}
 	if err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			err = ctxErr
-		}
+		err = contextCause(ctx, err)
 		c.broken = fmt.Errorf("ipc: %s: connection to core lost: %w", method, err)
 		return c.broken
 	}
@@ -279,6 +277,21 @@ func (c *Client) Call(ctx context.Context, method string, params, result any) er
 
 // Close closes the connection.
 func (c *Client) Close() error { return c.conn.Close() }
+
+// contextCause reports ctx's error in place of an I/O error that ctx
+// caused. The conn deadline is ctx's deadline, and the two timers race: the
+// read can time out a moment before ctx.Err() turns non-nil. A timeout under
+// a ctx deadline was that deadline, so wait the instant for ctx to catch up.
+func contextCause(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	if _, ok := ctx.Deadline(); ok && errors.Is(err, os.ErrDeadlineExceeded) {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	return err
+}
 
 // bindDeadline makes blocked I/O on c.conn honor ctx: its deadline becomes
 // the conn deadline, and cancellation expires the conn deadline
