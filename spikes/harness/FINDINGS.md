@@ -1,6 +1,6 @@
 # Spike 1: Claude Code headless harness from Go
 
-Environment: Windows 11, Go 1.27.1, Claude Code 2.1.284 (`C:\Users\blain\.local\bin\claude.exe`,
+Environment: Windows 11, Go 1.27.1, Claude Code 2.1.284 (`~\.local\bin\claude.exe`,
 a native 246 MB exe, not a `.cmd` shim), subscription auth (`apiKeySource: "none"`).
 Model: `claude-haiku-4-5-20251001`. Code: `main.go` (`go run . basic|resume|tools|big|isolated`).
 Raw event streams are in `out/*.jsonl`. Total spend for the spike: about $0.60 (notional).

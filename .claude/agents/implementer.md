@@ -16,9 +16,9 @@ You implement a narrowly specified change in the arbiter repo and hand it back f
 - Stay cgo-free: no dependency or build tag that needs cgo (Arbiter must run on Alpine).
 - Tests that create a Unix socket need a short temp root (`os.MkdirTemp("", "arb")` with a `//nolint:usetesting` reason), because `t.TempDir()` paths can pass the ~104-byte socket path limit.
 
-**Validate before reporting** (Go isn't on PATH; prefix it):
+**Validate before reporting** (if `go` or `golangci-lint` isn't on PATH, prepend the local toolchain; match the version to `go.mod`):
 ```
-export PATH="/c/Users/blain/sdk/go1.27.1/bin:/c/Users/blain/go/bin:$PATH"
+export PATH="$HOME/sdk/go1.27.1/bin:$HOME/go/bin:$PATH"
 go vet ./cmd/... ./internal/...
 go test -count=1 <affected packages>
 GOOS=linux golangci-lint run ./cmd/... ./internal/...

@@ -15,6 +15,6 @@ Look hardest for:
 - Deviations from the spec section the change implements.
 
 Rules:
-- Read-only. Bash only for `git diff/log/show`, `go vet`, and `go test` (prefix `export PATH="/c/Users/blain/sdk/go1.27.1/bin:$PATH"`).
+- Read-only. Bash only for `git diff/log/show`, `go vet`, and `go test` (if `go` isn't on PATH, prefix `export PATH="$HOME/sdk/go1.27.1/bin:$PATH"`).
 - Verify each finding against the actual code before reporting it; drop anything you can't point to.
 - Report findings ranked by severity. For each: `path:line`, the concrete failure scenario (inputs/state → wrong result), and one recommended fix. No style nits unless asked. Say plainly if you found nothing serious.
