@@ -1,6 +1,15 @@
-# Arbiter Engine: Architecture & System Specification (v3.1)
+# Arbiter Engine: Architecture & System Specification (v3.2)
 
 A lean, local-first execution arbiter, task governor, and multi-agent coordination layer built on native Git primitives, embedded SQLite, and signed audit records.
+
+> **Changes from v3.1** (§7 Process Supervision implementation, PR #48):
+>
+> | Issue | Resolution | Section |
+> |---|---|---|
+> | `Terminate` had no return error; failed hard kill could go unnoticed | `Terminate(h Handle, grace time.Duration) error`; returns error on failed hard kill or if container fails to empty | §7 |
+> | Linux `PR_SET_PDEATHSIG` only covers direct child, leaving orphan grandchildren if program dies or exits | Group leader runs `_pgshim` with `PDEATHSIG` (from `LockOSThread`), kills whole group on supervisor death, reports exit status via fd-3 pipe, and anchors PGID | §7 |
+> | Hard kill is asynchronous on Windows and Linux; dying processes could be logged as false strays | `Terminate` waits (bounded) for container to empty after hard kill before reaping leader and returning | §7 |
+> | Windows graceful stop fails if leader exited; `AttachConsole` and group id require a live leader | `_ctrlbreak` accepts candidate attach PIDs from job members, attaches through first viable (non-conhost) process, and signals group 0 | §7 |
 
 > **Changes from v3** (pre-build spikes; evidence in `spikes/*/FINDINGS.md`):
 >
@@ -832,8 +841,8 @@ All sub-processes (every agent role, test runners, installs) are launched throug
 
 ```go
 type Supervisor interface {
-    Spawn(cmd Cmd) (Handle, error)            // starts the process inside a kill-able container
-    Terminate(h Handle, grace time.Duration)  // graceful signal, then hard kill of the whole tree
+    Spawn(cmd Cmd) (Handle, error)                  // starts the process inside a kill-able container
+    Terminate(h Handle, grace time.Duration) error  // graceful signal, then hard kill of the whole tree
 }
 ```
 
@@ -842,12 +851,13 @@ type Supervisor interface {
 | Container | Job Object (`CreateJobObject`) | Process group (`Setpgid`) | Process group (`Setpgid`) |
 | Spawn flags | `CREATE_SUSPENDED \| CREATE_NEW_PROCESS_GROUP \| CREATE_NO_WINDOW` | `Setpgid` | `Setpgid` |
 | Spawn race | Create suspended, assign to job, then resume, so no grandchild escapes. Go's `os/exec` drops the main-thread handle, so resume via a Toolhelp thread snapshot (`TH32CS_SNAPTHREAD` → `ResumeThread`), or create the process directly inside the job with `PROC_THREAD_ATTRIBUTE_JOB_LIST` | n/a | n/a |
-| Graceful stop | `CTRL_BREAK_EVENT`, sent by a helper process (`arbiter _ctrlbreak <pid>`: `FreeConsole` → `AttachConsole(pid)` → `GenerateConsoleCtrlEvent`), never by the supervisor itself | `kill -TERM -<pgid>` | `kill -TERM -<pgid>` |
+| Graceful stop | `CTRL_BREAK_EVENT`, sent by a helper process (`arbiter _ctrlbreak <group> [<attach>...]`: `FreeConsole` → `AttachConsole` → `GenerateConsoleCtrlEvent`), never by the supervisor itself | `kill -TERM -<pgid>` | `kill -TERM -<pgid>` |
 | Hard kill | `TerminateJobObject` | `kill -KILL -<pgid>` | `kill -KILL -<pgid>` |
-| Supervisor-death cleanup | `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`: the OS kills the job when the supervisor's handle closes | `PR_SET_PDEATHSIG`. Go gotcha: it fires when the *spawning OS thread* exits, so spawn from a `runtime.LockOSThread()` goroutine | No PDEATHSIG; a tiny shim polls `getppid()` / kqueue `NOTE_EXIT` and kills its group |
+| Supervisor-death cleanup | `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`: the OS kills the job when the supervisor's handle closes | `PR_SET_PDEATHSIG` on a group-leader shim (`arbiter _pgshim`), not the program itself (plain `PDEATHSIG` only reaches the direct child). The shim sets `PR_SET_PDEATHSIG` from a `runtime.LockOSThread()` goroutine, kills its whole group (`kill -KILL -<pgid>`), reports the program's exit status over an fd-3 pipe, and anchors the PGID until teardown | No PDEATHSIG; a tiny shim polls `getppid()` / kqueue `NOTE_EXIT` and kills its group |
 
-- **Why the break goes through a helper.** `CTRL_BREAK_EVENT` only reaches a process group attached to the *caller's* console. A console-less supervisor (`arbiter serve`, a background launch) gets "handle is invalid". A child with its own console (`CREATE_NO_WINDOW`, which stops a console window popping up for every agent) gets nothing, *and the call still reports success*. Attaching to the child's console detaches the caller from its own and is process-global, so it runs in a short-lived helper.
-- **`Terminate(h, grace)` always ends in a hard kill:** send the graceful signal, wait `grace`, then `TerminateJobObject` / `kill -KILL` regardless, then close the job handle. The graceful signal is best effort and can silently not arrive.
+- **Why the break goes through a helper.** `CTRL_BREAK_EVENT` only reaches a process group attached to the *caller's* console. A console-less supervisor (`arbiter serve`, a background launch) gets "handle is invalid". A child with its own console (`CREATE_NO_WINDOW`, which stops a console window popping up for every agent) gets nothing, *and the call still reports success*. Attaching to the child's console detaches the caller from its own and is process-global, so it runs in a short-lived helper (`arbiter _ctrlbreak <group> [<attach>...]`). If the leader process has already exited, `AttachConsole(pid)` on its PID fails, and a group ID whose leader is gone reaches nobody; the helper accepts candidate job member PIDs to attach through (skipping `conhost.exe`, which cannot be attached through) and signals group 0 (all processes on that console).
+- **Linux process group plus a shim.** `PR_SET_PDEATHSIG` only reaches the direct child; if the program is killed or exits, any background processes its shell launched keep running. Arbiter runs the program under `arbiter _pgshim` as group leader. The shim receives `PR_SET_PDEATHSIG` (from a `LockOSThread` goroutine), ignores graceful SIGTERM (which reaches the program directly via the group signal), reports the program's exit status over a pipe (fd 3), and remains alive as the group anchor until teardown's group kill. This ensures supervisor-death cleanup covers processes left behind after program exit, and prevents PGID recycling before `Terminate` signals the group. The helper defaults to `/proc/self/exe` so it survives binary replacement during upgrades.
+- **`Terminate(h, grace)` always ends in a hard kill:** send the graceful signal, wait up to `grace` (exiting early once the container is empty), then send `TerminateJobObject` / `kill -KILL -<pgid>` regardless. Both hard kills are asynchronous, so `Terminate` waits (bounded) for the container to actually empty before reaping the leader and releasing the container/closing the job handle; otherwise dying processes could appear as false strays in the post-run scan. `Terminate` returns an error if the hard kill fails or the container fails to empty. The graceful signal is best effort and can silently not arrive.
 - **What's in the container.** `claude.exe` is a single native binary; its tree is whatever its shell tools start (powershell/cmd/bash and their commands) plus `conhost.exe`.
 - **Containment is cleanup, not a sandbox.** Children can't break away from the job (`CREATE_BREAKAWAY_FROM_JOB` is denied), but a process started *through a system service* is not the job's child: WMI (`Win32_Process.Create`), the Task Scheduler, or a service can start processes that survive `TerminateJobObject`, without admin rights. After every invocation the Runner scans for live processes whose command line or working directory contains the slot path and logs any as a violation against the seat (§8.A).
 
