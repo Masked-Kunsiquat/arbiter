@@ -129,7 +129,7 @@ func seed(t *testing.T, raw *sql.DB) (prdID, taskID string) {
 	if err != nil {
 		t.Fatalf("seed task: %v", err)
 	}
-	return
+	return prdID, taskID
 }
 
 func TestPRD_StatusCheck(t *testing.T) {

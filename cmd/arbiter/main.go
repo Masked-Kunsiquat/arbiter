@@ -49,7 +49,7 @@ func loadAndValidateConfig() error {
 		return err
 	}
 	arbiterDir := filepath.Dir(dbPath)
-	cfgPath := config.ConfigPath(arbiterDir)
+	cfgPath := config.Path(arbiterDir)
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		return err

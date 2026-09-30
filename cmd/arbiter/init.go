@@ -15,7 +15,7 @@ import (
 // default config.toml, add the *.jsonl .gitattributes entry, then validate
 // the result so a broken install fails loudly at the point of creation
 // rather than on first use.
-func runInit(ctx context.Context, args []string) error {
+func runInit(_ context.Context, args []string) error {
 	force, err := parseInitArgs(args)
 	if err != nil {
 		return err
@@ -49,7 +49,7 @@ func runInit(ctx context.Context, args []string) error {
 	}
 
 	cfg := config.FromEcosystem(primary)
-	cfgPath := config.ConfigPath(arbiterDir)
+	cfgPath := config.Path(arbiterDir)
 
 	if err := config.Validate(cfg, primary.Name); err != nil {
 		return fmt.Errorf("arbiter init: config validation failed before writing:\n%w", err)

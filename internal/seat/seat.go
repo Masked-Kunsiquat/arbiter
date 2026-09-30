@@ -92,7 +92,7 @@ func verifyRingleader(ctx context.Context, db *sql.DB, seatID, prdID string) err
 // seat and attributing it to a different, unrelated seat as parent.
 func verifyParentage(ctx context.Context, db *sql.DB, minterSeatID, parentSeatID string) error {
 	current := parentSeatID
-	for depth := 0; depth < 64; depth++ { // bound: the agent tree is shallow; this guards against a corrupt cycle
+	for range 64 { // bound: the agent tree is shallow; this guards against a corrupt cycle
 		if current == minterSeatID {
 			return nil
 		}
@@ -231,7 +231,7 @@ func nextSeatID(ctx context.Context, db *sql.DB, req MintRequest) (string, error
 	var scope, prefix string
 	if req.Role == RoleRingleader {
 		scope = req.PRDID
-		prefix = fmt.Sprintf("%s/ringleader.", req.PRDID)
+		prefix = req.PRDID + "/ringleader."
 	} else {
 		scope = req.TaskID
 		prefix = fmt.Sprintf("%s/%s.", req.TaskID, req.Role)

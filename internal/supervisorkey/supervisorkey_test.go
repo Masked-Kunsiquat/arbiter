@@ -182,7 +182,7 @@ func TestLoadOrGenerate_ConcurrentGenerate_SameKeyWins(t *testing.T) {
 		err error
 	}
 	results := make(chan result, 2)
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		go func() {
 			signer, err := supervisorkey.LoadOrGenerate(configDir)
 			if err != nil {

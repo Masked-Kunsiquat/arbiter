@@ -57,7 +57,7 @@ func (s *SSHSigner) Sign(message []byte) (string, error) {
 	}
 	var blob bytes.Buffer
 	blob.WriteString(sshsigMagic)
-	binary.Write(&blob, binary.BigEndian, uint32(sshsigVersion))
+	_ = binary.Write(&blob, binary.BigEndian, uint32(sshsigVersion))
 	writeString(&blob, s.signer.PublicKey().Marshal())
 	writeString(&blob, []byte(s.namespace))
 	writeString(&blob, nil) // reserved
@@ -121,7 +121,7 @@ func signedData(namespace string, message []byte) []byte {
 }
 
 func writeString(b *bytes.Buffer, s []byte) {
-	binary.Write(b, binary.BigEndian, uint32(len(s)))
+	_ = binary.Write(b, binary.BigEndian, uint32(len(s)))
 	b.Write(s)
 }
 

@@ -34,7 +34,6 @@ func TestResolveHarnessCommand_RejectsNonExe(t *testing.T) {
 	}
 
 	for _, ext := range []string{".cmd", ".bat"} {
-		ext := ext
 		t.Run(ext, func(t *testing.T) {
 			dir := t.TempDir()
 			name := "fake-harness" + ext

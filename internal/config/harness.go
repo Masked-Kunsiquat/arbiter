@@ -9,7 +9,6 @@ import (
 	"strings"
 )
 
-
 // ErrHarnessShim is returned when harness.command resolves to a non-native
 // executable on Windows (anything other than a .exe).
 var ErrHarnessShim = errors.New("config: harness command does not resolve to a native .exe on Windows")

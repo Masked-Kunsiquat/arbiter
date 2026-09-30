@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -53,6 +54,7 @@ func mustAppend(t *testing.T, c *Chain, seat, action, task string, payload map[s
 
 // sampleChain covers null task_id, nested arrays/objects, floats, nulls, and non-ASCII text.
 func sampleChain(t *testing.T, s Signer) *Chain {
+	t.Helper()
 	c := newChain(t, "PRD-004", s)
 	mustAppend(t, c, "human", "prd_lock", "", map[string]any{
 		"tag": "arbiter/prd/PRD-004/v1", "spec_hash": strings.Repeat("ab", 32), "tag_object_sha": strings.Repeat("cd", 20),
@@ -120,7 +122,7 @@ func TestGoldenEntry(t *testing.T) {
 		"notes":         "Ünïcödé € 🚀 \"quoted\" back\\slash\r\nCRLF\ttab  ",
 		"\U0001F600":    "emoji key sorts before דּ by UTF-16",
 		"דּ":             1e21,
-		"n":             []any{0.1, 1e-7, -0.0, 100, int64(1) << 53},
+		"n":             []any{0.1, 1e-7, math.Copysign(0, -1), 100, int64(1) << 53},
 	})
 
 	const wantCanon = `{"action":"result","chain":"PRD-004","created_at":"2026-09-29T03:00:01.123456Z",` +

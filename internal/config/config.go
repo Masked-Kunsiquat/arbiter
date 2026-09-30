@@ -30,28 +30,28 @@ type Config struct {
 }
 
 type Harness struct {
-	Command         string `toml:"command"`
-	RingleaderModel string `toml:"ringleader_model"`
-	WorkerModel     string `toml:"worker_model"`
-	AdversaryModel  string `toml:"adversary_model"`
-	JudgeModel      string `toml:"judge_model"`
+	Command         string   `toml:"command"`
+	RingleaderModel string   `toml:"ringleader_model"`
+	WorkerModel     string   `toml:"worker_model"`
+	AdversaryModel  string   `toml:"adversary_model"`
+	JudgeModel      string   `toml:"judge_model"`
 	ShellAllow      []string `toml:"shell_allow"`
 }
 
 type Limits struct {
-	MaxAttempts         int `toml:"max_attempts"`
-	LeaseMinutes        int `toml:"lease_minutes"`
-	LeaseCeilingMinutes int `toml:"lease_ceiling_minutes"`
-	JudgeBundleTokens   int `toml:"judge_bundle_tokens"`
+	MaxAttempts          int `toml:"max_attempts"`
+	LeaseMinutes         int `toml:"lease_minutes"`
+	LeaseCeilingMinutes  int `toml:"lease_ceiling_minutes"`
+	JudgeBundleTokens    int `toml:"judge_bundle_tokens"`
 	AttackTimeoutSeconds int `toml:"attack_timeout_seconds"`
 }
 
 type Test struct {
-	Build      string `toml:"build"`
-	All        string `toml:"all"`
-	Files      string `toml:"files"`
-	Reporter   string `toml:"reporter"`
-	JUnitPath  string `toml:"junit_path"`
+	Build     string `toml:"build"`
+	All       string `toml:"all"`
+	Files     string `toml:"files"`
+	Reporter  string `toml:"reporter"`
+	JUnitPath string `toml:"junit_path"`
 }
 
 type Adversary struct {
@@ -92,8 +92,8 @@ func Load(path string) (*Config, error) {
 	return &cfg, nil
 }
 
-// ConfigPath returns the expected location of config.toml under an
+// Path returns the expected location of config.toml under an
 // .arbiter directory rooted at arbiterDir.
-func ConfigPath(arbiterDir string) string {
+func Path(arbiterDir string) string {
 	return filepath.Join(arbiterDir, "config.toml")
 }
