@@ -3,7 +3,8 @@
 // This is a v0.1 bootstrap scaffold: only enough of the command tree exists
 // to unblock work that depends on a CLI entrypoint (e.g. `arbiter seats`,
 // issue #5; `arbiter init`, issue #1). PRD lifecycle commands and the
-// Runner (issue #15) are not implemented yet.
+// Runner are not implemented yet; the process supervisor it will use is
+// internal/supervisor (issue #15).
 //
 // Commands reach state through the core, never by opening state.db
 // themselves: connectCore attaches to the core already running for the
@@ -18,9 +19,15 @@ import (
 
 	"github.com/Masked-Kunsiquat/arbiter/internal/config"
 	"github.com/Masked-Kunsiquat/arbiter/internal/core"
+	"github.com/Masked-Kunsiquat/arbiter/internal/supervisor"
 )
 
 func main() {
+	// Hidden helper commands the process supervisor re-executes this binary
+	// for (_ctrlbreak, _pgshim; spec §7). Checked before anything else.
+	if code, ok := supervisor.RunHelper(os.Args[1:]); ok {
+		os.Exit(code)
+	}
 	if err := run(context.Background(), os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "arbiter:", err)
 		os.Exit(1)
