@@ -4,6 +4,7 @@
 .arbiter/core.lock
 .arbiter/core.sock
 .arbiter/worktrees/
+.arbiter/cache/
 
 # Agent Skills
 .agents/

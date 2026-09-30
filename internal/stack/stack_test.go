@@ -86,3 +86,61 @@ func TestDetect_Empty(t *testing.T) {
 		t.Fatalf("Detect: got %+v, want none", got)
 	}
 }
+
+func TestDetect_Rust(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "Cargo.toml")
+
+	got, err := stack.Detect(dir)
+	if err != nil {
+		t.Fatalf("Detect: %v", err)
+	}
+	if len(got) != 1 || got[0].Name != "rust" {
+		t.Fatalf("Detect: got %+v, want single rust ecosystem", got)
+	}
+	if len(got[0].Deps.Keep) != 1 || got[0].Deps.Keep[0] != "target" {
+		t.Errorf("Rust Deps.Keep = %v, want [target]", got[0].Deps.Keep)
+	}
+	if got[0].Deps.Install != "cargo fetch" {
+		t.Errorf("Rust Deps.Install = %q, want 'cargo fetch'", got[0].Deps.Install)
+	}
+	if len(got[0].Deps.Lockfiles) != 1 || got[0].Deps.Lockfiles[0] != "Cargo.lock" {
+		t.Errorf("Rust Deps.Lockfiles = %v, want [Cargo.lock]", got[0].Deps.Lockfiles)
+	}
+}
+
+func TestKeepListPerEcosystem(t *testing.T) {
+	cases := []struct {
+		file     string
+		wantName string
+		wantKeep []string
+	}{
+		{"go.mod", "go", nil},
+		{"package.json", "node", []string{"node_modules"}},
+		{"pyproject.toml", "python", []string{".venv"}},
+		{"Cargo.toml", "rust", []string{"target"}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.wantName, func(t *testing.T) {
+			dir := t.TempDir()
+			writeFile(t, dir, tc.file)
+			got, err := stack.Detect(dir)
+			if err != nil {
+				t.Fatalf("Detect: %v", err)
+			}
+			if len(got) != 1 || got[0].Name != tc.wantName {
+				t.Fatalf("Detect: got %+v, want ecosystem %s", got, tc.wantName)
+			}
+			if len(got[0].Deps.Keep) != len(tc.wantKeep) {
+				t.Fatalf("%s Keep = %v, want %v", tc.wantName, got[0].Deps.Keep, tc.wantKeep)
+			}
+			for i := range tc.wantKeep {
+				if got[0].Deps.Keep[i] != tc.wantKeep[i] {
+					t.Errorf("%s Keep[%d] = %q, want %q", tc.wantName, i, got[0].Deps.Keep[i], tc.wantKeep[i])
+				}
+			}
+		})
+	}
+}
+

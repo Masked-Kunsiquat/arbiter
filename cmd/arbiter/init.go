@@ -64,6 +64,7 @@ func runInit(_ context.Context, args []string) error {
 	}
 
 	fmt.Printf("arbiter init: detected %s, wrote %s\n", primary.Name, cfgPath)
+	printDevDriveRecommendation(repoRoot)
 	return nil
 }
 

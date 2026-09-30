@@ -24,6 +24,9 @@ var adversaryPatternRules = map[string]func(base string) bool{
 	"node": func(base string) bool {
 		return strings.Contains(base, ".test.") || strings.Contains(base, ".spec.")
 	},
+	"rust": func(base string) bool {
+		return strings.HasSuffix(base, "_test.rs") || strings.HasSuffix(base, "_tests.rs") || strings.HasPrefix(base, "test_")
+	},
 }
 
 // CheckAdversaryPattern validates that pattern (spec §9.C adversary.pattern)

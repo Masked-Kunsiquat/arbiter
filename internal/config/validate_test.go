@@ -66,6 +66,12 @@ func TestCheckAdversaryPattern_KnownEcosystems(t *testing.T) {
 		{"node", "**/*.test.ts", false},
 		{"node", "**/*.spec.js", false},
 		{"node", "adversary.ts", true},
+
+		// rust — *_test.rs, *_tests.rs, or test_*.rs
+		{"rust", "**/*_adversary_test.rs", false},
+		{"rust", "**/*_tests.rs", false},
+		{"rust", "**/test_adversary.rs", false},
+		{"rust", "adversary.rs", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.eco+"/"+tc.pattern, func(t *testing.T) {

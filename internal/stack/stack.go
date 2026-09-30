@@ -13,7 +13,7 @@ import (
 
 // Ecosystem is a detected project ecosystem.
 type Ecosystem struct {
-	Name string // matches internal/config's adversary-pattern-rule keys ("go", "node", "python")
+	Name string // matches internal/config's adversary-pattern-rule keys ("go", "node", "python", "rust")
 
 	Harness struct {
 		ShellAllow []string
@@ -49,6 +49,7 @@ var detectors = []marker{
 	{"pyproject.toml", pythonEcosystem},
 	{"requirements.txt", pythonEcosystem},
 	{"setup.py", pythonEcosystem},
+	{"Cargo.toml", rustEcosystem},
 }
 
 // Detect inspects dir for known lockfiles/manifests and returns every
@@ -129,5 +130,24 @@ func pythonEcosystem() Ecosystem {
 	e.Deps.Install = "pip install -r requirements.txt"
 	e.Deps.Lockfiles = []string{"requirements.txt"}
 	e.Deps.Keep = []string{".venv"}
+	return e
+}
+
+func rustEcosystem() Ecosystem {
+	var e Ecosystem
+	e.Name = "rust"
+	e.Harness.ShellAllow = []string{
+		"Bash(cargo test*)", "Bash(cargo build*)", "Bash(cargo check*)",
+		"Bash(git status*)", "Bash(git diff*)",
+		"PowerShell(cargo test*)", "PowerShell(cargo build*)", "PowerShell(cargo check*)",
+	}
+	e.Test.Build = "cargo check"
+	e.Test.All = "cargo test"
+	e.Test.Files = "cargo test -- {files}"
+	e.Test.Reporter = "tap"
+	e.Adversary.Pattern = "**/*_adversary_test.rs"
+	e.Deps.Install = "cargo fetch"
+	e.Deps.Lockfiles = []string{"Cargo.lock"}
+	e.Deps.Keep = []string{"target"}
 	return e
 }
