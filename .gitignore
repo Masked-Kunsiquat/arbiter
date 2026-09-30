@@ -1,6 +1,8 @@
 # Arbiter runtime state
 .arbiter/*.db
 .arbiter/*.db-*
+.arbiter/core.lock
+.arbiter/core.sock
 .arbiter/worktrees/
 
 # Agent Skills
