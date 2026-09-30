@@ -4,12 +4,26 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
 func TestInitAndSeatsIntegration(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
+
+	// Create fake claude executable on PATH so config.Validate accepts harness.command = "claude".
+	binDir := t.TempDir()
+	var binName, binContent string
+	if runtime.GOOS == "windows" {
+		binName, binContent = "claude.exe", "not a real PE, just needs to be a .exe"
+	} else {
+		binName, binContent = "claude", "#!/bin/sh\nexit 0\n"
+	}
+	if err := os.WriteFile(filepath.Join(binDir, binName), []byte(binContent), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	// Create go.mod marker so Detect finds Go ecosystem
 	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module test\n\ngo 1.27\n"), 0o644); err != nil {
