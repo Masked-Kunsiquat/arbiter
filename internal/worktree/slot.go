@@ -251,6 +251,9 @@ func (s *Slot) ReinstallDeps(ctx context.Context, depsCfg *config.Deps, force bo
 			if keep == "" {
 				continue
 			}
+			if !filepath.IsLocal(keep) {
+				return false, fmt.Errorf("worktree: keep path %q is not a local path", keep)
+			}
 			targetDir := filepath.Join(s.Path, filepath.Clean(keep))
 			if err := os.RemoveAll(targetDir); err != nil {
 				return false, fmt.Errorf("worktree: removing tainted keep dir %s: %w", targetDir, err)

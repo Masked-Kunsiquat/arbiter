@@ -4,7 +4,6 @@ package main
 
 import (
 	"fmt"
-	"path/filepath"
 	"strings"
 
 	"golang.org/x/sys/windows"
@@ -12,19 +11,21 @@ import (
 
 // isReFS reports whether the volume containing path is formatted with ReFS.
 func isReFS(path string) bool {
-	vol := filepath.VolumeName(path)
-	if vol == "" {
+	if path == "" {
 		return false
 	}
-	volRoot := vol + `\`
-	volPtr, err := windows.UTF16PtrFromString(volRoot)
+	pathPtr, err := windows.UTF16PtrFromString(path)
 	if err != nil {
+		return false
+	}
+	var volPathBuf [windows.MAX_PATH + 1]uint16
+	if err := windows.GetVolumePathName(pathPtr, &volPathBuf[0], uint32(len(volPathBuf))); err != nil {
 		return false
 	}
 
 	var fsNameBuf [256]uint16
 	err = windows.GetVolumeInformation(
-		volPtr,
+		&volPathBuf[0],
 		nil,
 		0,
 		nil,

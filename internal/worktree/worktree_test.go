@@ -402,6 +402,41 @@ func TestReinstallDeps_UnseenChanges(t *testing.T) {
 	}
 }
 
+func TestReinstallDeps_NonLocalKeepRejected(t *testing.T) {
+	repoRoot, initialCommit := initGitRepo(t)
+	ctx := context.Background()
+
+	slot := worktree.NewSlot(repoRoot, 0)
+	if err := slot.EnsureWorktree(ctx, initialCommit); err != nil {
+		t.Fatal(err)
+	}
+
+	lockPath := filepath.Join(slot.Path, "requirements.txt")
+	if err := os.WriteFile(lockPath, []byte("pytest==8.0.0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	slot.Cmd = func(_ context.Context, dir, command string, env []string) error {
+		return nil
+	}
+
+	depsCfg := &config.Deps{
+		Install:   "pip install -r requirements.txt",
+		Lockfiles: []string{"requirements.txt"},
+		Keep:      []string{"../escaping"},
+	}
+
+	// First run sets the initial hash
+	if _, err := slot.ReinstallDeps(ctx, depsCfg, false, false); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reinstall with unseenChanges = true and non-local keep entry
+	if _, err := slot.ReinstallDeps(ctx, depsCfg, false, true); err == nil {
+		t.Fatal("expected error for non-local keep path, got nil")
+	}
+}
+
 func TestUnseenState_KeepListChanges(t *testing.T) {
 	repoRoot, initialCommit := initGitRepo(t)
 	ctx := context.Background()

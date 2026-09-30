@@ -71,6 +71,7 @@ func TestCheckAdversaryPattern_KnownEcosystems(t *testing.T) {
 		{"rust", "**/*_adversary_test.rs", false},
 		{"rust", "**/*_tests.rs", false},
 		{"rust", "**/test_adversary.rs", false},
+		{"rust", "**/test_adversary.txt", true},
 		{"rust", "adversary.rs", true},
 	}
 	for _, tc := range cases {
