@@ -409,6 +409,8 @@ func TestPathMatching(t *testing.T) {
 	}{
 		{"tool --cwd " + root + " --x", true},
 		{"tool --cwd=" + root, true},
+		{"tool --paths=" + root + ",/other", true},
+		{"tool --opt=" + root + "=val", true},
 		{`tool "` + root + sep + `a b"`, true},
 		{"tool " + root + sep + "node_modules", true},
 		{"tool " + root + "0", false},         // slot-00, not slot-0

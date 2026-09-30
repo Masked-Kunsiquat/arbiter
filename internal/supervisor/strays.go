@@ -119,7 +119,7 @@ func underPath(dir, root string) bool {
 // Characters that may precede / follow a path on a command line.
 const (
 	pathOpeners = " \t\"'=,"
-	pathClosers = " \t\"'/\\"
+	pathClosers = " \t\"'/\\=,"
 )
 
 // containsPath reports whether command line s names root or a path under
