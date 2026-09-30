@@ -1,3 +1,5 @@
+//go:build linux || windows
+
 package supervisor
 
 import (
@@ -23,6 +25,7 @@ const (
 	envName     = "ARBITER_SUPTEST_NAME"
 	envStubborn = "ARBITER_SUPTEST_STUBBORN"
 	envCode     = "ARBITER_SUPTEST_CODE"
+	envSubmode  = "ARBITER_SUPTEST_SUBMODE"
 )
 
 // TestMain lets the test binary double as three things: the supervisor's
@@ -146,16 +149,22 @@ func runExit() int {
 	return code
 }
 
-// runSupervisorMode spawns a "tree" child through a real Supervisor and
-// reports its own pid, so a test can hard-kill this process from the outside
-// and check the whole tree (child, grandchild) dies with it.
+// runSupervisorMode spawns a "tree" child (or the envSubmode mode) through a
+// real Supervisor and reports its own pid, so a test can hard-kill this
+// process from the outside and check the whole tree (child, grandchild)
+// dies with it. For "orphaner" it reports only after the program has
+// exited, leaving just the grandchild in the container.
 func runSupervisorMode(dir string) int {
+	submode := os.Getenv(envSubmode)
+	if submode == "" {
+		submode = "tree"
+	}
 	sup, err := New(Options{})
 	if err != nil {
 		_, _ = os.Stderr.WriteString("supervisor: New: " + err.Error() + "\n")
 		return 1
 	}
-	h, err := sup.Spawn(Cmd{Path: os.Args[0], Env: childEnv(dir, "tree")})
+	h, err := sup.Spawn(Cmd{Path: os.Args[0], Env: childEnv(dir, submode)})
 	if err != nil {
 		_, _ = os.Stderr.WriteString("supervisor: Spawn: " + err.Error() + "\n")
 		return 1
@@ -170,11 +179,18 @@ func runSupervisorMode(dir string) int {
 		time.Sleep(20 * time.Millisecond)
 	}
 
+	if submode == "orphaner" {
+		<-h.Exited()
+	}
 	if err := writeFileAtomic(filepath.Join(dir, "supervisor.ready"), []byte(strconv.Itoa(h.Pid()))); err != nil {
 		_, _ = os.Stderr.WriteString("supervisor: write ready file: " + err.Error() + "\n")
 		return 1
 	}
-	select {}
+	// Not select {}: with the program gone and no signal handler, Go would
+	// report a deadlock and exit, closing the job itself.
+	for {
+		time.Sleep(time.Hour)
+	}
 }
 
 // writePID writes <dir>/<name>.pid for the current process, atomically.

@@ -8,7 +8,13 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 )
+
+// startSlack widens ScanStrays's since cutoff to absorb start-time
+// precision (Linux reports it in clock ticks against a boot time in whole
+// seconds).
+const startSlack = 2 * time.Second
 
 // Stray is a live process found by ScanStrays.
 type Stray struct {
@@ -23,22 +29,28 @@ func (s Stray) CmdlineHash() string {
 	return hex.EncodeToString(h[:])
 }
 
-// procInfo is one process as the platform lister sees it. Cwd or Cmdline is
-// empty when it couldn't be read (another user's or a protected process).
+// procInfo is one process as the platform lister sees it. A field is
+// empty (zero) when it couldn't be read (another user's or a protected
+// process).
 type procInfo struct {
 	pid     int
 	image   string
 	cmdline string
 	cwd     string
+	started time.Time
 }
 
-// ScanStrays lists live processes, other than this one, whose command line
-// contains slot or whose working directory is slot or below it. The Runner
-// calls it after each invocation's Terminate: anything found escaped the
-// container, e.g. through WMI or the Task Scheduler (§7), and is logged
-// against the seat as a stray_processes ledger entry (StrayPayload).
-// Processes whose details can't be read are skipped.
-func ScanStrays(slot string) ([]Stray, error) {
+// ScanStrays lists live processes, other than this one, started at or
+// after since, whose command line names slot (or a path under it) or whose
+// working directory is slot or below it. The Runner calls it after each
+// invocation's Terminate with since = the invocation's spawn time: anything
+// found escaped the container, e.g. through WMI or the Task Scheduler (§7),
+// and is logged against the seat as a stray_processes ledger entry
+// (StrayPayload). The since cutoff keeps out processes the agent can't have
+// started, such as an editor or shell the user opened in the slot. A zero
+// since, or an unreadable start time, doesn't filter. Processes whose
+// command line and working directory can't be read are skipped.
+func ScanStrays(slot string, since time.Time) ([]Stray, error) {
 	abs, err := filepath.Abs(slot)
 	if err != nil {
 		return nil, fmt.Errorf("supervisor: scan strays: %w", err)
@@ -55,6 +67,9 @@ func ScanStrays(slot string) ([]Stray, error) {
 	var out []Stray
 	for _, p := range procs {
 		if p.pid == self {
+			continue
+		}
+		if !since.IsZero() && !p.started.IsZero() && p.started.Before(since.Add(-startSlack)) {
 			continue
 		}
 		for _, root := range roots {
@@ -101,7 +116,32 @@ func underPath(dir, root string) bool {
 	return dir == root || strings.HasPrefix(dir, strings.TrimSuffix(root, sep)+sep)
 }
 
-// containsPath reports whether s mentions root.
+// Characters that may precede / follow a path on a command line.
+const (
+	pathOpeners = " \t\"'=,"
+	pathClosers = " \t\"'/\\"
+)
+
+// containsPath reports whether command line s names root or a path under
+// it: an occurrence starting at a token boundary (start, space, quote, '=',
+// ',') and ending at one or a path separator. So slot-1 doesn't match
+// slot-10, and /tmp/slot doesn't match /mnt/tmp/slot.
 func containsPath(s, root string) bool {
-	return s != "" && strings.Contains(normPath(s), normPath(filepath.Clean(root)))
+	if s == "" {
+		return false
+	}
+	s, root = normPath(s), normPath(filepath.Clean(root))
+	for i := 0; ; {
+		j := strings.Index(s[i:], root)
+		if j < 0 {
+			return false
+		}
+		start, end := i+j, i+j+len(root)
+		before := start == 0 || strings.ContainsRune(pathOpeners, rune(s[start-1]))
+		after := end == len(s) || strings.ContainsRune(pathClosers, rune(s[end]))
+		if before && after {
+			return true
+		}
+		i = start + 1
+	}
 }

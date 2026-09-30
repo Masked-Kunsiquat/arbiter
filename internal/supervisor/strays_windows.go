@@ -1,6 +1,7 @@
 package supervisor
 
 import (
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -22,20 +23,32 @@ func listProcesses() ([]procInfo, error) {
 			continue
 		}
 		p := procInfo{pid: int(pe.ProcessID), image: windows.UTF16ToString(pe.ExeFile[:])}
-		p.cmdline, p.cwd = readProcessParams(pe.ProcessID)
+		p.cmdline, p.cwd, p.started = readProcessDetails(pe.ProcessID)
 		out = append(out, p)
 	}
 	return out, nil
 }
 
-// readProcessParams returns the command line and current directory from
-// the process's RTL_USER_PROCESS_PARAMETERS, or empty strings.
-func readProcessParams(pid uint32) (cmdline, cwd string) {
+// readProcessDetails returns the process's creation time and the command
+// line and current directory from its RTL_USER_PROCESS_PARAMETERS, or zero
+// values for what it can't read.
+func readProcessDetails(pid uint32) (cmdline, cwd string, started time.Time) {
 	h, err := windows.OpenProcess(windows.PROCESS_QUERY_INFORMATION|windows.PROCESS_VM_READ, false, pid)
 	if err != nil {
-		return "", ""
+		return "", "", time.Time{}
 	}
 	defer func() { _ = windows.CloseHandle(h) }()
+	var created, exited, kernel, user windows.Filetime
+	if windows.GetProcessTimes(h, &created, &exited, &kernel, &user) == nil {
+		started = time.Unix(0, created.Nanoseconds())
+	}
+	cmdline, cwd = readProcessParams(h)
+	return cmdline, cwd, started
+}
+
+// readProcessParams reads the command line and current directory of the
+// process open as h, or empty strings.
+func readProcessParams(h windows.Handle) (cmdline, cwd string) {
 	var pbi windows.PROCESS_BASIC_INFORMATION
 	if err := windows.NtQueryInformationProcess(h, windows.ProcessBasicInformation,
 		unsafe.Pointer(&pbi), uint32(unsafe.Sizeof(pbi)), nil); err != nil || pbi.PebBaseAddress == nil {

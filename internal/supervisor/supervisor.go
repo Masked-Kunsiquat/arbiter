@@ -25,7 +25,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"os/exec"
 	"sync"
 	"time"
@@ -56,14 +55,31 @@ type Handle interface {
 	// ID identifies the container for invocations.supervisor_handle (§4):
 	// the PGID on Linux, the Job Object name on Windows.
 	ID() string
-	// Exited is closed when the leader process exits. The container may
-	// still hold other processes, and the leader is not yet reaped.
+	// Exited is closed when the program exits. The container may still
+	// hold processes it started; they live until Terminate or Wait.
 	Exited() <-chan struct{}
-	// Wait blocks until the leader exits, tears the container down
+	// Wait blocks until the program exits, tears the container down
 	// (Terminate with no grace, killing anything left in it) and returns
-	// the leader's exit error as exec.Cmd.Wait reports it.
+	// nil for a zero exit status, else an *ExitError.
 	Wait() error
 }
+
+// ExitError reports a program that exited with a nonzero status or was
+// killed.
+type ExitError struct {
+	Code   int    // exit status; -1 when killed by a signal
+	Signal string // the killing signal on Linux ("killed" when unknown); "" otherwise
+}
+
+func (e *ExitError) Error() string {
+	if e.Signal != "" {
+		return "supervisor: program killed by signal: " + e.Signal
+	}
+	return fmt.Sprintf("supervisor: program exit status %d", e.Code)
+}
+
+// ExitCode returns Code, matching exec.ExitError.
+func (e *ExitError) ExitCode() int { return e.Code }
 
 // Supervisor launches processes inside kill-able containers.
 type Supervisor interface {
@@ -71,9 +87,10 @@ type Supervisor interface {
 	Spawn(cmd Cmd) (Handle, error)
 	// Terminate sends the graceful stop signal, waits up to grace for the
 	// container to empty, then hard-kills the whole container regardless,
-	// reaps the leader and releases the container. It is idempotent and
-	// safe to call concurrently; later calls wait for the first to finish.
-	// The error reports a failed hard kill, never the process's exit status.
+	// waits for it to empty, reaps the leader and releases the container.
+	// It is idempotent and safe to call concurrently; later calls wait for
+	// the first to finish. The error reports a failed hard kill (including
+	// a container still not empty afterwards), never the exit status.
 	Terminate(h Handle, grace time.Duration) error
 }
 
@@ -89,7 +106,7 @@ type Options struct {
 func New(opts Options) (Supervisor, error) {
 	helper := opts.Helper
 	if len(helper) == 0 {
-		exe, err := os.Executable()
+		exe, err := defaultHelper()
 		if err != nil {
 			return nil, fmt.Errorf("supervisor: locate helper executable: %w", err)
 		}
@@ -125,6 +142,11 @@ const (
 	// pollInterval is how often Terminate checks whether the container has
 	// emptied during the grace period.
 	pollInterval = 50 * time.Millisecond
+	// killWait bounds how long Terminate waits, after the hard kill, for the
+	// container to empty. Both hard kills are asynchronous: a process in
+	// uninterruptible I/O dies late, and one still unwinding would show up
+	// in a post-run ScanStrays as a false stray.
+	killWait = 5 * time.Second
 	// waitDelay bounds how long reaping waits for stdio copying after the
 	// hard kill, in case an escaped process still holds a pipe.
 	waitDelay = 5 * time.Second
@@ -136,6 +158,10 @@ type container interface {
 	signal() error // send the graceful stop signal (best effort)
 	kill() error   // hard-kill every process in the container
 	release()      // free OS resources once the leader is reaped
+
+	// exitErr turns the leader's exec.Cmd.Wait result into Handle.Wait's
+	// result. It runs after Exited is closed.
+	exitErr(waitErr error) error
 }
 
 // supervisor is the platform-independent Supervisor; start (per platform)
@@ -150,7 +176,7 @@ type proc struct {
 	cmd    *exec.Cmd
 	id     string
 	c      container
-	exited chan struct{} // closed by the platform watcher when the leader exits
+	exited chan struct{} // closed by the platform watcher when the program exits
 
 	once    sync.Once
 	done    chan struct{} // closed when teardown finishes
@@ -201,27 +227,41 @@ func (p *proc) terminate(grace time.Duration) {
 }
 
 // teardown is §7's Terminate: graceful signal, wait out the grace period
-// (ending early once the container is empty), hard kill regardless, reap,
-// release. The leader stays unreaped until after the hard kill, so on Linux
-// the PGID can't be recycled before the group signal is sent.
+// (ending early once the container is empty), hard kill regardless, wait
+// for the container to empty, reap, release. The leader is reaped only
+// after the hard kill, so on Linux the PGID can't be recycled before the
+// group signal is sent.
 func (p *proc) teardown(grace time.Duration) {
 	defer close(p.done)
 	if grace > 0 && p.c.alive() {
 		// A failed graceful signal skips the wait: nothing will stop on it.
 		if err := p.c.signal(); err == nil {
-			deadline := time.Now().Add(grace)
-			for p.c.alive() && time.Now().Before(deadline) {
-				time.Sleep(min(pollInterval, time.Until(deadline)))
-			}
+			p.waitEmpty(grace)
 		}
 	}
 	if p.killErr = p.c.kill(); p.killErr != nil {
 		// At least stop the leader, so reaping below can't block forever.
 		_ = p.cmd.Process.Kill()
+	} else if !p.waitEmpty(killWait) {
+		p.killErr = fmt.Errorf("supervisor: container %s not empty %v after hard kill", p.id, killWait)
 	}
-	p.waitErr = p.cmd.Wait()
+	waitErr := p.cmd.Wait()
 	<-p.exited
+	p.waitErr = p.c.exitErr(waitErr)
 	p.c.release()
+}
+
+// waitEmpty polls until the container is empty or d elapses, and reports
+// whether it emptied.
+func (p *proc) waitEmpty(d time.Duration) bool {
+	deadline := time.Now().Add(d)
+	for p.c.alive() {
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		time.Sleep(min(pollInterval, time.Until(deadline)))
+	}
+	return true
 }
 
 // newExecCmd builds the exec.Cmd for argv with c's directory, environment

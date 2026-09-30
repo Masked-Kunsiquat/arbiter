@@ -4,10 +4,12 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"os/signal"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -17,8 +19,13 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// ctrlBreakTimeout bounds the _ctrlbreak helper run.
-const ctrlBreakTimeout = 5 * time.Second
+const (
+	// ctrlBreakTimeout bounds the _ctrlbreak helper run.
+	ctrlBreakTimeout = 5 * time.Second
+	// maxJobMembers caps the job pid list read for picking a console to
+	// attach to; any member will do.
+	maxJobMembers = 256
+)
 
 var (
 	kernel32          = windows.NewLazySystemDLL("kernel32.dll")
@@ -29,6 +36,8 @@ var (
 func newSupervisor(helper []string) (Supervisor, error) {
 	return &supervisor{helper: helper}, nil
 }
+
+func defaultHelper() (string, error) { return os.Executable() }
 
 // start creates the program suspended in a new process group with its own
 // hidden console, assigns it to a fresh kill-on-close Job Object, then
@@ -180,13 +189,31 @@ func (j *jobObject) alive() bool {
 	return info.ActiveProcesses > 0
 }
 
-// signal delivers CTRL_BREAK_EVENT to the leader's process group through
-// the _ctrlbreak helper. The supervisor never attaches to a child's console
-// itself: it would lose its own, process-wide (§7).
+// signal delivers CTRL_BREAK_EVENT to the job through the _ctrlbreak
+// helper. The supervisor never attaches to a child's console itself: it
+// would lose its own, process-wide (§7). While the leader lives, the helper
+// attaches to its console and signals its process group. Once it has
+// exited, a group id with no leader reaches nobody, so the helper attaches
+// via a surviving member and signals group 0: every process on that
+// console. CREATE_NO_WINDOW gave the leader a console of its own, so that
+// is the job's processes.
 func (j *jobObject) signal() error {
+	members := j.members()
+	if len(members) == 0 {
+		return errors.New("supervisor: job is empty")
+	}
+	group, attach := j.pid, []uint32{j.pid}
+	if !slices.Contains(members, j.pid) {
+		// Some members (conhost.exe) can't be attached through; the helper
+		// takes the first that works.
+		group, attach = 0, members
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), ctrlBreakTimeout)
 	defer cancel()
-	argv := append(append([]string{}, j.helper...), helperCtrlBreak, strconv.FormatUint(uint64(j.pid), 10))
+	argv := append(append([]string{}, j.helper...), helperCtrlBreak, strconv.FormatUint(uint64(group), 10))
+	for _, pid := range attach {
+		argv = append(argv, strconv.FormatUint(uint64(pid), 10))
+	}
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: windows.DETACHED_PROCESS}
 	out, err := cmd.CombinedOutput()
@@ -194,6 +221,25 @@ func (j *jobObject) signal() error {
 		return fmt.Errorf("supervisor: %s %d: %w: %s", helperCtrlBreak, j.pid, err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+// members lists the pids currently in the job (up to maxJobMembers).
+func (j *jobObject) members() []uint32 {
+	var list struct {
+		Assigned uint32
+		InList   uint32
+		IDs      [maxJobMembers]uintptr
+	}
+	err := windows.QueryInformationJobObject(j.job, windows.JobObjectBasicProcessIdList,
+		uintptr(unsafe.Pointer(&list)), uint32(unsafe.Sizeof(list)), nil)
+	if err != nil && !errors.Is(err, windows.ERROR_MORE_DATA) {
+		return nil
+	}
+	pids := make([]uint32, 0, list.InList)
+	for _, id := range list.IDs[:min(list.InList, maxJobMembers)] {
+		pids = append(pids, uint32(id))
+	}
+	return pids
 }
 
 func (j *jobObject) kill() error {
@@ -208,28 +254,56 @@ func (j *jobObject) release() {
 	_ = windows.CloseHandle(j.process)
 }
 
-// runCtrlBreak is `_ctrlbreak <pid>`: attach to the console of process
-// group <pid> and send it CTRL_BREAK_EVENT. CTRL_BREAK only reaches groups
-// on the caller's console, and a CREATE_NO_WINDOW child has its own hidden
-// one, so the event must come from a process attached to that console.
+func (j *jobObject) exitErr(waitErr error) error {
+	var ee *exec.ExitError
+	if errors.As(waitErr, &ee) {
+		return &ExitError{Code: ee.ExitCode()}
+	}
+	return waitErr
+}
+
+// runCtrlBreak is `_ctrlbreak <group> [<attach>]`: attach to the console
+// of process <attach> (default <group>) and send CTRL_BREAK_EVENT to process
+// group <group>, or to every process on that console for group 0.
+// CTRL_BREAK only reaches groups on the caller's console, and a
+// CREATE_NO_WINDOW child has its own hidden one, so the event must come
+// from a process attached to that console.
 func runCtrlBreak(args []string) int {
-	if len(args) != 1 {
-		fmt.Fprintln(os.Stderr, "usage: _ctrlbreak <pid>")
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "usage: _ctrlbreak <group> [<attach>...]")
 		return 2
 	}
-	pid, err := strconv.ParseUint(args[0], 10, 32)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "_ctrlbreak: bad pid:", args[0])
-		return 2
+	ids := make([]uint32, len(args))
+	for i, a := range args {
+		n, err := strconv.ParseUint(a, 10, 32)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "_ctrlbreak: bad pid:", a)
+			return 2
+		}
+		ids[i] = uint32(n)
 	}
-	// We are not in the target group, but stay safe if the event reaches us.
-	signal.Ignore(os.Interrupt)
+	group, attach := ids[0], ids[1:]
+	if len(attach) == 0 {
+		attach = ids[:1]
+	}
+	// Group 0 includes us. Handle (not Ignore) the event: an ignored
+	// CTRL_BREAK falls through to the default handler, which exits.
+	signal.Notify(make(chan os.Signal, 1), os.Interrupt)
 	_, _, _ = procFreeConsole.Call()
-	if r, _, err := procAttachConsole.Call(uintptr(pid)); r == 0 {
-		fmt.Fprintln(os.Stderr, "_ctrlbreak: AttachConsole:", err)
+	var attachErr error
+	for _, pid := range attach {
+		r, _, err := procAttachConsole.Call(uintptr(pid))
+		if r != 0 {
+			attachErr = nil
+			break
+		}
+		attachErr = err
+	}
+	if attachErr != nil {
+		fmt.Fprintln(os.Stderr, "_ctrlbreak: AttachConsole:", attachErr)
 		return 1
 	}
-	err = windows.GenerateConsoleCtrlEvent(windows.CTRL_BREAK_EVENT, uint32(pid))
+	err := windows.GenerateConsoleCtrlEvent(windows.CTRL_BREAK_EVENT, group)
 	_, _, _ = procFreeConsole.Call()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "_ctrlbreak: GenerateConsoleCtrlEvent:", err)

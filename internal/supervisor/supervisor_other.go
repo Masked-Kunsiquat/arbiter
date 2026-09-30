@@ -13,6 +13,8 @@ import (
 
 func newSupervisor([]string) (Supervisor, error) { return nil, ErrUnsupported }
 
+func defaultHelper() (string, error) { return os.Executable() }
+
 func (s *supervisor) start(Cmd) (*proc, error) { return nil, ErrUnsupported }
 
 func listProcesses() ([]procInfo, error) { return nil, errors.ErrUnsupported }

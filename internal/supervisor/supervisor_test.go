@@ -1,3 +1,5 @@
+//go:build linux || windows
+
 package supervisor
 
 import (
@@ -64,7 +66,7 @@ func TestSpawnStdioAndExitStatus(t *testing.T) {
 		t.Fatalf("Pid() = %d, ID() = %q", h.Pid(), h.ID())
 	}
 	err = h.Wait()
-	var ee *exec.ExitError
+	var ee *ExitError
 	if !errors.As(err, &ee) || ee.ExitCode() != 3 {
 		t.Fatalf("Wait() = %v, want exit status 3", err)
 	}
@@ -102,8 +104,7 @@ func TestTerminateGraceful(t *testing.T) {
 			t.Errorf("%s never got the graceful signal", name)
 		}
 	}
-	waitDead(t, child, 5*time.Second)
-	waitDead(t, grandchild, 5*time.Second)
+	assertDead(t, child, grandchild)
 	select {
 	case <-h.Exited():
 	default:
@@ -130,8 +131,11 @@ func TestTerminateHardKillsAfterGrace(t *testing.T) {
 			t.Errorf("%s never got the graceful signal", name)
 		}
 	}
-	waitDead(t, child, 5*time.Second)
-	waitDead(t, grandchild, 5*time.Second)
+	assertDead(t, child, grandchild)
+	var ee *ExitError
+	if err := h.Wait(); !errors.As(err, &ee) {
+		t.Errorf("Wait() after hard kill = %v, want *ExitError", err)
+	}
 }
 
 func TestTerminateWithoutGraceSkipsSignal(t *testing.T) {
@@ -142,8 +146,7 @@ func TestTerminateWithoutGraceSkipsSignal(t *testing.T) {
 	if err := sup.Terminate(h, 0); err != nil {
 		t.Fatal(err)
 	}
-	waitDead(t, child, 5*time.Second)
-	waitDead(t, grandchild, 5*time.Second)
+	assertDead(t, child, grandchild)
 	for _, name := range []string{"child", "grandchild"} {
 		if fileExists(filepath.Join(dir, name+".sig")) {
 			t.Errorf("%s got a graceful signal with zero grace", name)
@@ -175,7 +178,41 @@ func TestWaitKillsLeftovers(t *testing.T) {
 	if err := h.Wait(); err != nil {
 		t.Fatalf("Wait() = %v, want clean exit", err)
 	}
-	waitDead(t, grandchild, 5*time.Second)
+	assertDead(t, grandchild)
+}
+
+// After the program exits, the graceful signal still reaches what it left
+// behind in the container.
+func TestTerminateGracefulAfterLeaderExit(t *testing.T) {
+	sup := newTestSupervisor(t)
+	dir := t.TempDir()
+	h, err := sup.Spawn(Cmd{Path: os.Args[0], Env: childEnv(dir, "orphaner")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sup.Terminate(h, 0) })
+	grandchild := readPID(t, filepath.Join(dir, "grandchild.pid"))
+	killOnCleanup(t, grandchild)
+	<-h.Exited()
+
+	if err := sup.Terminate(h, 30*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if !fileExists(filepath.Join(dir, "grandchild.sig")) {
+		t.Error("grandchild never got the graceful signal")
+	}
+	assertDead(t, grandchild)
+}
+
+// assertDead fails unless every pid is already dead: Terminate and Wait
+// return only once the container is empty.
+func assertDead(t *testing.T, pids ...int) {
+	t.Helper()
+	for _, pid := range pids {
+		if processAlive(pid) {
+			t.Errorf("pid %d still alive after teardown", pid)
+		}
+	}
 }
 
 func TestTerminateIsIdempotentAndConcurrent(t *testing.T) {
@@ -211,34 +248,45 @@ func TestTerminateForeignHandle(t *testing.T) {
 
 // Kill-on-supervisor-death: a separate supervisor process spawns a tree and
 // is then hard-killed (no cleanup code runs). The OS must take the tree
-// down: KILL_ON_JOB_CLOSE on Windows, the PDEATHSIG shim on Linux.
+// down: KILL_ON_JOB_CLOSE on Windows, the PDEATHSIG shim on Linux. The
+// orphaner case covers a program that already exited, leaving only its
+// grandchild in the container.
 func TestTreeDiesWithSupervisor(t *testing.T) {
-	dir := t.TempDir()
-	supProc := exec.Command(os.Args[0])
-	supProc.Env = childEnv(dir, "supervisor")
-	var stderr bytes.Buffer
-	supProc.Stderr = &stderr
-	if err := supProc.Start(); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = supProc.Process.Kill(); _ = supProc.Wait() })
+	for _, submode := range []string{"tree", "orphaner"} {
+		t.Run(submode, func(t *testing.T) {
+			dir := t.TempDir()
+			supProc := exec.Command(os.Args[0])
+			supProc.Env = childEnv(dir, "supervisor", envSubmode+"="+submode)
+			var stderr bytes.Buffer
+			supProc.Stderr = &stderr
+			if err := supProc.Start(); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = supProc.Process.Kill(); _ = supProc.Wait() })
 
-	leader := readPID(t, filepath.Join(dir, "supervisor.ready"))
-	child := readPID(t, filepath.Join(dir, "child.pid"))
-	grandchild := readPID(t, filepath.Join(dir, "grandchild.pid"))
-	killOnCleanup(t, leader, child, grandchild)
-	for _, pid := range []int{leader, child, grandchild} {
-		if !processAlive(pid) {
-			t.Fatalf("pid %d not running before the supervisor died (stderr: %s)", pid, stderr.String())
-		}
-	}
+			leader := readPID(t, filepath.Join(dir, "supervisor.ready"))
+			grandchild := readPID(t, filepath.Join(dir, "grandchild.pid"))
+			pids := []int{grandchild}
+			if submode == "tree" {
+				// Under "orphaner" the leader has exited on Windows (it is the
+				// program) but lives on Linux (it is the shim).
+				pids = append(pids, leader, readPID(t, filepath.Join(dir, "child.pid")))
+			}
+			killOnCleanup(t, pids...)
+			for _, pid := range pids {
+				if !processAlive(pid) {
+					t.Fatalf("pid %d not running before the supervisor died (stderr: %s)", pid, stderr.String())
+				}
+			}
 
-	if err := supProc.Process.Kill(); err != nil { // SIGKILL / TerminateProcess
-		t.Fatal(err)
-	}
-	_ = supProc.Wait()
-	for _, pid := range []int{leader, child, grandchild} {
-		waitDead(t, pid, 10*time.Second)
+			if err := supProc.Process.Kill(); err != nil { // SIGKILL / TerminateProcess
+				t.Fatal(err)
+			}
+			_ = supProc.Wait()
+			for _, pid := range pids {
+				waitDead(t, pid, 10*time.Second)
+			}
+		})
 	}
 }
 
@@ -255,7 +303,7 @@ func TestScanStrays(t *testing.T) {
 	byArg := startLeaf(t, pids, "byarg", "", filepath.Join(slot, "marker"))
 	unrelated := startLeaf(t, pids, "unrelated", "")
 
-	strays, err := ScanStrays(slot)
+	strays, err := ScanStrays(slot, time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -278,6 +326,17 @@ func TestScanStrays(t *testing.T) {
 	}
 	if _, ok := found[os.Getpid()]; ok {
 		t.Error("ScanStrays reported the scanning process itself")
+	}
+
+	// Processes started before the invocation aren't its strays.
+	later, err := ScanStrays(slot, time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range later {
+		if s.PID == byCwd || s.PID == byArg {
+			t.Errorf("pid %d started before since but reported", s.PID)
+		}
 	}
 }
 
@@ -343,7 +402,23 @@ func TestPathMatching(t *testing.T) {
 			t.Errorf("underPath(%q, %q) = %v, want %v", c.dir, root, got, c.want)
 		}
 	}
-	if !containsPath("tool --cwd "+root+" --x", root) {
-		t.Error("containsPath missed the slot on a command line")
+	sep := string(filepath.Separator)
+	cmdlines := []struct {
+		s    string
+		want bool
+	}{
+		{"tool --cwd " + root + " --x", true},
+		{"tool --cwd=" + root, true},
+		{`tool "` + root + sep + `a b"`, true},
+		{"tool " + root + sep + "node_modules", true},
+		{"tool " + root + "0", false},         // slot-00, not slot-0
+		{"tool " + root + "-old", false},      // a sibling
+		{"tool " + sep + "mnt" + root, false}, // a longer path ending in root
+		{"", false},
+	}
+	for _, c := range cmdlines {
+		if got := containsPath(c.s, root); got != c.want {
+			t.Errorf("containsPath(%q) = %v, want %v", c.s, got, c.want)
+		}
 	}
 }
