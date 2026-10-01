@@ -359,6 +359,56 @@ func TestReinstallDeps_LockfileHash(t *testing.T) {
 	}
 }
 
+// A reinstall that wipes tainted keep dirs and then fails must not leave the
+// previous install hash in place: the next call, with the unseen-changes
+// signal lost, still has to reinstall.
+func TestReinstallDeps_FailedInstallInvalidatesHash(t *testing.T) {
+	repoRoot, initialCommit := initGitRepo(t)
+	ctx := context.Background()
+
+	slot := worktree.NewSlot(repoRoot, 0)
+	if err := slot.EnsureWorktree(ctx, initialCommit); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(slot.Path, "requirements.txt"), []byte("pytest==8.0.0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	installs := 0
+	failInstall := false
+	slot.Cmd = func(_ context.Context, dir, command string, env []string) error {
+		installs++
+		if failInstall {
+			return errors.New("install interrupted")
+		}
+		return nil
+	}
+	depsCfg := &config.Deps{
+		Install:   "pip install -r requirements.txt",
+		Lockfiles: []string{"requirements.txt"},
+		Keep:      []string{".venv"},
+	}
+
+	if _, err := slot.ReinstallDeps(ctx, depsCfg, false, false); err != nil {
+		t.Fatalf("initial ReinstallDeps: %v", err)
+	}
+
+	failInstall = true
+	if _, err := slot.ReinstallDeps(ctx, depsCfg, false, true); err == nil {
+		t.Fatal("tainted ReinstallDeps with failing install: want error")
+	}
+
+	failInstall = false
+	installs = 0
+	reinstalled, err := slot.ReinstallDeps(ctx, depsCfg, false, false)
+	if err != nil {
+		t.Fatalf("ReinstallDeps after failed install: %v", err)
+	}
+	if !reinstalled || installs != 1 {
+		t.Errorf("after failed install: reinstalled=%v installs=%d, want true and 1", reinstalled, installs)
+	}
+}
+
 func TestReinstallDeps_UnseenChanges(t *testing.T) {
 	repoRoot, initialCommit := initGitRepo(t)
 	ctx := context.Background()

@@ -351,6 +351,16 @@ func (s *Slot) ReinstallDeps(ctx context.Context, depsCfg *config.Deps, force bo
 		return false, nil
 	}
 
+	// Invalidate the recorded install before wiping or installing, so an
+	// install that fails or is interrupted forces a reinstall next time
+	// instead of matching the stale hash.
+	if meta.LastInstallHash != "" {
+		meta.LastInstallHash = ""
+		if err := s.SaveMetadata(meta); err != nil {
+			return false, fmt.Errorf("worktree: invalidating install hash: %w", err)
+		}
+	}
+
 	// If keep-list directories were altered during an agent run, wipe them
 	// before reinstalling from the lockfile (spec §5.3).
 	if unseenChanges {
