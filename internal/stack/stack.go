@@ -175,6 +175,14 @@ type cargoManifest struct {
 	} `toml:"workspace"`
 }
 
+// readCargoManifest decodes the Cargo.toml at file, reporting false if it
+// can't be read or parsed.
+func readCargoManifest(file string) (cargoManifest, bool) {
+	var m cargoManifest
+	_, err := toml.DecodeFile(file, &m)
+	return m, err == nil
+}
+
 // setRustAdversaryPattern points e's adversary pattern at a member crate's
 // tests/ dir when dir's Cargo.toml is a virtual workspace: Cargo builds no
 // package at the workspace root, so a root tests/ dir would never run. The
@@ -182,11 +190,8 @@ type cargoManifest struct {
 // else members). A manifest that doesn't parse keeps the root default;
 // cargo itself will report that error.
 func setRustAdversaryPattern(dir string, e *Ecosystem) error {
-	var m cargoManifest
-	if _, err := toml.DecodeFile(filepath.Join(dir, "Cargo.toml"), &m); err != nil {
-		return nil
-	}
-	if m.Package != nil || m.Workspace == nil {
+	m, ok := readCargoManifest(filepath.Join(dir, "Cargo.toml"))
+	if !ok || m.Package != nil || m.Workspace == nil {
 		return nil
 	}
 	candidates := m.Workspace.DefaultMembers
