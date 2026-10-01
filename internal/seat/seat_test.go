@@ -596,3 +596,46 @@ func TestTransition_DetectsConcurrentChange(t *testing.T) {
 		t.Fatal("expected error applying a transition against an already-changed status, got nil")
 	}
 }
+
+func TestRenewLease(t *testing.T) {
+	ctx := context.Background()
+	raw := openDB(t)
+	id := mintTestSeat(t, raw)
+	invID, err := seat.StartInvocation(ctx, raw, seat.StartInvocationRequest{
+		SeatID: id, TaskID: "TASK-001", Purpose: seat.PurposeImplement,
+	})
+	if err != nil {
+		t.Fatalf("StartInvocation: %v", err)
+	}
+
+	want := time.Date(2026, 1, 1, 12, 30, 0, 0, time.UTC)
+	if err := seat.RenewLease(ctx, raw, invID, want); err != nil {
+		t.Fatalf("RenewLease: %v", err)
+	}
+	var got time.Time
+	if err := raw.QueryRowContext(ctx, `SELECT lease_expires_at FROM invocations WHERE id = ?`, invID).Scan(&got); err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if !got.Equal(want) {
+		t.Errorf("lease_expires_at = %v, want %v", got, want)
+	}
+
+	// A zero expiry (paused lease) stores NULL.
+	if err := seat.RenewLease(ctx, raw, invID, time.Time{}); err != nil {
+		t.Fatalf("RenewLease(zero): %v", err)
+	}
+	var frozen sql.NullTime
+	if err := raw.QueryRowContext(ctx, `SELECT lease_expires_at FROM invocations WHERE id = ?`, invID).Scan(&frozen); err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if frozen.Valid {
+		t.Errorf("lease_expires_at = %v, want NULL", frozen.Time)
+	}
+
+	if err := seat.EndInvocation(ctx, raw, seat.EndInvocationRequest{InvocationID: invID, ExitReason: seat.ExitOK}); err != nil {
+		t.Fatalf("EndInvocation: %v", err)
+	}
+	if err := seat.RenewLease(ctx, raw, invID, want.Add(time.Minute)); err == nil {
+		t.Error("RenewLease on an ended invocation succeeded")
+	}
+}

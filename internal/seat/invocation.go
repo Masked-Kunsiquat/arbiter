@@ -108,6 +108,33 @@ func StartInvocation(ctx context.Context, db *sql.DB, req StartInvocationRequest
 	return id, nil
 }
 
+// RenewLease stores a renewed lease expiry for an open invocation (§7: the
+// supervisor renews leases while the process is live). A zero expiresAt
+// stores NULL: the lease is frozen while paused. Renewing an ended
+// invocation is an error.
+func RenewLease(ctx context.Context, db *sql.DB, invocationID string, expiresAt time.Time) error {
+	var at any
+	if !expiresAt.IsZero() {
+		at = expiresAt.UTC()
+	}
+	res, err := db.ExecContext(ctx, `
+		UPDATE invocations SET lease_expires_at = ?
+		WHERE id = ? AND ended_at IS NULL`,
+		at, invocationID,
+	)
+	if err != nil {
+		return fmt.Errorf("seat: renewing lease for %s: %w", invocationID, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("seat: renewing lease for %s: %w", invocationID, err)
+	}
+	if n == 0 {
+		return fmt.Errorf("seat: invocation %s not found or already ended", invocationID)
+	}
+	return nil
+}
+
 // EndInvocationRequest records how an invocation finished.
 type EndInvocationRequest struct {
 	InvocationID  string
