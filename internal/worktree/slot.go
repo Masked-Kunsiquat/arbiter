@@ -72,7 +72,7 @@ type CommandRunner func(ctx context.Context, dir string, command string, env []s
 // .arbiter/empty-hooks.
 func EmptyHooksDir(arbiterDir string) (string, error) {
 	if arbiterDir == "" {
-		return "", fmt.Errorf("worktree: empty-hooks dir needs an arbiter dir")
+		return "", errors.New("worktree: empty-hooks dir needs an arbiter dir")
 	}
 	abs, err := filepath.Abs(arbiterDir)
 	if err != nil {
