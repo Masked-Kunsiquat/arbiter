@@ -1185,6 +1185,80 @@ func TestCheckUnseenState_PreexistingHookDir(t *testing.T) {
 	}
 }
 
+// A pre-existing symlinked hook is kept while its target and the content it
+// resolves to are unchanged. A retargeted link, or one whose target content
+// changed, is removed without writing through it.
+func TestCheckUnseenState_PreexistingHookSymlink(t *testing.T) {
+	for _, tamper := range []string{"retarget", "edit target"} {
+		t.Run(tamper, func(t *testing.T) {
+			repoRoot, initialCommit := initGitRepo(t)
+			slot := worktree.NewSlot(repoRoot, 0)
+			if err := slot.EnsureWorktree(context.Background(), initialCommit); err != nil {
+				t.Fatal(err)
+			}
+
+			hooksDir := filepath.Join(repoRoot, ".git", "hooks")
+			if err := os.MkdirAll(hooksDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			outside := t.TempDir()
+			target := filepath.Join(outside, "pre-commit")
+			if err := os.WriteFile(target, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			link := filepath.Join(hooksDir, "pre-commit")
+			if err := os.Symlink(target, link); err != nil {
+				t.Skipf("symlinks unavailable: %v", err)
+			}
+
+			snap, err := slot.TakeSnapshot(nil, nil)
+			if err != nil {
+				t.Fatalf("TakeSnapshot: %v", err)
+			}
+			rep, err := slot.CheckUnseenState(nil, nil, snap)
+			if err != nil {
+				t.Fatalf("CheckUnseenState: %v", err)
+			}
+			if rep.Violation || rep.GitHooksChanged {
+				t.Errorf("untouched hook symlink: got Violation=%v GitHooksChanged=%v, want false", rep.Violation, rep.GitHooksChanged)
+			}
+			if fi, err := os.Lstat(link); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+				t.Fatalf("untouched hook symlink not kept: %v, %v", fi, err)
+			}
+
+			const planted = "#!/bin/sh\nexit 1\n"
+			if tamper == "retarget" {
+				other := filepath.Join(outside, "evil")
+				if err := os.WriteFile(other, []byte(planted), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Remove(link); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(other, link); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.WriteFile(target, []byte(planted), 0o755); err != nil {
+				t.Fatal(err)
+			}
+
+			rep, err = slot.CheckUnseenState(nil, nil, snap)
+			if err != nil {
+				t.Fatalf("CheckUnseenState: %v", err)
+			}
+			if !rep.Violation || !rep.GitHooksChanged {
+				t.Errorf("%s: got Violation=%v GitHooksChanged=%v, want true", tamper, rep.Violation, rep.GitHooksChanged)
+			}
+			if _, err := os.Lstat(link); !errors.Is(err, fs.ErrNotExist) {
+				t.Errorf("%s: tampered hook symlink not removed: %v", tamper, err)
+			}
+			if _, err := os.Stat(target); err != nil {
+				t.Errorf("%s: symlink target removed: %v", tamper, err)
+			}
+		})
+	}
+}
+
 // The admin dir's gitdir pointer is restored if changed, and a non-empty
 // directory planted as config.worktree is removed rather than aborting the
 // check.

@@ -39,6 +39,9 @@ type GitFileBackup struct {
 	// can't be compared.
 	Size    int64
 	ModTime time.Time
+	// LinkTarget is set for a symlinked hook (always Opaque). Content then
+	// holds what the link resolved to, if that was a regular file.
+	LinkTarget string
 }
 
 // Snapshot records the state of lockfiles, keep-list directories, .git/config,
@@ -336,17 +339,44 @@ func snapshotGitHooks(hooksDir string) map[string]*GitFileBackup {
 		if err != nil {
 			continue // removed since ReadDir
 		}
+		hp := filepath.Join(hooksDir, e.Name())
 		backup := &GitFileBackup{RelPath: e.Name(), Mode: info.Mode(), Size: info.Size(), ModTime: info.ModTime()}
 		// Record entries that can't be backed up too, so the check doesn't
-		// take them for planted hooks and delete them.
-		if data, err := os.ReadFile(filepath.Join(hooksDir, e.Name())); err == nil && !e.IsDir() {
-			backup.Content = data
-		} else {
+		// take them for planted hooks and delete them. A symlink is never
+		// read as if it were the hook file itself: restoring one as a
+		// regular file would replace the user's link.
+		switch {
+		case info.Mode()&fs.ModeSymlink != 0:
+			backup.Opaque = true
+			backup.LinkTarget, _ = os.Readlink(hp)
+			backup.Content = readRegularFile(hp)
+		case info.Mode().IsRegular():
+			if data, err := os.ReadFile(hp); err == nil {
+				backup.Content = data
+			} else {
+				backup.Opaque = true
+			}
+		default:
 			backup.Opaque = true
 		}
 		gitHooks[e.Name()] = backup
 	}
 	return gitHooks
+}
+
+// readRegularFile returns the content of path, following symlinks, or nil
+// if it doesn't resolve to a readable regular file. Checking first keeps a
+// link to a FIFO or device from blocking the read.
+func readRegularFile(path string) []byte {
+	fi, err := os.Stat(path)
+	if err != nil || !fi.Mode().IsRegular() {
+		return nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	return data
 }
 
 func snapshotWorktreeGit(slotDir string, snap *Snapshot) {
@@ -491,7 +521,7 @@ func checkAndRestoreHooks(hooksDir string, snapHooks map[string]*GitFileBackup, 
 		}
 
 		if old.Opaque {
-			if keepOpaqueHook(e, old) {
+			if keepOpaqueHook(hp, e, old) {
 				continue
 			}
 			// Something else took the place of an entry we couldn't back
@@ -515,11 +545,16 @@ func checkAndRestoreHooks(hooksDir string, snapHooks map[string]*GitFileBackup, 
 			continue
 		}
 
-		currData, rerr := os.ReadFile(hp)
+		// Compare the mode (lstat) before reading, so a hook swapped for a
+		// symlink or FIFO is restored without being read through.
 		info, ierr := e.Info()
-		modeChanged := ierr == nil && (info.Mode() != old.Mode)
+		changed := ierr != nil || info.Mode() != old.Mode
+		if !changed {
+			currData, rerr := os.ReadFile(hp)
+			changed = rerr != nil || !bytes.Equal(currData, old.Content)
+		}
 
-		if rerr != nil || !bytes.Equal(currData, old.Content) || modeChanged {
+		if changed {
 			report.GitHooksChanged = true
 			report.Violation = true
 			if err := restoreFile(hp, old.Content, old.Mode); err != nil {
@@ -544,20 +579,28 @@ func checkAndRestoreHooks(hooksDir string, snapHooks map[string]*GitFileBackup, 
 	return nil
 }
 
-// keepOpaqueHook reports whether e, at the name of an entry the snapshot
-// couldn't back up, can be left in place: it is still a real directory, or
-// still a regular file with the same mode, size and mtime. A symlink or a
-// changed entry could now point git at a runnable hook, so it is not kept.
-func keepOpaqueHook(e fs.DirEntry, old *GitFileBackup) bool {
+// keepOpaqueHook reports whether e (at hp), at the name of an entry the
+// snapshot couldn't back up, can be left in place: it is still a real
+// directory, still a regular file with the same mode, size and mtime, or
+// still a symlink with the same target that resolves to the same content.
+// Anything else could now point git at a runnable hook, so it is not kept.
+func keepOpaqueHook(hp string, e fs.DirEntry, old *GitFileBackup) bool {
 	info, err := e.Info()
 	if err != nil || info.Mode().Type() != old.Mode.Type() {
 		return false
 	}
-	if info.IsDir() {
+	switch {
+	case info.IsDir():
 		return true
+	case info.Mode()&fs.ModeSymlink != 0:
+		target, err := os.Readlink(hp)
+		return err == nil && target == old.LinkTarget &&
+			bytes.Equal(readRegularFile(hp), old.Content)
+	case info.Mode().IsRegular():
+		return info.Mode() == old.Mode &&
+			info.Size() == old.Size && info.ModTime().Equal(old.ModTime)
 	}
-	return info.Mode().IsRegular() && info.Mode() == old.Mode &&
-		info.Size() == old.Size && info.ModTime().Equal(old.ModTime)
+	return false
 }
 
 func checkAndRestoreWorktreeConfig(adminDir string, backup *GitFileBackup, report *UnseenReport) error {
