@@ -115,6 +115,53 @@ func TestDetect_Rust(t *testing.T) {
 	}
 }
 
+func writeManifest(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDetect_RustVirtualWorkspace(t *testing.T) {
+	cases := []struct {
+		name     string
+		manifest string
+		members  []string
+		want     string // "" means Detect must fail
+	}{
+		{"package manifest", "[package]\nname = \"x\"\n[workspace]\nmembers = [\"crates/a\"]\n", []string{"crates/a"}, "tests/*_adversary_test.rs"},
+		{"glob member", "[workspace]\nmembers = [\"crates/*\"]\n", []string{"crates/b", "crates/a"}, "crates/a/tests/*_adversary_test.rs"},
+		{"default-members win", "[workspace]\nmembers = [\"crates/*\"]\ndefault-members = [\"crates/b\"]\n", []string{"crates/a", "crates/b"}, "crates/b/tests/*_adversary_test.rs"},
+		{"excluded member skipped", "[workspace]\nmembers = [\"crates/*\"]\nexclude = [\"crates/a\"]\n", []string{"crates/a", "crates/b"}, "crates/b/tests/*_adversary_test.rs"},
+		{"no members", "[workspace]\nmembers = []\n", nil, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeManifest(t, filepath.Join(dir, "Cargo.toml"), tc.manifest)
+			for _, m := range tc.members {
+				writeManifest(t, filepath.Join(dir, filepath.FromSlash(m), "Cargo.toml"), "[package]\nname = \"m\"\n")
+			}
+			got, err := stack.Detect(dir)
+			if tc.want == "" {
+				if err == nil {
+					t.Fatalf("Detect: got %+v, want error", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Detect: %v", err)
+			}
+			if got[0].Adversary.Pattern != tc.want {
+				t.Errorf("Adversary.Pattern = %q, want %q", got[0].Adversary.Pattern, tc.want)
+			}
+		})
+	}
+}
+
 func TestKeepListPerEcosystem(t *testing.T) {
 	cases := []struct {
 		file     string

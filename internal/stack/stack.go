@@ -9,6 +9,9 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
+
+	"github.com/BurntSushi/toml"
 )
 
 // Ecosystem is a detected project ecosystem.
@@ -71,6 +74,11 @@ func Detect(dir string) ([]Ecosystem, error) {
 		eco := d.build()
 		if seen[eco.Name] {
 			continue
+		}
+		if eco.Name == "rust" {
+			if err := setRustAdversaryPattern(dir, &eco); err != nil {
+				return nil, err
+			}
 		}
 		seen[eco.Name] = true
 		found = append(found, eco)
@@ -153,4 +161,59 @@ func rustEcosystem() Ecosystem {
 	e.Deps.Lockfiles = []string{"Cargo.lock"}
 	e.Deps.Keep = []string{"target"}
 	return e
+}
+
+// cargoManifest is the subset of Cargo.toml needed to tell a virtual
+// workspace (a [workspace] with no [package]) from a package manifest.
+type cargoManifest struct {
+	Package   *struct{} `toml:"package"`
+	Workspace *struct {
+		Members        []string `toml:"members"`
+		DefaultMembers []string `toml:"default-members"`
+		Exclude        []string `toml:"exclude"`
+	} `toml:"workspace"`
+}
+
+// setRustAdversaryPattern points e's adversary pattern at a member crate's
+// tests/ dir when dir's Cargo.toml is a virtual workspace: Cargo builds no
+// package at the workspace root, so a root tests/ dir would never run. The
+// member is the first one `cargo test` runs from the root (default-members,
+// else members). A manifest that doesn't parse keeps the root default;
+// cargo itself will report that error.
+func setRustAdversaryPattern(dir string, e *Ecosystem) error {
+	var m cargoManifest
+	if _, err := toml.DecodeFile(filepath.Join(dir, "Cargo.toml"), &m); err != nil {
+		return nil
+	}
+	if m.Package != nil || m.Workspace == nil {
+		return nil
+	}
+	candidates := m.Workspace.DefaultMembers
+	if len(candidates) == 0 {
+		candidates = m.Workspace.Members
+	}
+	for _, c := range candidates {
+		matches, err := filepath.Glob(filepath.Join(dir, filepath.FromSlash(c)))
+		if err != nil {
+			continue
+		}
+		slices.Sort(matches)
+		for _, mp := range matches {
+			rel, err := filepath.Rel(dir, mp)
+			if err != nil || !filepath.IsLocal(rel) {
+				continue
+			}
+			rel = filepath.ToSlash(rel)
+			if slices.Contains(m.Workspace.Exclude, rel) {
+				continue
+			}
+			if fi, err := os.Stat(filepath.Join(mp, "Cargo.toml")); err != nil || !fi.Mode().IsRegular() {
+				continue
+			}
+			e.Adversary.Pattern = rel + "/tests/*_adversary_test.rs"
+			return nil
+		}
+	}
+	return errors.New("stack: Cargo.toml is a virtual workspace with no resolvable member crate; " +
+		"add a member (or default-members) so arbiter init can place adversary tests in it")
 }
