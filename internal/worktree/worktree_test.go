@@ -1127,3 +1127,59 @@ func TestCheckUnseenState_RestoreDoesNotFollowSymlinks(t *testing.T) {
 		}
 	}
 }
+
+// An entry in .git/hooks that can't be backed up (a directory) is not taken
+// for a planted hook: it survives the check with no violation. Something else
+// put in its place is still removed.
+func TestCheckUnseenState_PreexistingHookDir(t *testing.T) {
+	repoRoot, initialCommit := initGitRepo(t)
+	ctx := context.Background()
+
+	slot := worktree.NewSlot(repoRoot, 0)
+	if err := slot.EnsureWorktree(ctx, initialCommit); err != nil {
+		t.Fatal(err)
+	}
+
+	hookDir := filepath.Join(repoRoot, ".git", "hooks", "pre-commit.d")
+	if err := os.MkdirAll(hookDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	userFile := filepath.Join(hookDir, "lint")
+	if err := os.WriteFile(userFile, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	snap, err := slot.TakeSnapshot(nil, nil)
+	if err != nil {
+		t.Fatalf("TakeSnapshot: %v", err)
+	}
+
+	rep, err := slot.CheckUnseenState(nil, nil, snap)
+	if err != nil {
+		t.Fatalf("CheckUnseenState: %v", err)
+	}
+	if rep.Violation || rep.GitHooksChanged {
+		t.Errorf("untouched hook dir: got Violation=%v GitHooksChanged=%v, want false", rep.Violation, rep.GitHooksChanged)
+	}
+	if _, err := os.Stat(userFile); err != nil {
+		t.Fatalf("pre-existing hook dir contents removed: %v", err)
+	}
+
+	// Replace the directory with a runnable hook file of the same name.
+	if err := os.RemoveAll(hookDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(hookDir, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rep, err = slot.CheckUnseenState(nil, nil, snap)
+	if err != nil {
+		t.Fatalf("CheckUnseenState: %v", err)
+	}
+	if !rep.Violation || !rep.GitHooksChanged {
+		t.Errorf("file replacing hook dir: got Violation=%v GitHooksChanged=%v, want true", rep.Violation, rep.GitHooksChanged)
+	}
+	if _, err := os.Lstat(hookDir); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("file replacing hook dir not removed: %v", err)
+	}
+}

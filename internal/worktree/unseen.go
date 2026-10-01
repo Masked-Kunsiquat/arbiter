@@ -31,6 +31,10 @@ type GitFileBackup struct {
 	RelPath string
 	Content []byte
 	Mode    os.FileMode
+	// Opaque marks an entry that existed but couldn't be backed up (a
+	// directory or an unreadable file). It is left in place while its type is
+	// unchanged, and never restored as a file.
+	Opaque bool
 }
 
 // Snapshot records the state of lockfiles, keep-list directories, .git/config,
@@ -324,23 +328,19 @@ func snapshotGitHooks(hooksDir string) map[string]*GitFileBackup {
 		return gitHooks
 	}
 	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		hp := filepath.Join(hooksDir, e.Name())
-		data, err := os.ReadFile(hp)
+		info, err := e.Info()
 		if err != nil {
-			continue
+			continue // removed since ReadDir
 		}
-		mode := os.FileMode(0o755)
-		if info, err := e.Info(); err == nil {
-			mode = info.Mode()
+		backup := &GitFileBackup{RelPath: e.Name(), Mode: info.Mode()}
+		// Record entries that can't be backed up too, so the check doesn't
+		// take them for planted hooks and delete them.
+		if data, err := os.ReadFile(filepath.Join(hooksDir, e.Name())); err == nil && !e.IsDir() {
+			backup.Content = data
+		} else {
+			backup.Opaque = true
 		}
-		gitHooks[e.Name()] = &GitFileBackup{
-			RelPath: e.Name(),
-			Content: data,
-			Mode:    mode,
-		}
+		gitHooks[e.Name()] = backup
 	}
 	return gitHooks
 }
@@ -486,6 +486,21 @@ func checkAndRestoreHooks(hooksDir string, snapHooks map[string]*GitFileBackup, 
 			continue
 		}
 
+		if old.Opaque {
+			if keepOpaqueHook(e, old) {
+				continue
+			}
+			// Something else took the place of an entry we couldn't back
+			// up: it can't be restored, so only remove what was planted.
+			report.GitHooksChanged = true
+			report.Violation = true
+			if err := os.RemoveAll(hp); err != nil {
+				return fmt.Errorf("worktree: removing hook replacing %s: %w", hp, err)
+			}
+			report.RestoredPaths = append(report.RestoredPaths, filepath.ToSlash(filepath.Join(".git/hooks", name)))
+			continue
+		}
+
 		if e.IsDir() {
 			report.GitHooksChanged = true
 			report.Violation = true
@@ -511,7 +526,7 @@ func checkAndRestoreHooks(hooksDir string, snapHooks map[string]*GitFileBackup, 
 	}
 
 	for name, old := range snapHooks {
-		if currHooks[name] {
+		if currHooks[name] || old.Opaque {
 			continue
 		}
 		report.GitHooksChanged = true
@@ -523,6 +538,18 @@ func checkAndRestoreHooks(hooksDir string, snapHooks map[string]*GitFileBackup, 
 		report.RestoredPaths = append(report.RestoredPaths, filepath.ToSlash(filepath.Join(".git/hooks", name)))
 	}
 	return nil
+}
+
+// keepOpaqueHook reports whether e, at the name of an entry the snapshot
+// couldn't back up, can be left in place: it is still a real directory, or
+// still a regular file, as it was. A symlink or a changed type could now
+// point git at a runnable hook, so it is not kept.
+func keepOpaqueHook(e fs.DirEntry, old *GitFileBackup) bool {
+	info, err := e.Info()
+	if err != nil || info.Mode().Type() != old.Mode.Type() {
+		return false
+	}
+	return info.IsDir() || info.Mode().IsRegular()
 }
 
 func checkAndRestoreWorktreeConfig(adminDir string, backup *GitFileBackup, report *UnseenReport) error {
