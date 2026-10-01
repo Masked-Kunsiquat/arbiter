@@ -2,7 +2,9 @@ package worktree
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -60,50 +62,76 @@ type GitRunner func(ctx context.Context, dir string, args ...string) (string, er
 // CommandRunner executes a shell command in dir with the provided environment.
 type CommandRunner func(ctx context.Context, dir string, command string, env []string) error
 
-// EmptyHooksDir returns an absolute path to a guaranteed-empty hooks directory
-// to ensure git never executes user or repository hooks during Arbiter operations
-// (spec §5.3: "-c core.hooksPath=<empty arbiter dir> -c core.fsmonitor=false").
-func EmptyHooksDir(baseDir string) string {
-	var targetDir string
-	if baseDir != "" {
-		current := filepath.Clean(baseDir)
-		for range 5 {
-			cand := filepath.Join(current, ".arbiter")
-			if fi, err := os.Stat(cand); err == nil && fi.IsDir() {
-				targetDir = filepath.Join(cand, "empty-hooks")
-				break
-			}
-			parent := filepath.Dir(current)
-			if parent == current {
-				break
-			}
-			current = parent
+// EmptyHooksDir returns the absolute path of arbiterDir's empty-hooks
+// directory, verified empty, so git never executes user or repository hooks
+// during Arbiter operations (spec §5.3: "-c core.hooksPath=<empty arbiter
+// dir> -c core.fsmonitor=false"). Anything found there (files, or a symlink
+// in place of the directory) is removed and the directory recreated private.
+// The path comes only from arbiterDir, never from the directory git runs in:
+// a slot is agent-writable, so a lookup from there could pick up a planted
+// .arbiter/empty-hooks.
+func EmptyHooksDir(arbiterDir string) (string, error) {
+	if arbiterDir == "" {
+		return "", fmt.Errorf("worktree: empty-hooks dir needs an arbiter dir")
+	}
+	abs, err := filepath.Abs(arbiterDir)
+	if err != nil {
+		return "", fmt.Errorf("worktree: resolving arbiter dir: %w", err)
+	}
+	dir := filepath.Join(abs, "empty-hooks")
+
+	fi, err := os.Lstat(dir)
+	switch {
+	case err == nil && fi.IsDir():
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return "", fmt.Errorf("worktree: reading empty-hooks dir: %w", err)
 		}
+		if len(entries) == 0 {
+			return dir, nil
+		}
+		fallthrough
+	case err == nil:
+		// RemoveAll removes a symlink itself, not its target.
+		if err := os.RemoveAll(dir); err != nil {
+			return "", fmt.Errorf("worktree: clearing empty-hooks dir: %w", err)
+		}
+	case !errors.Is(err, fs.ErrNotExist):
+		return "", fmt.Errorf("worktree: checking empty-hooks dir: %w", err)
 	}
-	if targetDir == "" {
-		targetDir = filepath.Join(os.TempDir(), "arbiter-empty-hooks")
+
+	if err := os.MkdirAll(abs, 0o755); err != nil {
+		return "", fmt.Errorf("worktree: creating arbiter dir: %w", err)
 	}
-	_ = os.MkdirAll(targetDir, 0o755)
-	return targetDir
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		return "", fmt.Errorf("worktree: creating empty-hooks dir: %w", err)
+	}
+	return dir, nil
 }
 
-// DefaultGitRunner executes git with Arbiter's mandatory security overrides
-// (spec §5.3: "Separately, every git command Arbiter runs itself passes
-// -c core.hooksPath=<empty arbiter dir> -c core.fsmonitor=false").
-func DefaultGitRunner(ctx context.Context, dir string, args ...string) (string, error) {
-	emptyHooks := EmptyHooksDir(dir)
-	fullArgs := append([]string{
-		"-c", "core.hooksPath=" + filepath.ToSlash(emptyHooks),
-		"-c", "core.fsmonitor=false",
-	}, args...)
-	cmd := exec.CommandContext(ctx, "git", fullArgs...)
-	cmd.Dir = dir
-	cmd.Env = os.Environ()
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return string(out), fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+// NewGitRunner returns a GitRunner that executes git with Arbiter's mandatory
+// security overrides (spec §5.3: "Separately, every git command Arbiter runs
+// itself passes -c core.hooksPath=<empty arbiter dir> -c core.fsmonitor=false"),
+// using arbiterDir's empty-hooks directory.
+func NewGitRunner(arbiterDir string) GitRunner {
+	return func(ctx context.Context, dir string, args ...string) (string, error) {
+		emptyHooks, err := EmptyHooksDir(arbiterDir)
+		if err != nil {
+			return "", err
+		}
+		fullArgs := append([]string{
+			"-c", "core.hooksPath=" + filepath.ToSlash(emptyHooks),
+			"-c", "core.fsmonitor=false",
+		}, args...)
+		cmd := exec.CommandContext(ctx, "git", fullArgs...)
+		cmd.Dir = dir
+		cmd.Env = os.Environ()
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			return string(out), fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+		}
+		return string(out), nil
 	}
-	return string(out), nil
 }
 
 // DefaultCommandRunner executes command in dir using the platform shell
@@ -142,7 +170,7 @@ func NewSlot(repoRoot string, index int) *Slot {
 		RepoRoot:   repoRoot,
 		ArbiterDir: arbiterDir,
 		Path:       SlotDir(arbiterDir, index),
-		Git:        DefaultGitRunner,
+		Git:        NewGitRunner(arbiterDir),
 		Cmd:        DefaultCommandRunner,
 	}
 }

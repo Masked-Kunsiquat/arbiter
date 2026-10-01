@@ -892,9 +892,9 @@ func TestDefaultGitRunner_CoreHooksPathOverride(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	emptyHooks := worktree.EmptyHooksDir(slot.Path)
-	if emptyHooks == "" {
-		t.Fatal("EmptyHooksDir returned empty string")
+	emptyHooks, err := worktree.EmptyHooksDir(slot.ArbiterDir)
+	if err != nil {
+		t.Fatalf("EmptyHooksDir: %v", err)
 	}
 	fi, err := os.Stat(emptyHooks)
 	if err != nil || !fi.IsDir() {
@@ -904,6 +904,97 @@ func TestDefaultGitRunner_CoreHooksPathOverride(t *testing.T) {
 	out, err := slot.Git(ctx, slot.Path, "status")
 	if err != nil {
 		t.Fatalf("slot.Git status with empty hooksPath failed: %v, out: %s", err, out)
+	}
+}
+
+func TestEmptyHooksDir_RequiresArbiterDir(t *testing.T) {
+	if _, err := worktree.EmptyHooksDir(""); err == nil {
+		t.Fatal("EmptyHooksDir(\"\") = nil error, want error")
+	}
+}
+
+// A hook planted in the arbiter empty-hooks dir is cleared before git runs.
+func TestEmptyHooksDir_ClearsPlantedFiles(t *testing.T) {
+	arbiterDir := filepath.Join(t.TempDir(), ".arbiter")
+	planted := filepath.Join(arbiterDir, "empty-hooks", "post-checkout")
+	if err := os.MkdirAll(filepath.Dir(planted), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(planted, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	dir, err := worktree.EmptyHooksDir(arbiterDir)
+	if err != nil {
+		t.Fatalf("EmptyHooksDir: %v", err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("empty-hooks dir has %d entries, want 0", len(entries))
+	}
+}
+
+// A symlink in place of the empty-hooks dir is replaced, and its target is
+// left alone.
+func TestEmptyHooksDir_ReplacesSymlink(t *testing.T) {
+	arbiterDir := filepath.Join(t.TempDir(), ".arbiter")
+	if err := os.MkdirAll(arbiterDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target := t.TempDir()
+	hook := filepath.Join(target, "post-checkout")
+	if err := os.WriteFile(hook, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(arbiterDir, "empty-hooks")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	dir, err := worktree.EmptyHooksDir(arbiterDir)
+	if err != nil {
+		t.Fatalf("EmptyHooksDir: %v", err)
+	}
+	fi, err := os.Lstat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
+		t.Errorf("empty-hooks is %v, want a real directory", fi.Mode())
+	}
+	if _, err := os.Stat(hook); err != nil {
+		t.Errorf("symlink target's contents were touched: %v", err)
+	}
+}
+
+// An agent can write .arbiter/empty-hooks inside its slot; Reset's git
+// checkout must not pick that up as its hooks path.
+func TestReset_IgnoresHooksPlantedInSlot(t *testing.T) {
+	repoRoot, initialCommit := initGitRepo(t)
+	ctx := context.Background()
+
+	slot := worktree.NewSlot(repoRoot, 0)
+	if err := slot.EnsureWorktree(ctx, initialCommit); err != nil {
+		t.Fatal(err)
+	}
+
+	marker := filepath.Join(t.TempDir(), "hook-ran")
+	planted := filepath.Join(slot.Path, ".arbiter", "empty-hooks", "post-checkout")
+	if err := os.MkdirAll(filepath.Dir(planted), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script := "#!/bin/sh\necho ran > '" + filepath.ToSlash(marker) + "'\n"
+	if err := os.WriteFile(planted, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := slot.Reset(ctx, initialCommit, nil); err != nil {
+		t.Fatalf("Reset: %v", err)
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("hook planted in the slot ran during Reset")
 	}
 }
 
