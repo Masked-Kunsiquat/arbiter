@@ -1,6 +1,7 @@
 package worktree_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io/fs"
@@ -1181,5 +1182,51 @@ func TestCheckUnseenState_PreexistingHookDir(t *testing.T) {
 	}
 	if _, err := os.Lstat(hookDir); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("file replacing hook dir not removed: %v", err)
+	}
+}
+
+// The admin dir's gitdir pointer is restored if changed, and a non-empty
+// directory planted as config.worktree is removed rather than aborting the
+// check.
+func TestUnseenState_GitdirAndConfigWorktreeDir(t *testing.T) {
+	repoRoot, initialCommit := initGitRepo(t)
+	ctx := context.Background()
+
+	slot := worktree.NewSlot(repoRoot, 0)
+	if err := slot.EnsureWorktree(ctx, initialCommit); err != nil {
+		t.Fatal(err)
+	}
+	adminDir := filepath.Join(repoRoot, ".git", "worktrees", "slot-0")
+	gitdirPath := filepath.Join(adminDir, "gitdir")
+	origGitdir, err := os.ReadFile(gitdirPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	snap, err := slot.TakeSnapshot(nil, nil)
+	if err != nil {
+		t.Fatalf("TakeSnapshot: %v", err)
+	}
+
+	if err := os.WriteFile(gitdirPath, []byte("/elsewhere/.git\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfgWorktree := filepath.Join(adminDir, "config.worktree")
+	if err := os.MkdirAll(filepath.Join(cfgWorktree, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	rep, err := slot.CheckUnseenState(nil, nil, snap)
+	if err != nil {
+		t.Fatalf("CheckUnseenState: %v", err)
+	}
+	if !rep.Violation || !rep.GitConfigChanged {
+		t.Errorf("got Violation=%v GitConfigChanged=%v, want true", rep.Violation, rep.GitConfigChanged)
+	}
+	if got, err := os.ReadFile(gitdirPath); err != nil || !bytes.Equal(got, origGitdir) {
+		t.Errorf("gitdir not restored: %q, %v", got, err)
+	}
+	if _, err := os.Lstat(cfgWorktree); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("planted config.worktree dir not removed: %v", err)
 	}
 }

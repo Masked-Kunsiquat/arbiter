@@ -32,9 +32,13 @@ type GitFileBackup struct {
 	Content []byte
 	Mode    os.FileMode
 	// Opaque marks an entry that existed but couldn't be backed up (a
-	// directory or an unreadable file). It is left in place while its type is
-	// unchanged, and never restored as a file.
+	// directory or an unreadable file). It is left in place while unchanged
+	// (see keepOpaqueHook), and never restored as a file.
 	Opaque bool
+	// Size and ModTime are recorded for opaque regular files, whose content
+	// can't be compared.
+	Size    int64
+	ModTime time.Time
 }
 
 // Snapshot records the state of lockfiles, keep-list directories, .git/config,
@@ -332,7 +336,7 @@ func snapshotGitHooks(hooksDir string) map[string]*GitFileBackup {
 		if err != nil {
 			continue // removed since ReadDir
 		}
-		backup := &GitFileBackup{RelPath: e.Name(), Mode: info.Mode()}
+		backup := &GitFileBackup{RelPath: e.Name(), Mode: info.Mode(), Size: info.Size(), ModTime: info.ModTime()}
 		// Record entries that can't be backed up too, so the check doesn't
 		// take them for planted hooks and delete them.
 		if data, err := os.ReadFile(filepath.Join(hooksDir, e.Name())); err == nil && !e.IsDir() {
@@ -542,14 +546,18 @@ func checkAndRestoreHooks(hooksDir string, snapHooks map[string]*GitFileBackup, 
 
 // keepOpaqueHook reports whether e, at the name of an entry the snapshot
 // couldn't back up, can be left in place: it is still a real directory, or
-// still a regular file, as it was. A symlink or a changed type could now
-// point git at a runnable hook, so it is not kept.
+// still a regular file with the same mode, size and mtime. A symlink or a
+// changed entry could now point git at a runnable hook, so it is not kept.
 func keepOpaqueHook(e fs.DirEntry, old *GitFileBackup) bool {
 	info, err := e.Info()
 	if err != nil || info.Mode().Type() != old.Mode.Type() {
 		return false
 	}
-	return info.IsDir() || info.Mode().IsRegular()
+	if info.IsDir() {
+		return true
+	}
+	return info.Mode().IsRegular() && info.Mode() == old.Mode &&
+		info.Size() == old.Size && info.ModTime().Equal(old.ModTime)
 }
 
 func checkAndRestoreWorktreeConfig(adminDir string, backup *GitFileBackup, report *UnseenReport) error {
@@ -558,7 +566,7 @@ func checkAndRestoreWorktreeConfig(adminDir string, backup *GitFileBackup, repor
 		if _, err := os.Lstat(wtCfgPath); err == nil {
 			report.GitConfigChanged = true
 			report.Violation = true
-			if err := os.Remove(wtCfgPath); err != nil {
+			if err := os.RemoveAll(wtCfgPath); err != nil {
 				return fmt.Errorf("worktree: removing planted config.worktree: %w", err)
 			}
 			report.RestoredPaths = append(report.RestoredPaths, "config.worktree")
@@ -603,6 +611,26 @@ func isRegularFile(path string) bool {
 	return err == nil && fi.Mode().IsRegular()
 }
 
+// checkAndRestoreAdminFile restores backup (one of the worktree admin dir's
+// pointer files, e.g. commondir) if it was changed, replaced or removed.
+func checkAndRestoreAdminFile(adminDir string, backup *GitFileBackup, report *UnseenReport) error {
+	if backup == nil {
+		return nil
+	}
+	p := filepath.Join(adminDir, backup.RelPath)
+	currData, err := os.ReadFile(p)
+	if err == nil && isRegularFile(p) && bytes.Equal(currData, backup.Content) {
+		return nil
+	}
+	report.GitConfigChanged = true
+	report.Violation = true
+	if err := restoreFile(p, backup.Content, backup.Mode); err != nil {
+		return fmt.Errorf("worktree: restoring %s: %w", backup.RelPath, err)
+	}
+	report.RestoredPaths = append(report.RestoredPaths, backup.RelPath)
+	return nil
+}
+
 func checkAndRestoreWorktreeGit(slotDir string, snap *Snapshot, report *UnseenReport) error {
 	if snap.WorktreeGitPointer != nil {
 		slotGitPath := filepath.Join(slotDir, ".git")
@@ -628,16 +656,9 @@ func checkAndRestoreWorktreeGit(slotDir string, snap *Snapshot, report *UnseenRe
 		return err
 	}
 
-	if snap.WorktreeCommondir != nil {
-		cdPath := filepath.Join(adminDir, "commondir")
-		currData, err := os.ReadFile(cdPath)
-		if err != nil || !isRegularFile(cdPath) || !bytes.Equal(currData, snap.WorktreeCommondir.Content) {
-			report.GitConfigChanged = true
-			report.Violation = true
-			if err := restoreFile(cdPath, snap.WorktreeCommondir.Content, snap.WorktreeCommondir.Mode); err != nil {
-				return fmt.Errorf("worktree: restoring commondir: %w", err)
-			}
-			report.RestoredPaths = append(report.RestoredPaths, "commondir")
+	for _, backup := range []*GitFileBackup{snap.WorktreeCommondir, snap.WorktreeGitdir} {
+		if err := checkAndRestoreAdminFile(adminDir, backup, report); err != nil {
+			return err
 		}
 	}
 
