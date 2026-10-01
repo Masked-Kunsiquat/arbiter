@@ -103,10 +103,24 @@ func EmptyHooksDir(arbiterDir string) (string, error) {
 	if err := os.MkdirAll(abs, 0o755); err != nil {
 		return "", fmt.Errorf("worktree: creating arbiter dir: %w", err)
 	}
-	if err := os.Mkdir(dir, 0o700); err != nil {
+	err = os.Mkdir(dir, 0o700)
+	if errors.Is(err, fs.ErrExist) && isEmptyRealDir(dir) {
+		return dir, nil // another caller created it first
+	}
+	if err != nil {
 		return "", fmt.Errorf("worktree: creating empty-hooks dir: %w", err)
 	}
 	return dir, nil
+}
+
+// isEmptyRealDir reports whether path is an empty directory and not a symlink.
+func isEmptyRealDir(path string) bool {
+	fi, err := os.Lstat(path)
+	if err != nil || !fi.IsDir() {
+		return false
+	}
+	entries, err := os.ReadDir(path)
+	return err == nil && len(entries) == 0
 }
 
 // NewGitRunner returns a GitRunner that executes git with Arbiter's mandatory
