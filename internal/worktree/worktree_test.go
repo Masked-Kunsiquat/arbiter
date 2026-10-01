@@ -1065,3 +1065,65 @@ func TestCheckAndRestoreHooks_Hardened(t *testing.T) {
 		t.Fatalf("expected hook to be restored to file, got isDir=%v, err=%v", fi != nil && fi.IsDir(), err)
 	}
 }
+
+// Replacing a hook or .git/config with a symlink must not make the restore
+// write through the link: the link's target stays untouched, and a regular
+// file is restored in its place.
+func TestCheckUnseenState_RestoreDoesNotFollowSymlinks(t *testing.T) {
+	repoRoot, initialCommit := initGitRepo(t)
+	ctx := context.Background()
+
+	slot := worktree.NewSlot(repoRoot, 0)
+	if err := slot.EnsureWorktree(ctx, initialCommit); err != nil {
+		t.Fatal(err)
+	}
+
+	hooksDir := filepath.Join(repoRoot, ".git", "hooks")
+	if err := os.MkdirAll(hooksDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	hookPath := filepath.Join(hooksDir, "pre-commit")
+	if err := os.WriteFile(hookPath, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(repoRoot, ".git", "config")
+
+	snap, err := slot.TakeSnapshot(nil, nil)
+	if err != nil {
+		t.Fatalf("TakeSnapshot: %v", err)
+	}
+
+	outside := t.TempDir()
+	const victimData = "victim\n"
+	for _, p := range []string{hookPath, configPath} {
+		victim := filepath.Join(outside, filepath.Base(p))
+		if err := os.WriteFile(victim, []byte(victimData), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(p); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(victim, p); err != nil {
+			t.Skipf("symlinks unavailable: %v", err)
+		}
+	}
+
+	rep, err := slot.CheckUnseenState(nil, nil, snap)
+	if err != nil {
+		t.Fatalf("CheckUnseenState: %v", err)
+	}
+	if !rep.Violation || !rep.GitHooksChanged || !rep.GitConfigChanged {
+		t.Errorf("symlinked hook and config: got Violation=%v GitHooksChanged=%v GitConfigChanged=%v, want all true",
+			rep.Violation, rep.GitHooksChanged, rep.GitConfigChanged)
+	}
+	for _, p := range []string{hookPath, configPath} {
+		victim := filepath.Join(outside, filepath.Base(p))
+		if data, err := os.ReadFile(victim); err != nil || string(data) != victimData {
+			t.Errorf("symlink target %s was written through: %q, %v", victim, data, err)
+		}
+		fi, err := os.Lstat(p)
+		if err != nil || !fi.Mode().IsRegular() {
+			t.Errorf("%s not restored as a regular file: %v, %v", p, fi, err)
+		}
+	}
+}

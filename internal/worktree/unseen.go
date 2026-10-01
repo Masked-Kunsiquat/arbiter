@@ -489,10 +489,7 @@ func checkAndRestoreHooks(hooksDir string, snapHooks map[string]*GitFileBackup, 
 		if e.IsDir() {
 			report.GitHooksChanged = true
 			report.Violation = true
-			if err := os.RemoveAll(hp); err != nil {
-				return fmt.Errorf("worktree: removing directory replacing hook %s: %w", hp, err)
-			}
-			if err := os.WriteFile(hp, old.Content, old.Mode); err != nil {
+			if err := restoreFile(hp, old.Content, old.Mode); err != nil {
 				return fmt.Errorf("worktree: restoring hook %s: %w", hp, err)
 			}
 			report.RestoredPaths = append(report.RestoredPaths, filepath.ToSlash(filepath.Join(".git/hooks", name)))
@@ -506,10 +503,9 @@ func checkAndRestoreHooks(hooksDir string, snapHooks map[string]*GitFileBackup, 
 		if rerr != nil || !bytes.Equal(currData, old.Content) || modeChanged {
 			report.GitHooksChanged = true
 			report.Violation = true
-			if err := os.WriteFile(hp, old.Content, old.Mode); err != nil {
+			if err := restoreFile(hp, old.Content, old.Mode); err != nil {
 				return fmt.Errorf("worktree: restoring hook %s: %w", hp, err)
 			}
-			_ = os.Chmod(hp, old.Mode)
 			report.RestoredPaths = append(report.RestoredPaths, filepath.ToSlash(filepath.Join(".git/hooks", name)))
 		}
 	}
@@ -521,10 +517,9 @@ func checkAndRestoreHooks(hooksDir string, snapHooks map[string]*GitFileBackup, 
 		report.GitHooksChanged = true
 		report.Violation = true
 		hp := filepath.Join(hooksDir, name)
-		if err := os.WriteFile(hp, old.Content, old.Mode); err != nil {
+		if err := restoreFile(hp, old.Content, old.Mode); err != nil {
 			return fmt.Errorf("worktree: restoring deleted hook %s: %w", hp, err)
 		}
-		_ = os.Chmod(hp, old.Mode)
 		report.RestoredPaths = append(report.RestoredPaths, filepath.ToSlash(filepath.Join(".git/hooks", name)))
 	}
 	return nil
@@ -533,7 +528,7 @@ func checkAndRestoreHooks(hooksDir string, snapHooks map[string]*GitFileBackup, 
 func checkAndRestoreWorktreeConfig(adminDir string, backup *GitFileBackup, report *UnseenReport) error {
 	wtCfgPath := filepath.Join(adminDir, "config.worktree")
 	if backup == nil {
-		if _, err := os.Stat(wtCfgPath); err == nil {
+		if _, err := os.Lstat(wtCfgPath); err == nil {
 			report.GitConfigChanged = true
 			report.Violation = true
 			if err := os.Remove(wtCfgPath); err != nil {
@@ -545,18 +540,40 @@ func checkAndRestoreWorktreeConfig(adminDir string, backup *GitFileBackup, repor
 	}
 
 	currData, err := os.ReadFile(wtCfgPath)
-	fi, _ := os.Stat(wtCfgPath)
+	fi, _ := os.Lstat(wtCfgPath)
 	modeChanged := fi != nil && fi.Mode() != backup.Mode
 	if err != nil || !bytes.Equal(currData, backup.Content) || modeChanged {
 		report.GitConfigChanged = true
 		report.Violation = true
-		if err := os.WriteFile(wtCfgPath, backup.Content, backup.Mode); err != nil {
+		if err := restoreFile(wtCfgPath, backup.Content, backup.Mode); err != nil {
 			return fmt.Errorf("worktree: restoring config.worktree: %w", err)
 		}
-		_ = os.Chmod(wtCfgPath, backup.Mode)
 		report.RestoredPaths = append(report.RestoredPaths, "config.worktree")
 	}
 	return nil
+}
+
+// restoreFile writes a backup to path as a regular file. Anything else at
+// path (a symlink, a directory) is removed first, so the write can't follow
+// a planted link out of the git dir.
+func restoreFile(path string, content []byte, mode fs.FileMode) error {
+	if _, err := os.Lstat(path); err == nil && !isRegularFile(path) {
+		if err := os.RemoveAll(path); err != nil {
+			return err
+		}
+	}
+	if err := os.WriteFile(path, content, mode); err != nil {
+		return err
+	}
+	_ = os.Chmod(path, mode)
+	return nil
+}
+
+// isRegularFile reports whether path itself (not a symlink's target) is a
+// regular file.
+func isRegularFile(path string) bool {
+	fi, err := os.Lstat(path)
+	return err == nil && fi.Mode().IsRegular()
 }
 
 func checkAndRestoreWorktreeGit(slotDir string, snap *Snapshot, report *UnseenReport) error {
@@ -587,10 +604,10 @@ func checkAndRestoreWorktreeGit(slotDir string, snap *Snapshot, report *UnseenRe
 	if snap.WorktreeCommondir != nil {
 		cdPath := filepath.Join(adminDir, "commondir")
 		currData, err := os.ReadFile(cdPath)
-		if err != nil || !bytes.Equal(currData, snap.WorktreeCommondir.Content) {
+		if err != nil || !isRegularFile(cdPath) || !bytes.Equal(currData, snap.WorktreeCommondir.Content) {
 			report.GitConfigChanged = true
 			report.Violation = true
-			if err := os.WriteFile(cdPath, snap.WorktreeCommondir.Content, snap.WorktreeCommondir.Mode); err != nil {
+			if err := restoreFile(cdPath, snap.WorktreeCommondir.Content, snap.WorktreeCommondir.Mode); err != nil {
 				return fmt.Errorf("worktree: restoring commondir: %w", err)
 			}
 			report.RestoredPaths = append(report.RestoredPaths, "commondir")
@@ -638,15 +655,14 @@ func CheckUnseenState(slotDir, repoRoot string, keepList, lockfiles []string, sn
 	configPath := filepath.Join(gitDir, "config")
 	if snap.GitConfig != nil {
 		currData, err := os.ReadFile(configPath)
-		fi, _ := os.Stat(configPath)
+		fi, _ := os.Lstat(configPath)
 		modeChanged := fi != nil && fi.Mode() != snap.GitConfig.Mode
 		if err != nil || !bytes.Equal(currData, snap.GitConfig.Content) || modeChanged {
 			report.GitConfigChanged = true
 			report.Violation = true
-			if rerr := os.WriteFile(configPath, snap.GitConfig.Content, snap.GitConfig.Mode); rerr != nil {
+			if rerr := restoreFile(configPath, snap.GitConfig.Content, snap.GitConfig.Mode); rerr != nil {
 				return nil, fmt.Errorf("worktree: restoring .git/config: %w", rerr)
 			}
-			_ = os.Chmod(configPath, snap.GitConfig.Mode)
 			report.RestoredPaths = append(report.RestoredPaths, ".git/config")
 		}
 	}
