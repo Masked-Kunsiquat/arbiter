@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"slices"
 
@@ -204,7 +205,9 @@ func setRustAdversaryPattern(dir string, e *Ecosystem) error {
 				continue
 			}
 			rel = filepath.ToSlash(rel)
-			if slices.Contains(m.Workspace.Exclude, rel) {
+			if slices.ContainsFunc(m.Workspace.Exclude, func(x string) bool {
+				return path.Clean(filepath.ToSlash(x)) == rel
+			}) {
 				continue
 			}
 			if fi, err := os.Stat(filepath.Join(mp, "Cargo.toml")); err != nil || !fi.Mode().IsRegular() {

@@ -136,6 +136,7 @@ func TestDetect_RustVirtualWorkspace(t *testing.T) {
 		{"glob member", "[workspace]\nmembers = [\"crates/*\"]\n", []string{"crates/b", "crates/a"}, "crates/a/tests/*_adversary_test.rs"},
 		{"default-members win", "[workspace]\nmembers = [\"crates/*\"]\ndefault-members = [\"crates/b\"]\n", []string{"crates/a", "crates/b"}, "crates/b/tests/*_adversary_test.rs"},
 		{"excluded member skipped", "[workspace]\nmembers = [\"crates/*\"]\nexclude = [\"crates/a\"]\n", []string{"crates/a", "crates/b"}, "crates/b/tests/*_adversary_test.rs"},
+		{"excluded member, unnormalized", "[workspace]\nmembers = [\"crates/*\"]\nexclude = [\"./crates/a/\"]\n", []string{"crates/a", "crates/b"}, "crates/b/tests/*_adversary_test.rs"},
 		{"no members", "[workspace]\nmembers = []\n", nil, ""},
 	}
 	for _, tc := range cases {
