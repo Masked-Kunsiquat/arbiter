@@ -210,7 +210,9 @@ func (s *Slot) Reset(ctx context.Context, baseCommit string, keepList []string) 
 	// If target is not kept, wipe per-slot CargoTargetDir to prevent artifact leakage
 	if !slices.Contains(keepList, "target") {
 		if ct := s.CacheConfig().CargoTargetDir; ct != "" {
-			_ = os.RemoveAll(ct)
+			if err := os.RemoveAll(ct); err != nil {
+				return fmt.Errorf("worktree: removing cargo target dir %s: %w", ct, err)
+			}
 		}
 	}
 

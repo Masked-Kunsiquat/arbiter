@@ -143,7 +143,10 @@ func rustEcosystem() Ecosystem {
 	}
 	e.Test.Build = "cargo test --no-run"
 	e.Test.All = "cargo test"
-	e.Test.Files = "cargo test --test {test}"
+	// Cargo selects integration tests by target name (--test <name>), not by
+	// file path, so neither documented placeholder ({files}, {packages}) fits.
+	// Run the full suite for subsets: a superset is always correct.
+	e.Test.Files = "cargo test"
 	e.Test.Reporter = "tap"
 	e.Adversary.Pattern = "tests/**/*_adversary_test.rs"
 	e.Deps.Install = "cargo fetch"
