@@ -148,7 +148,7 @@ func rustEcosystem() Ecosystem {
 	// Run the full suite for subsets: a superset is always correct.
 	e.Test.Files = "cargo test"
 	e.Test.Reporter = "tap"
-	e.Adversary.Pattern = "tests/**/*_adversary_test.rs"
+	e.Adversary.Pattern = "tests/*_adversary_test.rs"
 	e.Deps.Install = "cargo fetch"
 	e.Deps.Lockfiles = []string{"Cargo.lock"}
 	e.Deps.Keep = []string{"target"}

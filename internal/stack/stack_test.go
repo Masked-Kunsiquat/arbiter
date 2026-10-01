@@ -101,8 +101,8 @@ func TestDetect_Rust(t *testing.T) {
 	if got[0].Test.Build != "cargo test --no-run" {
 		t.Errorf("Rust Test.Build = %q, want 'cargo test --no-run'", got[0].Test.Build)
 	}
-	if got[0].Adversary.Pattern != "tests/**/*_adversary_test.rs" {
-		t.Errorf("Rust Adversary.Pattern = %q, want 'tests/**/*_adversary_test.rs'", got[0].Adversary.Pattern)
+	if got[0].Adversary.Pattern != "tests/*_adversary_test.rs" {
+		t.Errorf("Rust Adversary.Pattern = %q, want 'tests/*_adversary_test.rs'", got[0].Adversary.Pattern)
 	}
 	if len(got[0].Deps.Keep) != 1 || got[0].Deps.Keep[0] != "target" {
 		t.Errorf("Rust Deps.Keep = %v, want [target]", got[0].Deps.Keep)
