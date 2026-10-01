@@ -1,6 +1,12 @@
-# Arbiter Engine: Architecture & System Specification (v3.2)
+# Arbiter Engine: Architecture & System Specification (v3.3)
 
 A lean, local-first execution arbiter, task governor, and multi-agent coordination layer built on native Git primitives, embedded SQLite, and signed audit records.
+
+> **Changes from v3.2** (§5.3 warm slot implementation, PR #49):
+>
+> | Issue | Resolution | Section |
+> |---|---|---|
+> | The unseen-state check was described as a boundary, inviting endless same-user edge cases | Scoped as a tripwire: detect, restore what can be restored safely, log a violation. The `core.hooksPath` pin is what keeps hooks out of Arbiter's git commands; containment remains future OS-sandbox work | §5.3, §8.A, §9.A |
 
 > **Changes from v3.1** (§7 Process Supervision implementation, PR #48):
 >
@@ -633,6 +639,8 @@ Every relaunch in steps 2–6 increments the task's attempt counter; the ceiling
 
   Before any agent launch, the Runner records a snapshot: the lockfile hash, plus size and mtime for every file under the keep-list dirs, `.git/config`, and `.git/hooks/`. Before any test run (attack validation and integration gate) it compares against the snapshot. Changed dependency dirs are reinstalled from the lockfile; changed `.git` config or hooks are restored and logged as a violation against the seat. The liveness watcher (§7) already sees these writes, so the common case costs nothing. Separately, every git command Arbiter runs itself passes `-c core.hooksPath=<empty arbiter dir> -c core.fsmonitor=false`.
 
+  **Scope: a tripwire, not a boundary.** The check runs as the same OS user as the agent, after the agent exits, and only looks at the paths above. It catches accidental and naive tampering, restores what it can without writing outside the git dir, and flags the rest as a violation. An entry it can't safely restore (e.g. a pre-existing symlinked hook whose target changed) is removed, not rewritten. It does not stop an agent that writes elsewhere the user can (`~/.gitconfig`, shell startup files, files outside the repo), and it can't win races against a process that outlives the agent (§7). Two things carry the actual guarantees: the `core.hooksPath` / `core.fsmonitor` pin, which keeps planted hooks out of Arbiter's own git commands whatever the check finds, and reinstalling dependencies from the lockfile, which invalidates the slot's install record before wiping anything so an interrupted reinstall can't be skipped next time. Findings that need a hostile same-user process to exploit are out of scope here (§8.A) and belong to the OS-sandbox work (§11).
+
 ### 5.4 The Adversarial Reviewer & Attack Validation Protocol
 
 - **Rule:** never modifies application code. It may only add or modify files that match the adversary test pattern (§9.C) inside the PRD boundaries. Arbiter commits them on top of `submit_commit`, and the result is diff-checked like the worker's.
@@ -898,7 +906,7 @@ When an agent times out or crashes:
 Everything runs locally as one OS user. Any process running as that user can read memory, env vars, and files. Cryptography cannot stop a hostile local process, and this spec does not claim otherwise.
 
 **Defended against:**
-1. *Agent overreach:* scope creep, editing tests to pass (including patching ignored dependency dirs or planting git hooks), touching the PRD, self-grading. Enforced by submit-time diff checks, the unseen-state check (§5.3), per-role tool profiles (§9.A), planner-only seat minting, and role-restricted outcome authoring.
+1. *Agent overreach:* scope creep, editing tests to pass (including patching ignored dependency dirs or planting git hooks), touching the PRD, self-grading. Enforced by submit-time diff checks, the unseen-state check (§5.3; a tripwire for overreach, not containment), per-role tool profiles (§9.A), planner-only seat minting, and role-restricted outcome authoring.
 2. *Confused or prompt-injected agents* acting outside their role through Arbiter's own APIs. Seats are role- and task-bound and end with the task.
 3. *After-the-fact tampering* with history, attribution, or the outcome ledger: hash-chained ledger, signed commits and tags.
 4. *A compromised or remote core forging your approval:* the core never holds your key; human signatures are always produced client-side (§8.C).
@@ -1046,7 +1054,7 @@ claude -p --model <model> --output-format stream-json --verbose \
 | Adversary | same as Worker | Commit of adversary files + diff check |
 | Judge | `--tools "Read,Grep,Glob"` | Same assertion as the Ringleader |
 
-  `harness.shell_allow` (§9.C) lists the shell commands the edit roles may run, as Claude Code allow rules (e.g. `Bash(go test *)`); everything else is denied. The list doesn't stop a test file from running arbitrary code; the diff check and unseen-state check remain the boundary.
+  `harness.shell_allow` (§9.C) lists the shell commands the edit roles may run, as Claude Code allow rules (e.g. `Bash(go test *)`); everything else is denied. The list doesn't stop a test file from running arbitrary code; the diff check is the boundary for tracked files, and the unseen-state check is a tripwire for the rest (§5.3). Neither contains a hostile process (§8.A).
 
 **Result.** The model's final message must be exactly one JSON object; Arbiter strips a single surrounding code fence if present. It's validated against the schema for the invocation's `purpose`. Invalid output → **resume the same session once** with the validation error (the worker's edits are kept), then treat it as a crash (autopsy). Either way it counts as an attempt.
 

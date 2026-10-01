@@ -66,6 +66,22 @@ func TestCheckAdversaryPattern_KnownEcosystems(t *testing.T) {
 		{"node", "**/*.test.ts", false},
 		{"node", "**/*.spec.js", false},
 		{"node", "adversary.ts", true},
+
+		// rust — Cargo discovers tests/<name>.rs and tests/<dir>/main.rs only
+		{"rust", "tests/*_adversary_test.rs", false},
+		{"rust", "tests/adversary.rs", false},
+		{"rust", "tests/*/main.rs", false},
+		{"rust", "./tests/*_adversary_test.rs", false},
+		{"rust", "crates/core/tests/*_adversary_test.rs", false},
+		{"rust", "**/tests/*_adversary_test.rs", false},
+		{"rust", "tests/**/*_adversary_test.rs", true},
+		{"rust", "tests/**_adversary_test.rs", true},
+		{"rust", "tests/sub/adversary_test.rs", true},
+		{"rust", "tests/**/main.rs", true},
+		{"rust", "tests/adversary.txt", true},
+		{"rust", "**/*_adversary_test.rs", true},
+		{"rust", "src/adversary_test.rs", true},
+		{"rust", "adversary.rs", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.eco+"/"+tc.pattern, func(t *testing.T) {

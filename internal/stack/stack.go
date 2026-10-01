@@ -8,12 +8,16 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
+	"slices"
+
+	"github.com/BurntSushi/toml"
 )
 
 // Ecosystem is a detected project ecosystem.
 type Ecosystem struct {
-	Name string // matches internal/config's adversary-pattern-rule keys ("go", "node", "python")
+	Name string // matches internal/config's adversary-pattern-rule keys ("go", "node", "python", "rust")
 
 	Harness struct {
 		ShellAllow []string
@@ -49,6 +53,7 @@ var detectors = []marker{
 	{"pyproject.toml", pythonEcosystem},
 	{"requirements.txt", pythonEcosystem},
 	{"setup.py", pythonEcosystem},
+	{"Cargo.toml", rustEcosystem},
 }
 
 // Detect inspects dir for known lockfiles/manifests and returns every
@@ -70,6 +75,11 @@ func Detect(dir string) ([]Ecosystem, error) {
 		eco := d.build()
 		if seen[eco.Name] {
 			continue
+		}
+		if eco.Name == "rust" {
+			if err := setRustAdversaryPattern(dir, &eco); err != nil {
+				return nil, err
+			}
 		}
 		seen[eco.Name] = true
 		found = append(found, eco)
@@ -130,4 +140,88 @@ func pythonEcosystem() Ecosystem {
 	e.Deps.Lockfiles = []string{"requirements.txt"}
 	e.Deps.Keep = []string{".venv"}
 	return e
+}
+
+func rustEcosystem() Ecosystem {
+	var e Ecosystem
+	e.Name = "rust"
+	e.Harness.ShellAllow = []string{
+		"Bash(cargo test*)", "Bash(cargo build*)", "Bash(cargo check*)",
+		"Bash(git status*)", "Bash(git diff*)",
+		"PowerShell(cargo test*)", "PowerShell(cargo build*)", "PowerShell(cargo check*)",
+	}
+	e.Test.Build = "cargo test --no-run"
+	e.Test.All = "cargo test"
+	// Cargo selects integration tests by target name (--test <name>), not by
+	// file path, so neither documented placeholder ({files}, {packages}) fits.
+	// Run the full suite for subsets: a superset is always correct.
+	e.Test.Files = "cargo test"
+	e.Test.Reporter = "tap"
+	e.Adversary.Pattern = "tests/*_adversary_test.rs"
+	e.Deps.Install = "cargo fetch"
+	e.Deps.Lockfiles = []string{"Cargo.lock"}
+	e.Deps.Keep = []string{"target"}
+	return e
+}
+
+// cargoManifest is the subset of Cargo.toml needed to tell a virtual
+// workspace (a [workspace] with no [package]) from a package manifest.
+type cargoManifest struct {
+	Package   *struct{} `toml:"package"`
+	Workspace *struct {
+		Members        []string `toml:"members"`
+		DefaultMembers []string `toml:"default-members"`
+		Exclude        []string `toml:"exclude"`
+	} `toml:"workspace"`
+}
+
+// readCargoManifest decodes the Cargo.toml at file, reporting false if it
+// can't be read or parsed.
+func readCargoManifest(file string) (cargoManifest, bool) {
+	var m cargoManifest
+	_, err := toml.DecodeFile(file, &m)
+	return m, err == nil
+}
+
+// setRustAdversaryPattern points e's adversary pattern at a member crate's
+// tests/ dir when dir's Cargo.toml is a virtual workspace: Cargo builds no
+// package at the workspace root, so a root tests/ dir would never run. The
+// member is the first one `cargo test` runs from the root (default-members,
+// else members). A manifest that doesn't parse keeps the root default;
+// cargo itself will report that error.
+func setRustAdversaryPattern(dir string, e *Ecosystem) error {
+	m, ok := readCargoManifest(filepath.Join(dir, "Cargo.toml"))
+	if !ok || m.Package != nil || m.Workspace == nil {
+		return nil
+	}
+	candidates := m.Workspace.DefaultMembers
+	if len(candidates) == 0 {
+		candidates = m.Workspace.Members
+	}
+	for _, c := range candidates {
+		matches, err := filepath.Glob(filepath.Join(dir, filepath.FromSlash(c)))
+		if err != nil {
+			continue
+		}
+		slices.Sort(matches)
+		for _, mp := range matches {
+			rel, err := filepath.Rel(dir, mp)
+			if err != nil || !filepath.IsLocal(rel) {
+				continue
+			}
+			rel = filepath.ToSlash(rel)
+			if slices.ContainsFunc(m.Workspace.Exclude, func(x string) bool {
+				return path.Clean(filepath.ToSlash(x)) == rel
+			}) {
+				continue
+			}
+			if fi, err := os.Stat(filepath.Join(mp, "Cargo.toml")); err != nil || !fi.Mode().IsRegular() {
+				continue
+			}
+			e.Adversary.Pattern = rel + "/tests/*_adversary_test.rs"
+			return nil
+		}
+	}
+	return errors.New("stack: Cargo.toml is a virtual workspace with no resolvable member crate; " +
+		"add a member (or default-members) so arbiter init can place adversary tests in it")
 }
