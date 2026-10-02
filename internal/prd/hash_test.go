@@ -149,8 +149,8 @@ func TestSetArbiterFields(t *testing.T) {
 			if mustHash(t, string(out)) != mustHash(t, tc.src) {
 				t.Error("spec_hash changed")
 			}
-			if !strings.Contains(tc.src, "title:") {
-				return // not a complete PRD, nothing to parse
+			if !strings.Contains(tc.src, "title:") || tc.name == "after folded title" {
+				return // not a complete PRD (or multi-line, which Parse rejects): nothing to parse
 			}
 			p, err := Parse(out)
 			if err != nil {

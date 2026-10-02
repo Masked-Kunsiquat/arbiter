@@ -128,6 +128,12 @@ func parseFrontmatter(p *PRD, text string, errs *[]LineError) {
 	add := func(line int, format string, a ...any) {
 		*errs = append(*errs, LineError{line, fmt.Sprintf(format, a...)})
 	}
+	// Canonical and SetArbiterFields work line by line, so the frontmatter must
+	// have exactly the line layout they assume (§2.C).
+	if line := unicodeBreakLine(text); line != 0 {
+		add(line, "frontmatter must not contain U+0085, U+2028 or U+2029")
+		return
+	}
 	var doc yaml.Node
 	if err := yaml.Unmarshal([]byte(text), &doc); err != nil {
 		msg := strings.TrimPrefix(err.Error(), "yaml: ")
@@ -150,36 +156,12 @@ func parseFrontmatter(p *PRD, text string, errs *[]LineError) {
 		return
 	}
 
-	type field struct {
-		node *yaml.Node
-		line int
-	}
-	fields := map[string]field{}
-	m := doc.Content[0]
-	for i := 0; i+1 < len(m.Content); i += 2 {
-		k, v := m.Content[i], m.Content[i+1]
-		line := k.Line + 1
-		if k.Kind != yaml.ScalarNode {
-			add(line, "frontmatter keys must be plain strings")
-			continue
-		}
-		switch k.Value {
-		case "id", "title", "target_branch", "max_budget_usd", "status", "spec_hash", "created_by":
-		default:
-			add(line, "unknown frontmatter key %q", k.Value)
-			continue
-		}
-		if prev, dup := fields[k.Value]; dup {
-			add(line, "duplicate frontmatter key %q (first at line %d)", k.Value, prev.line)
-			continue
-		}
-		if v.Kind != yaml.ScalarNode {
-			add(line, "%s must be a scalar value", k.Value)
-			continue
-		}
-		fields[k.Value] = field{v, line}
+	if line, msg := checkLayout(doc.Content[0], text); msg != "" {
+		add(line, "%s", msg)
+		return
 	}
 
+	fields := collectFields(doc.Content[0], add)
 	str := func(key string) (string, int, bool) {
 		f, ok := fields[key]
 		if !ok {
@@ -247,6 +229,78 @@ func parseFrontmatter(p *PRD, text string, errs *[]LineError) {
 	}
 }
 
+// field is a frontmatter value and its file line.
+type field struct {
+	node *yaml.Node
+	line int
+}
+
+// collectFields returns the known top-level keys of m, reporting unknown,
+// duplicate and non-scalar entries.
+func collectFields(m *yaml.Node, add func(int, string, ...any)) map[string]field {
+	fields := map[string]field{}
+	for i := 0; i+1 < len(m.Content); i += 2 {
+		k, v := m.Content[i], m.Content[i+1]
+		line := k.Line + 1
+		if k.Kind != yaml.ScalarNode {
+			add(line, "frontmatter keys must be plain strings")
+			continue
+		}
+		switch k.Value {
+		case "id", "title", "target_branch", "max_budget_usd", "status", "spec_hash", "created_by":
+		default:
+			add(line, "unknown frontmatter key %q", k.Value)
+			continue
+		}
+		if prev, dup := fields[k.Value]; dup {
+			add(line, "duplicate frontmatter key %q (first at line %d)", k.Value, prev.line)
+			continue
+		}
+		if v.Kind != yaml.ScalarNode {
+			add(line, "%s must be a scalar value", k.Value)
+			continue
+		}
+		fields[k.Value] = field{v, line}
+	}
+	return fields
+}
+
+// unicodeBreakLine returns the file line of the first frontmatter line holding
+// a character YAML treats as a line break but Canonical doesn't, or 0.
+func unicodeBreakLine(text string) int {
+	for i, l := range strings.Split(text, "\n") {
+		if strings.ContainsFunc(l, func(r rune) bool { return r == 0x85 || r == 0x2028 || r == 0x2029 }) {
+			return i + 2
+		}
+	}
+	return 0
+}
+
+// checkLayout requires a block mapping whose keys are plain scalars at column
+// 1, each entry on its key's line, so that removing an entry's line (Canonical,
+// SetArbiterFields) removes exactly that entry. It returns the file line and
+// message of the first violation, or "".
+func checkLayout(m *yaml.Node, text string) (int, string) {
+	if m.Style&yaml.FlowStyle != 0 {
+		return m.Line + 1, "frontmatter must be a block mapping, not a flow mapping"
+	}
+	keyLines := map[int]bool{}
+	for i := 0; i < len(m.Content); i += 2 {
+		k := m.Content[i]
+		keyLines[k.Line] = true
+		if k.Kind == yaml.ScalarNode && (k.Style != 0 || k.Anchor != "" || k.Column != 1) {
+			return k.Line + 1, "frontmatter keys must be plain, untagged, unanchored scalars at the start of a line"
+		}
+	}
+	for i, l := range strings.Split(text, "\n") {
+		if t := strings.TrimSpace(l); t == "" || strings.HasPrefix(t, "#") || keyLines[i+1] {
+			continue
+		}
+		return i + 2, "frontmatter values must fit on one line (the key's line)"
+	}
+	return 0, ""
+}
+
 // badBranch explains why name is not an acceptable target branch, or "".
 func badBranch(name string) string {
 	switch {
@@ -308,16 +362,14 @@ func fenceCloses(line string, ch byte, n int) bool {
 	return c == ch && k >= n
 }
 
-// parseBody splits lines[from:] into sections and parses the four required ones.
-func parseBody(p *PRD, lines []string, from int, errs *[]LineError) {
-	add := func(line int, format string, a ...any) {
-		*errs = append(*errs, LineError{line, fmt.Sprintf(format, a...)})
-	}
-
+// splitSections splits lines[from:] into the recognized sections, skipping
+// headings inside code fences and HTML comments.
+func splitSections(lines []string, from int, add func(int, string, ...any)) map[string]*section {
 	sections := map[string]*section{}
 	var cur *section
 	var fenceCh byte
 	fenceN := 0
+	inComment := false // inside an HTML comment, which hides headings and fences
 	for i := from; i < len(lines); i++ {
 		line, no := lines[i], i+1
 		if fenceN > 0 {
@@ -329,14 +381,18 @@ func parseBody(p *PRD, lines []string, from int, errs *[]LineError) {
 			}
 			continue
 		}
-		if ch, n := fenceOpen(line); n > 0 {
-			fenceCh, fenceN = ch, n
-			if cur != nil {
-				cur.lines = append(cur.lines, secLine{no, line, 1})
+		wasIn := inComment
+		if !wasIn {
+			if ch, n := fenceOpen(line); n > 0 {
+				fenceCh, fenceN = ch, n
+				if cur != nil {
+					cur.lines = append(cur.lines, secLine{no, line, 1})
+				}
+				continue
 			}
-			continue
 		}
-		if m := headingRe.FindStringSubmatch(line); m != nil {
+		stripComments(line, &inComment)
+		if m := headingRe.FindStringSubmatch(line); m != nil && !wasIn {
 			cur = nil
 			text := strings.TrimSpace(numberingRe.ReplaceAllString(strings.TrimSpace(m[1]), ""))
 			lower := strings.ToLower(text)
@@ -364,6 +420,16 @@ func parseBody(p *PRD, lines []string, from int, errs *[]LineError) {
 			cur.lines = append(cur.lines, secLine{no, line, 0})
 		}
 	}
+	return sections
+}
+
+// parseBody splits lines[from:] into sections and parses the four required ones.
+func parseBody(p *PRD, lines []string, from int, errs *[]LineError) {
+	add := func(line int, format string, a ...any) {
+		*errs = append(*errs, LineError{line, fmt.Sprintf(format, a...)})
+	}
+
+	sections := splitSections(lines, from, add)
 
 	for _, k := range sectionKeywords {
 		if sections[k.name] == nil {

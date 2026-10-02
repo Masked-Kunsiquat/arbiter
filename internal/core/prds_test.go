@@ -146,7 +146,10 @@ func (e *prdEnv) setStatus(t *testing.T, status prd.Status) {
 	})
 }
 
-func (e *prdEnv) tags(t *testing.T) string { return gitIn(t, e.repo, "tag", "-l") }
+func (e *prdEnv) tags(t *testing.T) string {
+	t.Helper()
+	return gitIn(t, e.repo, "tag", "-l")
+}
 
 func TestPRDLock_RecordsRow(t *testing.T) {
 	e := newPRDEnv(t)
@@ -299,5 +302,25 @@ func TestPRDGet_UnknownAndBadID(t *testing.T) {
 	var re *ipc.RemoteError
 	if _, err := s.GetPRD(ctx, "nope"); !errors.As(err, &re) || re.Code != ipc.CodeBadParams {
 		t.Errorf("bad id: err = %v", err)
+	}
+}
+
+// If recording a lock in state.db failed after the tag was created, the
+// signed tag is authoritative: lock refuses (the tag exists) and amend
+// recreates the row.
+func TestPRDAmend_RecreatesMissingRow(t *testing.T) {
+	e := newPRDEnv(t)
+	e.commit(t, withCriteria(t, validPRD(t), "1"))
+	e.mustLock(t, false)
+	withDB(t, e.dir, func(raw *sql.DB) {
+		mustExec(t, raw, `DELETE FROM prds WHERE id = 'PRD-001'`)
+	})
+
+	if _, err := e.lock(false); err == nil || !strings.Contains(err.Error(), "amend") {
+		t.Fatalf("relock with a missing row: err = %v", err)
+	}
+	e.mustLock(t, true)
+	if st := e.get(t); st.Status != prd.StatusLocked || st.LockTag != "arbiter/prd/PRD-001/v2" {
+		t.Errorf("after repair: %+v", st)
 	}
 }

@@ -131,6 +131,8 @@ type pending struct {
 	tag      string
 	specHash any // string, or nil when no SpecHasher is set
 	prd      []byte
+	version  int
+	prior    [][]byte
 }
 
 // Service prepares and completes human-signed objects for one repository.
@@ -257,9 +259,9 @@ func (s *Service) PrepareLock(ctx context.Context, req LockRequest) (*Prepared, 
 		}
 		specHash = h
 	}
+	var prior [][]byte
 	if s.PRDs != nil {
-		prior, err := s.lockedVersions(ctx, req.PRDID, latest)
-		if err != nil {
+		if prior, err = s.lockedVersions(ctx, req.PRDID, latest); err != nil {
 			return nil, err
 		}
 		if err := s.PRDs.CheckLock(ctx, req.PRDID, version, []byte(prd), prior); err != nil {
@@ -275,6 +277,7 @@ func (s *Service) PrepareLock(ctx context.Context, req LockRequest) (*Prepared, 
 	return s.store(&pending{
 		kind: kindLock, payload: payload, ref: "refs/tags/" + tag, principal: req.Signer.Email, created: now,
 		signersAt: commit, prdID: req.PRDID, tag: tag, specHash: specHash, prd: []byte(prd),
+		version: version, prior: prior,
 	})
 }
 
@@ -462,6 +465,13 @@ func (s *Service) Complete(ctx context.Context, req CompleteRequest) (*Completed
 }
 
 func (s *Service) completeLock(ctx context.Context, p *pending, sig string) (*Completed, error) {
+	// The PRD may have changed state while the human was signing; a signed
+	// tag can't be taken back, so re-check before creating it.
+	if s.PRDs != nil {
+		if err := s.PRDs.CheckLock(ctx, p.prdID, p.version, p.prd, p.prior); err != nil {
+			return nil, err
+		}
+	}
 	sha, err := s.writeObject(ctx, "tag", AttachTagSig(p.payload, sig))
 	if err != nil {
 		return nil, err
@@ -471,22 +481,31 @@ func (s *Service) completeLock(ctx context.Context, p *pending, sig string) (*Co
 		return nil, fmt.Errorf("gitsign: creating %s: %w", p.ref, err)
 	}
 	done := &Completed{Ref: p.ref, ObjectSHA: sha}
-	if s.Ledger != nil {
-		payload := map[string]any{"tag": p.tag, "spec_hash": p.specHash, "tag_object_sha": sha}
-		if err := s.Ledger.Append(ctx, p.prdID, HumanSeat, "prd_lock", "", payload); err != nil {
-			return done, fmt.Errorf("gitsign: %s created, but recording prd_lock in the ledger failed: %w", p.ref, err)
-		}
-	}
+	// The tag exists, so record it everywhere we can: one failed write must
+	// not skip the other. A missing state.db row is repaired by
+	// `arbiter prd amend` (PRDStore.CheckLock accepts it once tags exist).
+	var errs []error
 	if s.PRDs != nil {
 		h, _ := p.specHash.(string)
 		if err := s.PRDs.RecordLock(ctx, p.prdID, p.tag, p.prd, h); err != nil {
-			return done, fmt.Errorf("gitsign: %s created, but recording the lock in state.db failed: %w", p.ref, err)
+			errs = append(errs, fmt.Errorf("gitsign: %s created, but recording the lock in state.db failed (arbiter prd amend %s repairs it): %w", p.ref, p.prdID, err))
 		}
 	}
-	return done, nil
+	if s.Ledger != nil {
+		payload := map[string]any{"tag": p.tag, "spec_hash": p.specHash, "tag_object_sha": sha}
+		if err := s.Ledger.Append(ctx, p.prdID, HumanSeat, "prd_lock", "", payload); err != nil {
+			errs = append(errs, fmt.Errorf("gitsign: %s created, but recording prd_lock in the ledger failed: %w", p.ref, err))
+		}
+	}
+	return done, errors.Join(errs...)
 }
 
 func (s *Service) completeMerge(ctx context.Context, p *pending, sig string) (*Completed, error) {
+	if s.PRDs != nil {
+		if err := s.PRDs.CheckMerge(ctx, p.prdID); err != nil {
+			return nil, err
+		}
+	}
 	header, err := s.sigHeader(ctx)
 	if err != nil {
 		return nil, err

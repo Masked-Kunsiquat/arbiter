@@ -480,6 +480,7 @@ type fakePRDs struct {
 	lockErr    error
 	recorded   []string // tag + " " + spec hash
 	recordedPR [][]byte
+	recordErr  error
 	mergeErr   error
 	merges     []string
 	merged     []string
@@ -494,7 +495,7 @@ func (f *fakePRDs) CheckLock(_ context.Context, _ string, n int, _ []byte, prior
 func (f *fakePRDs) RecordLock(_ context.Context, _, tag string, prd []byte, specHash string) error {
 	f.recorded = append(f.recorded, tag+" "+specHash)
 	f.recordedPR = append(f.recordedPR, prd)
-	return nil
+	return f.recordErr
 }
 
 func (f *fakePRDs) CheckMerge(_ context.Context, prdID string) error {
@@ -525,7 +526,8 @@ func TestPRDStoreLockHooks(t *testing.T) {
 	if _, err := svc.Complete(ctx, CompleteRequest{RequestID: prep.RequestID, Signature: key.sign(t, prep.Payload)}); err != nil {
 		t.Fatal(err)
 	}
-	if len(prds.lockN) != 1 || prds.lockN[0] != 1 || len(prds.lockPrior[0]) != 0 {
+	// Checked at prepare and again just before the tag is created.
+	if len(prds.lockN) != 2 || prds.lockN[0] != 1 || prds.lockN[1] != 1 || len(prds.lockPrior[0]) != 0 || len(prds.lockPrior[1]) != 0 {
 		t.Errorf("first lock: n=%v prior=%q", prds.lockN, prds.lockPrior)
 	}
 	wantHash, _ := fakeHasher{}.SpecHash([]byte(v1))
@@ -541,7 +543,7 @@ func TestPRDStoreLockHooks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(prds.lockN) != 2 || prds.lockN[1] != 2 || len(prds.lockPrior[1]) != 1 || string(prds.lockPrior[1][0]) != v1 {
+	if len(prds.lockN) != 3 || prds.lockN[2] != 2 || len(prds.lockPrior[2]) != 1 || string(prds.lockPrior[2][0]) != v1 {
 		t.Errorf("amend: n=%v prior=%q", prds.lockN, prds.lockPrior)
 	}
 	if _, err := svc.Complete(ctx, CompleteRequest{RequestID: prep.RequestID, Signature: key.sign(t, prep.Payload)}); err != nil {
@@ -549,6 +551,50 @@ func TestPRDStoreLockHooks(t *testing.T) {
 	}
 	if len(prds.recorded) != 2 || !strings.HasPrefix(prds.recorded[1], "arbiter/prd/PRD-001/v2 ") || string(prds.recordedPR[1]) != v2 {
 		t.Errorf("RecordLock after amend = %q", prds.recorded)
+	}
+}
+
+// A state change while the human signs (the re-check in Complete fails)
+// must not leave a signed tag behind.
+func TestPRDStoreRecheckAtComplete(t *testing.T) {
+	ctx := context.Background()
+	key := newTestKey(t, 1)
+	svc, repo := newRepo(t, key)
+	prds := &fakePRDs{}
+	svc.PRDs = prds
+	prep, err := svc.PrepareLock(ctx, LockRequest{PRDID: "PRD-001", Signer: key.signerInfo()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prds.lockErr = errors.New("PRD-001 is executing")
+	if _, err := svc.Complete(ctx, CompleteRequest{RequestID: prep.RequestID, Signature: key.sign(t, prep.Payload)}); err == nil || !strings.Contains(err.Error(), "executing") {
+		t.Fatalf("Complete = %v", err)
+	}
+	if tags := run(t, repo, "tag", "-l"); tags != "" {
+		t.Errorf("tags = %q", tags)
+	}
+	if len(prds.recorded) != 0 {
+		t.Errorf("RecordLock = %q", prds.recorded)
+	}
+}
+
+// A failed state.db record must not also lose the prd_lock ledger entry.
+func TestPRDStoreRecordErrorStillLedgers(t *testing.T) {
+	ctx := context.Background()
+	key := newTestKey(t, 1)
+	svc, _ := newRepo(t, key)
+	led := &fakeLedger{}
+	svc.Ledger, svc.PRDs = led, &fakePRDs{recordErr: errors.New("database is locked")}
+	prep, err := svc.PrepareLock(ctx, LockRequest{PRDID: "PRD-001", Signer: key.signerInfo()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done, err := svc.Complete(ctx, CompleteRequest{RequestID: prep.RequestID, Signature: key.sign(t, prep.Payload)})
+	if err == nil || !strings.Contains(err.Error(), "database is locked") || done == nil {
+		t.Fatalf("Complete = %v, %v", done, err)
+	}
+	if len(led.entries) != 1 {
+		t.Errorf("ledger entries = %d, want 1", len(led.entries))
 	}
 }
 

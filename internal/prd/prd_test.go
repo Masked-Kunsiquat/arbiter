@@ -297,3 +297,60 @@ func TestBoundaryMatch(t *testing.T) {
 		}
 	}
 }
+
+const frontmatterBody = "## Intent\nx\n## Invariants\n- [INVARIANT-1] a\n## File Boundaries\n- `a/**`\n## Acceptance Criteria\n- [ ] AC-1: a\n"
+
+// Frontmatter whose line layout Canonical and SetArbiterFields can't rely on
+// is rejected, so distinct content can't share a spec_hash.
+func TestParseFrontmatterLayout(t *testing.T) {
+	const req = "id: PRD-001\ntitle: T\ntarget_branch: feat/x\n"
+	tests := []struct {
+		name, fm string
+	}{
+		{"nel", req + "status: draft\u0085target_branch: aaa\n"},
+		{"line separator", req + "created_by: a b\n"},
+		{"paragraph separator", req + "created_by: a b\n"},
+		{"flow mapping", "{id: PRD-001, title: x,\nstatus: draft, target_branch: aaa}\n"},
+		{"multi-line double quote", req + "created_by: \"Foo\nstatus: bar\"\n"},
+		{"multi-line single quote", req + "created_by: 'Foo\nstatus: bar'\n"},
+		{"literal block", req + "created_by: |\n  Foo\n"},
+		{"quoted key", req + "\"status\": draft\n"},
+		{"explicit key", req + "? status\n: draft\n"},
+		{"tagged key", req + "!!str status: draft\n"},
+		{"anchored key", req + "&a status: draft\n"},
+		{"indented mapping", " id: PRD-001\n title: T\n target_branch: feat/x\n"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			src := "---\n" + tc.fm + "---\n" + frontmatterBody
+			if errs := parseErrs(t, src); len(errs) == 0 {
+				t.Errorf("Parse accepted:\n%s", src)
+			}
+		})
+	}
+	ok := "---\n# a comment\n" + req + "\nstatus: draft # trailing\n---\n" + frontmatterBody
+	if errs := parseErrs(t, ok); errs != nil {
+		t.Errorf("normal frontmatter rejected: %v", errs)
+	}
+}
+
+// A heading inside an HTML comment is not a heading; comment state survives
+// across what would otherwise be headings.
+func TestParseCommentHidesHeadings(t *testing.T) {
+	src := minimal("Why.\n<!--\n## Invariants\n-->\nstill intent", okInv, okBound, okAC)
+	p, err := Parse([]byte(src))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if !strings.Contains(p.Intent, "still intent") || strings.Contains(p.Intent, "Invariants") {
+		t.Errorf("Intent = %q", p.Intent)
+	}
+	if len(p.Invariants) != 1 {
+		t.Errorf("invariants = %+v", p.Invariants)
+	}
+	// An unterminated comment swallows the following would-be headings.
+	errs := parseErrs(t, minimal("Why. <!-- open", okInv, okBound, okAC))
+	if !hasErr(errs, 0, "missing required section: ## Invariants") {
+		t.Errorf("errs = %v", errs)
+	}
+}

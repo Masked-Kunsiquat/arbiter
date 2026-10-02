@@ -270,9 +270,103 @@ func humanSigner(ctx context.Context, root string) (gitsign.Signer, core.SignFun
 	}, hs.Sign, nil
 }
 
-// prdLock implements `prd lock` and `prd amend` (§2.A): record status,
-// spec_hash and created_by in the file, commit only that file, then have the
-// core prepare the tag for the human's key to sign.
+// lockedVersionCount returns the highest canonical n among the lock tags
+// arbiter/prd/<id>/v<n>, 0 if the PRD was never locked.
+func lockedVersionCount(ctx context.Context, root, id string) (int, error) {
+	prefix := "refs/tags/arbiter/prd/" + id + "/"
+	refs, err := git(ctx, root, "for-each-ref", "--format=%(refname)", prefix)
+	if err != nil {
+		return 0, err
+	}
+	latest := 0
+	for line := range strings.Lines(refs) {
+		// Only canonical suffixes count: v+9 or v09 would otherwise parse.
+		suffix := strings.TrimPrefix(strings.TrimSpace(line), prefix+"v")
+		if n, err := strconv.Atoi(suffix); err == nil && strconv.Itoa(n) == suffix {
+			latest = max(latest, n)
+		}
+	}
+	return latest, nil
+}
+
+// prdLockPlan runs every check that can fail before `prd lock`/`prd amend`
+// writes or commits anything, and returns the file content to commit. status
+// is the core's current status for the PRD ("" if it has no row yet).
+func prdLockPlan(ctx context.Context, root string, a prdArgs, src []byte, p *prd.PRD, status prd.Status, errOut io.Writer) ([]byte, error) {
+	verb := a.Sub
+	rel := prdRelPath(a.ID)
+	amend := a.Sub == "amend"
+	// An amend with no row is fine: the core recreates it.
+	if !amend || status != "" {
+		from := status
+		if from == "" {
+			from = prd.StatusDraft
+		}
+		if !prd.CanTransition(from, prd.StatusLocked) {
+			return nil, fmt.Errorf("arbiter prd %s: %s is %s; it cannot move to locked", verb, a.ID, from)
+		}
+	}
+
+	n, err := lockedVersionCount(ctx, root, a.ID)
+	if err != nil {
+		return nil, fmt.Errorf("arbiter prd %s: %w", verb, err)
+	}
+	switch {
+	case !amend && n > 0:
+		return nil, fmt.Errorf("arbiter prd lock: %s is already locked; use prd amend", a.ID)
+	case amend && n == 0:
+		return nil, fmt.Errorf("arbiter prd amend: %s has no lock tag; use prd lock", a.ID)
+	}
+	if amend {
+		prior := make([]*prd.PRD, 0, n)
+		for v := 1; v <= n; v++ {
+			tag := fmt.Sprintf("refs/tags/arbiter/prd/%s/v%d", a.ID, v)
+			blob, err := git(ctx, root, "cat-file", "blob", tag+"^{commit}:"+rel)
+			if err != nil {
+				return nil, fmt.Errorf("arbiter prd amend: %w", err)
+			}
+			pp, err := prd.Parse([]byte(blob))
+			if err != nil {
+				return nil, fmt.Errorf("arbiter prd amend: locked version v%d does not parse: %w", v, err)
+			}
+			prior = append(prior, pp)
+		}
+		if err := prd.CheckAmendment(prior, p); err != nil {
+			lines := formatLineErrors(rel, err)
+			for _, l := range lines {
+				fmt.Fprintln(errOut, l)
+			}
+			return nil, fmt.Errorf("arbiter prd amend: %s conflicts with its locked history (%d problem(s))", rel, len(lines))
+		}
+	}
+
+	hash, err := prd.SpecHash(src)
+	if err != nil {
+		return nil, fmt.Errorf("arbiter prd %s: %w", verb, err)
+	}
+	createdBy := p.CreatedBy
+	if createdBy == "" {
+		if cfg, err := humansig.LoadConfig(ctx, root); err == nil && cfg.Name != "" {
+			createdBy = "human:" + cfg.Name
+		}
+	}
+	out, err := prd.SetArbiterFields(src, prd.ArbiterFields{Status: prd.StatusLocked, SpecHash: hash, CreatedBy: createdBy})
+	if err != nil {
+		return nil, fmt.Errorf("arbiter prd %s: %w", verb, err)
+	}
+	if _, err := prd.Parse(out); err != nil {
+		return nil, fmt.Errorf("arbiter prd %s: the locked file would not parse: %w", verb, err)
+	}
+	if got, err := prd.SpecHash(out); err != nil || got != hash {
+		return nil, fmt.Errorf("arbiter prd %s: recording the lock fields would change spec_hash", verb)
+	}
+	return out, nil
+}
+
+// prdLock implements `prd lock` and `prd amend` (§2.A): check everything that
+// can fail first, then record status, spec_hash and created_by in the file,
+// commit only that file, and have the core prepare the tag for the human's
+// key to sign.
 func prdLock(ctx context.Context, root string, a prdArgs) error {
 	verb, subject := "lock", "Lock"
 	if a.Sub == "amend" {
@@ -284,26 +378,29 @@ func prdLock(ctx context.Context, root string, a prdArgs) error {
 	}
 	rel := prdRelPath(a.ID)
 
-	hash, err := prd.SpecHash(src)
+	signer, sign, err := humanSigner(ctx, root)
 	if err != nil {
 		return fmt.Errorf("arbiter prd %s: %w", verb, err)
 	}
-	createdBy := p.CreatedBy
-	if createdBy == "" {
-		if cfg, err := humansig.LoadConfig(ctx, root); err == nil && cfg.Name != "" {
-			createdBy = "human:" + cfg.Name
-		}
+	sess, err := connectCore(ctx)
+	if err != nil {
+		return err
 	}
-	out, err := prd.SetArbiterFields(src, prd.ArbiterFields{Status: prd.StatusLocked, SpecHash: hash, CreatedBy: createdBy})
+	defer sess.Close()
+	st, err := sess.GetPRD(ctx, a.ID)
 	if err != nil {
 		return fmt.Errorf("arbiter prd %s: %w", verb, err)
 	}
+	out, err := prdLockPlan(ctx, root, a, src, p, st.Status, os.Stderr)
+	if err != nil {
+		return err
+	}
+
 	if !bytes.Equal(out, src) {
 		if err := os.WriteFile(path, out, 0o644); err != nil {
 			return fmt.Errorf("arbiter prd %s: %w", verb, err)
 		}
 	}
-
 	if _, err := git(ctx, root, "add", "--", rel); err != nil {
 		return fmt.Errorf("arbiter prd %s: %w", verb, err)
 	}
@@ -318,15 +415,6 @@ func prdLock(ctx context.Context, root string, a prdArgs) error {
 		}
 	}
 
-	signer, sign, err := humanSigner(ctx, root)
-	if err != nil {
-		return fmt.Errorf("arbiter prd %s: %w", verb, err)
-	}
-	sess, err := connectCore(ctx)
-	if err != nil {
-		return err
-	}
-	defer sess.Close()
 	done, err := sess.LockPRD(ctx, gitsign.LockRequest{PRDID: a.ID, Amend: a.Sub == "amend", Signer: signer}, sign)
 	if err != nil {
 		return fmt.Errorf("arbiter prd %s: %w", verb, err)

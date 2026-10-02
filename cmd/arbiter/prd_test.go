@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -188,5 +189,98 @@ func TestPRDLockInvalidMakesNoCommit(t *testing.T) {
 	}
 	if tags := gitT(t, repo, "tag", "-l"); tags != "" {
 		t.Errorf("tags = %q", tags)
+	}
+}
+
+// lockTestPRD is a valid PRD with the given acceptance criteria lines.
+func lockTestPRD(criteria ...string) string {
+	return "---\nid: PRD-001\ntitle: T\ntarget_branch: feat/x\n---\n## Intent\nDo it.\n## Invariants\n- [INVARIANT-1] Be safe.\n" +
+		"## File Boundaries\n- `src/**`\n## Acceptance Criteria\n" + strings.Join(criteria, "\n") + "\n"
+}
+
+// commitLockTestPRD commits content as the PRD file and, if tag is set, points
+// a lightweight lock tag at the commit.
+func commitLockTestPRD(t *testing.T, repo, content, tag string) {
+	t.Helper()
+	path := filepath.Join(repo, ".arbiter", "prds", "PRD-001.md")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitT(t, repo, "add", ".")
+	gitT(t, repo, "commit", "-q", "-m", "prd")
+	if tag != "" {
+		gitT(t, repo, "tag", tag)
+	}
+}
+
+// Every check that can fail runs before the lock writes or commits anything.
+func TestPRDLockPlanChecksBeforeWriting(t *testing.T) {
+	repo := gitRepo(t)
+	ctx := context.Background()
+	const ac1, ac2 = "- [ ] AC-1: One.", "- [ ] AC-2: Two."
+	commitLockTestPRD(t, repo, lockTestPRD(ac1, ac2), "arbiter/prd/PRD-001/v1")
+	commitLockTestPRD(t, repo, lockTestPRD(ac1), "arbiter/prd/PRD-001/v2")
+	// The working copy reuses AC-2, which v2 retired.
+	reuse := lockTestPRD(ac1, ac2, "- [ ] AC-3: Three.")
+	commitLockTestPRD(t, repo, reuse, "")
+	head := gitT(t, repo, "rev-parse", "HEAD")
+
+	plan := func(sub string, status prd.Status, content string) ([]byte, string, error) {
+		t.Helper()
+		p, err := prd.Parse([]byte(content))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var errOut bytes.Buffer
+		out, err := prdLockPlan(ctx, repo, prdArgs{Sub: sub, ID: "PRD-001"}, []byte(content), p, status, &errOut)
+		return out, errOut.String(), err
+	}
+
+	if _, stderr, err := plan("amend", prd.StatusLocked, reuse); err == nil || !strings.Contains(stderr, "retired") {
+		t.Errorf("amend reusing a retired ID: err = %v, stderr = %q", err, stderr)
+	}
+	if _, _, err := plan("lock", prd.StatusDraft, reuse); err == nil || !strings.Contains(err.Error(), "already locked; use prd amend") {
+		t.Errorf("lock of a locked PRD: err = %v", err)
+	}
+	if _, _, err := plan("amend", prd.StatusArchived, lockTestPRD(ac1)); err == nil || !strings.Contains(err.Error(), "cannot move to locked") {
+		t.Errorf("amend of an archived PRD: err = %v", err)
+	}
+	if got := gitT(t, repo, "rev-parse", "HEAD"); got != head {
+		t.Errorf("HEAD moved from %s to %s", head, got)
+	}
+	if st := gitT(t, repo, "status", "--porcelain"); st != "" {
+		t.Errorf("worktree changed:\n%s", st)
+	}
+
+	// A clean amendment (new ID above the highest, empty status) passes and
+	// yields a file that parses with the same spec_hash.
+	good := lockTestPRD(ac1, "- [ ] AC-3: Three.")
+	out, _, err := plan("amend", "", good)
+	if err != nil {
+		t.Fatalf("clean amend: %v", err)
+	}
+	if p, err := prd.Parse(out); err != nil || p.Status != prd.StatusLocked {
+		t.Errorf("planned file: %+v, %v", p, err)
+	}
+}
+
+// A first lock of a draft PRD passes the plan.
+func TestPRDLockPlanFirstLock(t *testing.T) {
+	repo := gitRepo(t)
+	good := lockTestPRD("- [ ] AC-1: One.")
+	commitLockTestPRD(t, repo, good, "")
+	p, err := prd.Parse([]byte(good))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := prdLockPlan(context.Background(), repo, prdArgs{Sub: "lock", ID: "PRD-001"}, []byte(good), p, "", io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out), "status: locked") {
+		t.Errorf("planned file lacks status: locked:\n%s", out)
 	}
 }

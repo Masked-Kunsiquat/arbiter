@@ -81,10 +81,10 @@ func (s prdStore) CheckLock(ctx context.Context, prdID string, n int, content []
 		}
 		return nil
 	}
-	if st.Status == "" {
-		return fmt.Errorf("core: %s has lock tags but no row in state.db", prdID)
-	}
-	if !prd.CanTransition(st.Status, prd.StatusLocked) {
+	// A missing row with lock tags means recording an earlier lock failed
+	// (or state.db was rebuilt); the signed tags are authoritative, and
+	// RecordLock recreates the row from this amendment.
+	if st.Status != "" && !prd.CanTransition(st.Status, prd.StatusLocked) {
 		return fmt.Errorf("core: %s is %s; it can be amended only while locked or amendment_needed (§2.A)", prdID, st.Status)
 	}
 	versions := make([]*prd.PRD, 0, len(prior))
@@ -120,7 +120,7 @@ func (s prdStore) RecordLock(ctx context.Context, prdID, tag string, content []b
 			title = excluded.title, file_path = excluded.file_path, spec_hash = excluded.spec_hash,
 			lock_tag = excluded.lock_tag, status = 'locked', target_branch = excluded.target_branch,
 			max_budget_usd = excluded.max_budget_usd, updated_at = CURRENT_TIMESTAMP
-		WHERE prds.status IN ('draft', 'locked', 'amendment_needed')`,
+		WHERE prds.status IN ('draft', 'locked', 'amendment_needed')`, // keep in step with prd.CanTransition(·, locked)
 		prdID, p.Title, prdPath(prdID), specHash, tag, p.TargetBranch, p.MaxBudgetUSD)
 	if err != nil {
 		return fmt.Errorf("core: recording %s: %w", tag, err)
