@@ -139,7 +139,7 @@ func pinFor(entries []ledger.Entry) gitsign.LedgerPin {
 }
 
 func msgFor(pin gitsign.LedgerPin) string {
-	return "task merge\n\nArbiter-PRD: PRD-001@v1 (tag arbiter/prd/PRD-001/v1)\nArbiter-Ledger: " + pin.String() + "\n"
+	return "task merge\n\nArbiter-PRD: PRD-001@v1 (tag arbiter/prd/PRD-001/v1)\nArbiter-Task: TASK-1 (spec rev 1)\nArbiter-Ledger: " + pin.String() + "\n"
 }
 
 func verify(t *testing.T, r *repo) *Report {
@@ -238,7 +238,7 @@ func TestVerifyFailures(t *testing.T) {
 				r.commit(t, msgFor(pinFor(rogueChain)), sup)
 			},
 			in:     func(rep *Report) []Result { return append(rep.Commits, rep.Ledgers...) },
-			substr: "no line for key",
+			substr: "doesn't mark as Arbiter's",
 		},
 		{
 			name: "commit signed by unknown key",
@@ -275,6 +275,61 @@ func TestVerifyFailures(t *testing.T) {
 			substr: "signature",
 		},
 	}
+	tests = append(tests, []struct {
+		name   string
+		setup  func(t *testing.T, r *repo)
+		in     func(*Report) []Result
+		substr string
+	}{
+		{
+			name: "truncated by a later unsigned commit",
+			setup: func(t *testing.T, r *repo) {
+				t.Helper()
+				r.write(t, ".arbiter/ledger/PRD-001.jsonl", good)
+				r.commit(t, msgFor(pinFor(chain)), sup)
+				r.write(t, ".arbiter/ledger/PRD-001.jsonl", jsonl(t, chain[:2]))
+				r.commit(t, "drop the tail", nil)
+			},
+			in:     func(rep *Report) []Result { return rep.Ledgers },
+			substr: "truncated or rewritten",
+		},
+		{
+			name: "deleted by a later commit",
+			setup: func(t *testing.T, r *repo) {
+				t.Helper()
+				r.write(t, ".arbiter/ledger/PRD-001.jsonl", good)
+				r.commit(t, msgFor(pinFor(chain)), sup)
+				if err := os.Remove(filepath.Join(r.dir, ".arbiter", "ledger", "PRD-001.jsonl")); err != nil {
+					t.Fatal(err)
+				}
+				r.commit(t, "delete the ledger", nil)
+			},
+			in:     func(rep *Report) []Result { return rep.Ledgers },
+			substr: "missing at the tip",
+		},
+		{
+			name: "final merge signed by the supervisor",
+			setup: func(t *testing.T, r *repo) {
+				t.Helper()
+				r.write(t, ".arbiter/ledger/PRD-001.jsonl", good)
+				r.commit(t, "Merge\n\nArbiter-PRD: PRD-001@v1 (tag arbiter/prd/PRD-001/v1)\nArbiter-Ledger: "+pinFor(chain).String()+"\n", sup)
+			},
+			in:     func(rep *Report) []Result { return rep.Commits },
+			substr: "not a human",
+		},
+		{
+			name: "ledger signed by a human key without namespaces",
+			setup: func(t *testing.T, r *repo) {
+				t.Helper()
+				r.write(t, ".arbiter/ledger/allowed_signers", signersFile(sup, human)+allowedsigners.FormatLine("other@example.com", nil, rogue.PublicKey())+"\n")
+				rogueChain := buildChain(t, rogue, 1)
+				r.write(t, ".arbiter/ledger/PRD-001.jsonl", jsonl(t, rogueChain))
+				r.commit(t, msgFor(pinFor(rogueChain)), sup)
+			},
+			in:     func(rep *Report) []Result { return rep.Ledgers },
+			substr: "doesn't mark as Arbiter's",
+		},
+	}...)
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			r := newRepo(t, sup)
@@ -283,6 +338,24 @@ func TestVerifyFailures(t *testing.T) {
 			rep := verify(t, r)
 			wantFail(t, rep, tc.in(rep), tc.substr)
 		})
+	}
+}
+
+// Run from a subdirectory, the audit must still find the tip's ledgers.
+func TestVerifyFromSubdirectory(t *testing.T) {
+	sup, human := newSigner(t, 1), newSigner(t, 2)
+	r := newRepo(t, sup)
+	chain := buildChain(t, sup, 2)
+	r.write(t, ".arbiter/ledger/allowed_signers", signersFile(sup, human))
+	r.write(t, ".arbiter/ledger/PRD-001.jsonl", jsonl(t, chain))
+	r.write(t, "src/main.go", "package main\n")
+	r.commit(t, msgFor(pinFor(chain)), sup)
+	rep, err := Verify(context.Background(), filepath.Join(r.dir, "src"), "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rep.OK() || len(rep.Ledgers) != 1 {
+		t.Fatalf("commits=%v ledgers=%v", rep.Commits, rep.Ledgers)
 	}
 }
 

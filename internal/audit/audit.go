@@ -1,7 +1,9 @@
 // Package audit implements `arbiter audit verify` (spec §8.D "Verification"). It reads git
 // only: commit signatures are checked against allowed_signers, every committed ledger chain is
 // recomputed and its entries' signatures verified, and each Arbiter-Ledger trailer must pin
-// exactly the head of the chain committed alongside it (which is what catches truncation).
+// exactly the head of the chain committed alongside it. The tip's ledger files must still
+// contain every head pinned anywhere in its history, so a later commit can't truncate, rewrite
+// or delete a pinned chain (§8.D: truncating the tail breaks the signature that pinned it).
 //
 // The verifying keys come from one allowed_signers file: the one committed at the audited tip.
 // Never the working tree, and never a per-commit copy (a commit could otherwise authorize its
@@ -13,8 +15,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os/exec"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -57,6 +61,12 @@ func (r *Report) OK() bool {
 // missing allowed_signers, git failing); verification failures land in the Report.
 func Verify(ctx context.Context, repoDir, rev string) (*Report, error) {
 	g := gitRunner{dir: repoDir}
+	// Paths below are repo-relative, so run every command from the top level.
+	top, err := g.run(ctx, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return nil, fmt.Errorf("audit: not in a git repository: %w", err)
+	}
+	g.dir = strings.TrimSpace(string(top))
 	out, err := g.run(ctx, "rev-parse", "--verify", "--end-of-options", rev+"^{commit}")
 	if err != nil {
 		return nil, fmt.Errorf("audit: resolve %q: %w", rev, err)
@@ -71,7 +81,7 @@ func Verify(ctx context.Context, repoDir, rev string) (*Report, error) {
 	if err != nil {
 		return nil, fmt.Errorf("audit: %s at %.8s: %w", signersPath, tip, err)
 	}
-	v := &verifier{g: g, signers: signers}
+	v := &verifier{g: g, signers: signers, pins: map[gitsign.LedgerPin]string{}}
 
 	out, err = g.run(ctx, "log", "--format=%H", "-E", "--grep=^Arbiter-(PRD|Ledger): ", tip)
 	if err != nil {
@@ -83,23 +93,54 @@ func Verify(ctx context.Context, repoDir, rev string) (*Report, error) {
 		rep.Commits = append(rep.Commits, Result{Subject: subject, Err: err})
 	}
 
-	out, err = g.run(ctx, "ls-tree", "-z", "--name-only", tip, "--", ledgerDir)
+	out, err = g.run(ctx, "ls-tree", "-z", "--full-tree", "--name-only", tip, "--", ledgerDir)
 	if err != nil {
 		return nil, fmt.Errorf("audit: list ledgers: %w", err)
 	}
+	atTip := map[string]bool{}
 	for _, path := range strings.Split(string(out), "\x00") {
 		if !strings.HasSuffix(path, ".jsonl") {
 			continue
 		}
-		_, _, err := v.chain(ctx, tip, path)
+		atTip[path] = true
+		entries, err := v.chain(ctx, tip, path)
+		if err == nil {
+			err = v.checkPins(path, entries)
+		}
 		rep.Ledgers = append(rep.Ledgers, Result{Subject: path, Err: err})
 	}
+	// A pinned chain deleted since: nothing at the tip vouches for the pinned entries.
+	missing := map[string]string{}
+	for pin, by := range v.pins {
+		if !atTip[pin.Path] {
+			missing[pin.Path] = by
+		}
+	}
+	for _, path := range slices.Sorted(maps.Keys(missing)) {
+		rep.Ledgers = append(rep.Ledgers, Result{Subject: path, Err: fmt.Errorf("pinned by %s but missing at the tip", missing[path])})
+	}
 	return rep, nil
+}
+
+// checkPins requires the tip's chain at path to still hold every head pinned for it: at least
+// pin.Seq entries, with entry pin.Seq hashing to pin.Hash. The chain links make that entry
+// vouch for everything before it.
+func (v *verifier) checkPins(path string, entries []ledger.Entry) error {
+	for pin, by := range v.pins {
+		if pin.Path != path {
+			continue
+		}
+		if int64(len(entries)) < pin.Seq || entries[pin.Seq-1].EntryHash != pin.Hash {
+			return fmt.Errorf("does not contain seq %d sha256:%s pinned by %s (truncated or rewritten since)", pin.Seq, pin.Hash, by)
+		}
+	}
+	return nil
 }
 
 type verifier struct {
 	g       gitRunner
 	signers *allowedsigners.File
+	pins    map[gitsign.LedgerPin]string // every verified pin -> the commit that pinned it
 }
 
 var committerRe = regexp.MustCompile(`^committer .* <([^<>]*)> (\d+) [+-]\d{4}$`)
@@ -129,6 +170,11 @@ func (v *verifier) commit(ctx context.Context, sha string) (string, error) {
 	}
 	at := time.Unix(c.committed, 0)
 	if v.signers.IsSupervisorKey(sig.PublicKey) {
+		// The final merge (Arbiter-PRD without Arbiter-Task) is the human's approval (§8.C);
+		// the supervisor signs task and export commits only.
+		if hasTrailer(c.message, "Arbiter-PRD") && !hasTrailer(c.message, "Arbiter-Task") {
+			return subject, errors.New("final merge is signed by Arbiter's supervisor key, not a human")
+		}
 		// The supervisor's principal (arbiter@<host>) is not the committer's email.
 		err = v.signers.AuthorizeKey(gitsign.Namespace, sig.PublicKey, at)
 	} else {
@@ -145,47 +191,71 @@ func (v *verifier) commit(ctx context.Context, sha string) (string, error) {
 		return subject, err
 	}
 	for _, pin := range pins {
-		seq, head, err := v.chain(ctx, sha, pin.Path)
+		entries, err := v.chain(ctx, sha, pin.Path)
 		if err != nil {
 			return subject, fmt.Errorf("%s: %w", pin.Path, err)
+		}
+		seq, head := int64(0), ledger.ZeroHash
+		if n := len(entries); n > 0 {
+			seq, head = entries[n-1].Seq, entries[n-1].EntryHash
 		}
 		if err := ledger.VerifyHead(seq, head, pin.Seq, pin.Hash); err != nil {
 			return subject, fmt.Errorf("%s: %w", pin.Path, err)
 		}
 	}
+	for _, pin := range pins {
+		v.pins[pin] = sha[:min(8, len(sha))]
+	}
 	return subject, nil
 }
 
-// chain verifies the exported chain at path as committed in rev and returns its head. The
+// hasTrailer reports whether msg has a line starting "<key>: ".
+func hasTrailer(msg, key string) bool {
+	for line := range strings.Lines(msg) {
+		if strings.HasPrefix(line, key+": ") {
+			return true
+		}
+	}
+	return false
+}
+
+// chain verifies the exported chain at path as committed in rev and returns its entries. The
 // chain name comes from the file name. v1 has one signing key per chain (the supervisor's), so
-// the key is taken from the first entry's signature and must be authorized in allowed_signers
-// for the arbiter-ledger namespace at that entry's time; ledger.Verify then requires every
-// entry to verify under it.
-func (v *verifier) chain(ctx context.Context, rev, path string) (int64, string, error) {
+// the key is taken from the first entry's signature; it must be marked as Arbiter's in
+// allowed_signers (a human key on a line without namespaces= would otherwise pass) and
+// authorized for the arbiter-ledger namespace at that entry's time. ledger.Verify then requires
+// every entry to verify under it.
+func (v *verifier) chain(ctx context.Context, rev, path string) ([]ledger.Entry, error) {
 	data, err := v.g.run(ctx, "cat-file", "blob", rev+":"+path)
 	if err != nil {
-		return 0, "", err
+		return nil, err
 	}
 	entries, err := ledger.ReadJSONL(bytes.NewReader(data))
 	if err != nil {
-		return 0, "", err
+		return nil, err
 	}
 	if len(entries) == 0 {
-		return 0, ledger.ZeroHash, nil
+		return nil, nil
 	}
 	name := strings.TrimSuffix(path[strings.LastIndex(path, "/")+1:], ".jsonl")
 	sig, err := ledger.ParseSSHSig(entries[0].Signature)
 	if err != nil {
-		return 0, "", fmt.Errorf("ledger: %s seq 1: %w", name, err)
+		return nil, fmt.Errorf("ledger: %s seq 1: %w", name, err)
 	}
 	createdAt, err := time.Parse(ledger.TimeFormat, entries[0].CreatedAt)
 	if err != nil {
-		return 0, "", fmt.Errorf("ledger: %s seq 1: created_at: %w", name, err)
+		return nil, fmt.Errorf("ledger: %s seq 1: created_at: %w", name, err)
+	}
+	if !v.signers.IsSupervisorKey(sig.PublicKey) {
+		return nil, fmt.Errorf("ledger: %s is signed by a key allowed_signers doesn't mark as Arbiter's", name)
 	}
 	if err := v.signers.AuthorizeKey(ledger.Namespace, sig.PublicKey, createdAt); err != nil {
-		return 0, "", err
+		return nil, err
 	}
-	return ledger.Verify(entries, name, sig.PublicKey)
+	if _, _, err := ledger.Verify(entries, name, sig.PublicKey); err != nil {
+		return nil, err
+	}
+	return entries, nil
 }
 
 // commitInfo is a commit object split into what verification needs.

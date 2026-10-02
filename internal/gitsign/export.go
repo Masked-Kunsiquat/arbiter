@@ -10,6 +10,9 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/crypto/ssh"
+
+	"github.com/Masked-Kunsiquat/arbiter/internal/allowedsigners"
 	"github.com/Masked-Kunsiquat/arbiter/internal/ledger"
 )
 
@@ -20,41 +23,37 @@ type LedgerEntries interface {
 	Entries(ctx context.Context, chain string) ([]ledger.Entry, error)
 }
 
-// ensureExport brings the PRD's committed ledger export on the feature branch
-// up to the live chain before the final merge is prepared (§8.D "Human
-// capstone"). If entries were appended since the last export, it writes
-// .arbiter/ledger/<PRD>.jsonl in a supervisor-signed commit on top of source,
-// advances the branch, and returns the new commit; otherwise it returns
-// source unchanged. Without Heads, Entries and Supervisor it does nothing and
-// checkExportCurrent decides.
-func (s *Service) ensureExport(ctx context.Context, req MergeRequest, source string, now time.Time) (string, error) {
+// prepareExport brings the PRD's committed ledger export on the feature
+// branch up to the live chain before the final merge (§8.D "Human
+// capstone"). If entries were appended since the last export, it writes a
+// supervisor-signed commit on top of source holding
+// .arbiter/ledger/<PRD>.jsonl and returns its id; PrepareMerge moves the
+// branch to it once the rest of the merge checks out. It returns "" when no
+// export is needed, or when Heads, Entries or Supervisor is nil (then
+// checkExportCurrent decides).
+//
+// The committed export must be a prefix of the live chain: a rewritten
+// export is refused, never papered over, and so is one ahead of the live
+// chain (overwriting it would truncate committed history).
+func (s *Service) prepareExport(ctx context.Context, req MergeRequest, source, target string, now time.Time) (string, error) {
 	if s.Heads == nil || s.Entries == nil || s.Supervisor == nil {
-		return source, nil
+		return "", nil
 	}
 	seq, hash, err := s.Heads.Head(ctx, req.PRDID)
 	if err != nil {
 		return "", fmt.Errorf("gitsign: reading the %s ledger head: %w", req.PRDID, err)
 	}
 	if seq == 0 {
-		return source, nil
+		return "", nil
 	}
 	head, err := s.exportedHead(ctx, source, req.PRDID)
 	if err != nil {
 		return "", err
 	}
-	switch {
-	case head.present && head.seq == seq && head.hash == hash:
-		return source, nil
-	case head.present && head.seq > seq:
-		// Overwriting would truncate a committed chain; the live store lost
-		// entries (a replaced state.db?) and a human has to look.
+	if head.present && head.seq > seq {
+		// The live store lost entries (a replaced state.db?); a human has to look.
 		return "", fmt.Errorf("gitsign: the %s ledger committed on the feature branch is at seq %d, ahead of the live chain at seq %d; refusing to export over it",
 			req.PRDID, head.seq, seq)
-	}
-
-	branchRef := "refs/heads/" + req.Source
-	if tip, err := s.revParse(ctx, branchRef+"^{commit}"); err != nil || tip != source {
-		return "", fmt.Errorf("gitsign: the %s ledger needs exporting before the final merge, which needs the source %q to be a branch", req.PRDID, req.Source)
 	}
 
 	entries, err := s.Entries.Entries(ctx, req.PRDID)
@@ -67,6 +66,27 @@ func (s *Service) ensureExport(ctx context.Context, req MergeRequest, source str
 	}
 	if gotSeq != seq || gotHash != hash {
 		return "", fmt.Errorf("gitsign: the %s ledger changed while exporting it (head seq %d, now seq %d); prepare the merge again", req.PRDID, seq, gotSeq)
+	}
+	if err := checkPrefix(req.PRDID, head.entries, entries); err != nil {
+		return "", err
+	}
+	if head.present && head.seq == seq {
+		return "", nil
+	}
+	if tip, err := s.revParse(ctx, "refs/heads/"+req.Source+"^{commit}"); err != nil || tip != source {
+		return "", fmt.Errorf("gitsign: the %s ledger needs exporting before the final merge, which needs the source %q to be a branch", req.PRDID, req.Source)
+	}
+
+	// Never sign with a key that allowed_signers (as committed at the merge
+	// target) doesn't vouch for: main would carry history `audit verify`
+	// rejects. A new home directory silently generates a new key.
+	signers, err := s.signersAt(ctx, target)
+	if err != nil {
+		return "", err
+	}
+	if err := supervisorAuthorized(signers, s.Supervisor.PublicKey(), now); err != nil {
+		return "", fmt.Errorf("gitsign: the supervisor key is not authorized in .arbiter/%s at %s (%w); run arbiter init on this machine and commit the file",
+			allowedsigners.RelPath, req.Target, err)
 	}
 
 	var jsonl bytes.Buffer
@@ -100,14 +120,36 @@ func (s *Service) ensureExport(ctx context.Context, req MergeRequest, source str
 	if err != nil {
 		return "", err
 	}
-	sha, err := s.writeObject(ctx, "commit", obj)
-	if err != nil {
-		return "", err
+	return s.writeObject(ctx, "commit", obj)
+}
+
+// supervisorAuthorized requires key to be marked as Arbiter's and allowed to
+// sign both commits (git) and ledger entries (arbiter-ledger).
+func supervisorAuthorized(signers *allowedsigners.File, pub ssh.PublicKey, at time.Time) error {
+	if !signers.IsSupervisorKey(pub) {
+		return errors.New("no line marks it as Arbiter's")
 	}
-	if err := s.advanceBranch(ctx, req.Source, source, sha); err != nil {
-		return "", err
+	for _, ns := range []string{Namespace, ledger.Namespace} {
+		if err := signers.AuthorizeKey(ns, pub, at); err != nil {
+			return err
+		}
 	}
-	return sha, nil
+	return nil
+}
+
+// checkPrefix requires committed (the export on the branch) to be exactly the
+// first len(committed) entries of live.
+func checkPrefix(prdID string, committed, live []ledger.Entry) error {
+	if len(committed) > len(live) {
+		return fmt.Errorf("gitsign: the committed %s ledger has %d entries, more than the %d in the live chain", prdID, len(committed), len(live))
+	}
+	for i := range committed {
+		if committed[i].EntryHash != live[i].EntryHash || committed[i].Signature != live[i].Signature {
+			return fmt.Errorf("gitsign: the %s ledger committed on the feature branch diverges from the live chain at seq %d (it was rewritten there); revert that change before the final merge",
+				prdID, i+1)
+		}
+	}
+	return nil
 }
 
 // treeWithFile returns the tree of commit with path (a slash path from the

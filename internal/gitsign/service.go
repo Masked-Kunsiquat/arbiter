@@ -296,24 +296,36 @@ func (s *Service) PrepareMerge(ctx context.Context, req MergeRequest) (*Prepared
 	if _, err := s.git(ctx, s.RepoDir, nil, "merge-base", "--is-ancestor", source, target); err == nil {
 		return nil, fmt.Errorf("gitsign: %s is already merged into %s", req.Source, req.Target)
 	}
-	// The human signature must pin every ledger entry, so commit any
-	// entries appended since the last task commit first (§8.D).
-	if source, err = s.ensureExport(ctx, req, source, now); err != nil {
+	// The human signature must pin every ledger entry, so any entries
+	// appended since the last task commit are exported first (§8.D). The
+	// export commit is only written here; the branch moves to it after every
+	// other check has passed.
+	export, err := s.prepareExport(ctx, req, source, target, now)
+	if err != nil {
 		return nil, err
 	}
-	tree, err := s.mergeTree(ctx, target, source)
+	mergeSource := source
+	if export != "" {
+		mergeSource = export
+	}
+	tree, err := s.mergeTree(ctx, target, mergeSource)
 	if err != nil {
 		return nil, fmt.Errorf("gitsign: merging %s into %s: %w", req.Source, req.Target, err)
 	}
 
-	msg, head, err := s.mergeMessage(ctx, req, source)
+	msg, head, err := s.mergeMessage(ctx, req, mergeSource)
 	if err != nil {
 		return nil, err
 	}
 	if err := s.checkExportCurrent(ctx, req.PRDID, head); err != nil {
 		return nil, err
 	}
-	payload := CommitPayload(tree, []string{target, source}, req.Signer.Ident, req.Signer.Ident, now, msg)
+	if export != "" {
+		if err := s.advanceBranch(ctx, req.Source, source, export); err != nil {
+			return nil, err
+		}
+	}
+	payload := CommitPayload(tree, []string{target, mergeSource}, req.Signer.Ident, req.Signer.Ident, now, msg)
 	return s.store(&pending{
 		kind: kindMerge, payload: payload, ref: targetRef, oldOID: target, target: req.Target,
 		principal: req.Signer.Email, created: now, signersAt: target,

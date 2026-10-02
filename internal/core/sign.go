@@ -23,8 +23,14 @@ func (s *Session) LockPRD(ctx context.Context, req gitsign.LockRequest, sign Sig
 // MergeFinal creates the human-signed feature → main merge commit (§8.C,
 // §8.D "Human capstone") the same way.
 func (s *Session) MergeFinal(ctx context.Context, req gitsign.MergeRequest, sign SignFunc) (*gitsign.Completed, error) {
+	// Snapshot the source first: the core may commit the ledger export on
+	// top of it while preparing, and the check must see what that added.
+	check, err := gitsign.NewMergeCheck(ctx, s.arbiterDir, req)
+	if err != nil {
+		return nil, err
+	}
 	return s.signRoundTrip(ctx, MethodSignPrepareMerge, req, func(prep *gitsign.Prepared) error {
-		return gitsign.CheckMerge(ctx, s.arbiterDir, req, prep)
+		return check.Check(ctx, prep)
 	}, sign)
 }
 

@@ -2,6 +2,7 @@ package gitsign
 
 import (
 	"context"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -103,7 +104,7 @@ func TestExportBeforeMerge(t *testing.T) {
 			appendN(t, chain, tc.live-tc.committed)
 			before := strings.TrimSpace(run(t, repo, "rev-parse", "feature"))
 
-			msg := mergeAndRead(t, svc, repo, human, mergeReq(human))
+			msg := exportMerge(t, svc, repo, human, mergeReq(human))
 
 			after := strings.TrimSpace(run(t, repo, "rev-parse", "feature"))
 			if exported := after != before; exported != tc.exports {
@@ -149,6 +150,29 @@ func TestExportBeforeMerge(t *testing.T) {
 	}
 }
 
+// exportMerge is mergeAndRead with the CLI's full pre-signing check, which
+// snapshots the source before prepare and vets the export commit.
+func exportMerge(t *testing.T, svc *Service, repo string, key testKey, req MergeRequest) string {
+	t.Helper()
+	ctx := context.Background()
+	check, err := NewMergeCheck(ctx, svc.ArbiterDir, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prep, err := svc.PrepareMerge(ctx, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := check.Check(ctx, prep); err != nil {
+		t.Fatalf("client rejected an honest merge: %v", err)
+	}
+	if _, err := svc.Complete(ctx, CompleteRequest{RequestID: prep.RequestID, Signature: key.sign(t, prep.Payload)}); err != nil {
+		t.Fatal(err)
+	}
+	verifyWithGit(t, svc, repo, "verify-commit", "main")
+	return run(t, repo, "log", "-1", "--format=%B", "main")
+}
+
 // verifySupervisorCommit checks the export commit with git itself, against
 // allowed_signers, as GitHub would.
 func verifySupervisorCommit(t *testing.T, svc *Service, repo, rev string) {
@@ -190,6 +214,46 @@ func TestExportRejects(t *testing.T) {
 		}
 	})
 
+	t.Run("committed export rewritten", func(t *testing.T) {
+		svc, repo, human, chain := exportSetup(t)
+		forged := newLedgerChain(t, newTestKey(t, 5))
+		appendN(t, forged, 2) // same key, different created_at: different hashes
+		commitExport(t, repo, forged)
+		appendN(t, chain, 3)
+		if _, err := svc.PrepareMerge(ctx, mergeReq(human)); err == nil || !strings.Contains(err.Error(), "diverges from the live chain at seq 1") {
+			t.Errorf("err = %v, want a divergence refusal", err)
+		}
+	})
+
+	t.Run("supervisor key not in allowed_signers", func(t *testing.T) {
+		human := newTestKey(t, 1)
+		svc, repo := newRepo(t, human)
+		addFeature(t, repo)
+		chain := newLedgerChain(t, newTestKey(t, 5))
+		appendN(t, chain, 1)
+		svc.Heads, svc.Entries, svc.Supervisor = fakeStore{chain}, fakeStore{chain}, newTestKey(t, 5).signer
+		before := run(t, repo, "rev-parse", "feature")
+		if _, err := svc.PrepareMerge(ctx, mergeReq(human)); err == nil || !strings.Contains(err.Error(), "not authorized") {
+			t.Errorf("err = %v, want an unauthorized-key refusal", err)
+		}
+		if run(t, repo, "rev-parse", "feature") != before {
+			t.Error("feature branch moved")
+		}
+	})
+
+	t.Run("failed prepare leaves the branch alone", func(t *testing.T) {
+		svc, repo, human, chain := exportSetup(t)
+		appendN(t, chain, 2)
+		run(t, repo, "tag", "-d", "arbiter/prd/PRD-001/v1")
+		before := run(t, repo, "rev-parse", "feature")
+		if _, err := svc.PrepareMerge(ctx, mergeReq(human)); err == nil || !strings.Contains(err.Error(), "no lock tag") {
+			t.Errorf("err = %v, want a no-lock-tag refusal", err)
+		}
+		if run(t, repo, "rev-parse", "feature") != before {
+			t.Error("feature branch moved although prepare failed")
+		}
+	})
+
 	t.Run("live chain signed by another key", func(t *testing.T) {
 		svc, _, human, _ := exportSetup(t)
 		other := newLedgerChain(t, newTestKey(t, 9))
@@ -199,4 +263,50 @@ func TestExportRejects(t *testing.T) {
 			t.Errorf("err = %v, want a verification refusal", err)
 		}
 	})
+}
+
+// The export fast-forwards a linked worktree that has the feature branch
+// checked out, so its files follow.
+func TestExportLinkedWorktree(t *testing.T) {
+	svc, repo, human, chain := exportSetup(t)
+	appendN(t, chain, 2)
+	wt := filepath.Join(t.TempDir(), "wt")
+	run(t, repo, "worktree", "add", "-q", wt, "feature")
+	exportMerge(t, svc, repo, human, mergeReq(human))
+	if got := run(t, wt, "rev-parse", "HEAD"); got != run(t, repo, "rev-parse", "main^2") {
+		t.Errorf("worktree HEAD = %s, want the export commit", got)
+	}
+	if _, err := os.Stat(filepath.Join(wt, ".arbiter", "ledger", "PRD-001.jsonl")); err != nil {
+		t.Errorf("worktree lacks the exported ledger: %v", err)
+	}
+	if st := run(t, wt, "status", "--porcelain"); st != "" {
+		t.Errorf("worktree is dirty after the export: %s", st)
+	}
+}
+
+// The CLI refuses a source branch the core moved with anything other than a
+// ledger-only export commit.
+func TestMergeCheckRejectsForgedExport(t *testing.T) {
+	ctx := context.Background()
+	svc, repo, human, chain := exportSetup(t)
+	appendN(t, chain, 1)
+	req := mergeReq(human)
+	check, err := NewMergeCheck(ctx, svc.ArbiterDir, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A compromised core slips a code change in alongside the export.
+	var buf strings.Builder
+	if err := chain.WriteJSONL(&buf); err != nil {
+		t.Fatal(err)
+	}
+	run(t, repo, "checkout", "-q", "feature")
+	writeFile(t, filepath.Join(repo, ".arbiter", "ledger", "PRD-001.jsonl"), buf.String())
+	writeFile(t, filepath.Join(repo, "backdoor.txt"), "x\n")
+	run(t, repo, "add", ".")
+	run(t, repo, "commit", "-q", "-m", "Export PRD-001 ledger")
+	run(t, repo, "checkout", "-q", "main")
+	if err := check.Check(ctx, &Prepared{Ref: "refs/heads/main"}); err == nil || !strings.Contains(err.Error(), "not by a ledger export") {
+		t.Errorf("err = %v, want a forged-export refusal", err)
+	}
 }

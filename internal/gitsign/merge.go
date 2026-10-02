@@ -23,6 +23,7 @@ type ledgerHead struct {
 	present bool
 	seq     int64
 	hash    string
+	entries []ledger.Entry
 }
 
 // exportedHead reads .arbiter/ledger/<prdID>.jsonl at commit. A missing or
@@ -51,7 +52,7 @@ func (s *Service) exportedHead(ctx context.Context, commit, prdID string) (ledge
 	if last.Chain != prdID || last.Seq != int64(len(entries)) {
 		return h, fmt.Errorf("gitsign: %s at %s ends with chain %q seq %d after %d lines", h.path, short(commit), last.Chain, last.Seq, len(entries))
 	}
-	h.present, h.seq, h.hash = true, last.Seq, last.EntryHash
+	h.present, h.seq, h.hash, h.entries = true, last.Seq, last.EntryHash, entries
 	return h, nil
 }
 
