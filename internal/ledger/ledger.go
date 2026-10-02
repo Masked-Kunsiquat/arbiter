@@ -31,7 +31,6 @@ import (
 	"maps"
 	"regexp"
 	"slices"
-	"strings"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -130,34 +129,59 @@ func NewChain(name string, signer Signer) (*Chain, error) {
 
 // Append validates, hashes, signs and appends one entry.
 func (c *Chain) Append(seatID, action, taskID string, payload map[string]any) (Entry, error) {
+	seq, prev := c.Head()
+	e, err := NewEntry(c.name, seq, prev, seatID, action, taskID, payload, c.Now(), c.signer)
+	if err != nil {
+		return Entry{}, err
+	}
+	c.entries = append(c.entries, e)
+	return e, nil
+}
+
+// NewEntry builds, hashes and signs the entry that follows the given head (headSeq 0 and
+// ZeroHash for an empty chain). It is the shared write path for the in-memory Chain and the
+// state.db audit_log (§8.B).
+func NewEntry(chain string, headSeq int64, headHash string, seatID, action, taskID string, payload map[string]any, now time.Time, signer Signer) (Entry, error) {
+	if !chainRe.MatchString(chain) {
+		return Entry{}, fmt.Errorf("ledger: invalid chain name %q", chain)
+	}
+	switch {
+	case headSeq < 0:
+		return Entry{}, fmt.Errorf("ledger: invalid head seq %d", headSeq)
+	case headSeq == 0 && headHash != ZeroHash:
+		return Entry{}, fmt.Errorf("ledger: empty chain head must be ZeroHash, got %q", headHash)
+	case headSeq > 0 && !hashRe.MatchString(headHash):
+		return Entry{}, fmt.Errorf("ledger: malformed head hash %q", headHash)
+	}
 	if seatID == "" {
 		return Entry{}, errors.New("ledger: seat_id is required")
 	}
 	if err := checkPayload(action, payload); err != nil {
 		return Entry{}, err
 	}
-	seq, prev := c.Head()
 	e := Entry{
 		V:         Version,
-		Chain:     c.name,
-		Seq:       seq + 1,
+		Chain:     chain,
+		Seq:       headSeq + 1,
 		TaskID:    taskID,
 		SeatID:    seatID,
 		Action:    action,
 		Payload:   clonePayload(payload),
-		CreatedAt: c.Now().UTC().Format(TimeFormat),
-		PrevHash:  prev,
+		CreatedAt: now.UTC().Format(TimeFormat),
+		PrevHash:  headHash,
 	}
 	var err error
 	if e.EntryHash, err = ComputeHash(&e); err != nil {
 		return Entry{}, fmt.Errorf("ledger: %s: %w", action, err)
 	}
-	if e.Signature, err = c.signer.Sign([]byte(e.EntryHash)); err != nil {
+	if e.Signature, err = signer.Sign([]byte(e.EntryHash)); err != nil {
 		return Entry{}, err
 	}
-	c.entries = append(c.entries, e)
 	return e, nil
 }
+
+// PayloadJSON returns the canonical (JCS) payload_json text stored in state.db (§8.B).
+func (e *Entry) PayloadJSON() ([]byte, error) { return Canonicalize(e.Payload) }
 
 // Head returns the last seq and entry_hash (0 and ZeroHash for an empty chain). The
 // Arbiter-Ledger commit trailer pins this; see VerifyHead.
@@ -394,11 +418,27 @@ func clonePayload(p map[string]any) map[string]any {
 	if err != nil {
 		return p // Append's ComputeHash reports the error
 	}
-	dec := json.NewDecoder(strings.NewReader(string(b)))
-	dec.UseNumber()
-	var out map[string]any
-	if dec.Decode(&out) != nil {
+	out, err := DecodePayload(b)
+	if err != nil {
 		return p
 	}
 	return out
+}
+
+// DecodePayload parses a payload_json column: a single JSON object, numbers kept as
+// json.Number so hashing round-trips exactly.
+func DecodePayload(b []byte) (map[string]any, error) {
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.UseNumber()
+	var out map[string]any
+	if err := dec.Decode(&out); err != nil {
+		return nil, fmt.Errorf("ledger: payload: %w", err)
+	}
+	if out == nil {
+		return nil, errors.New("ledger: payload must be a JSON object")
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return nil, errors.New("ledger: payload has trailing data")
+	}
+	return out, nil
 }

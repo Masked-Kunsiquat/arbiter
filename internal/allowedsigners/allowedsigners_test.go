@@ -317,3 +317,36 @@ func TestInteropSSHKeygen(t *testing.T) {
 		t.Fatal("ssh-keygen accepted a namespace outside the line's namespaces")
 	}
 }
+
+func TestAuthorizeKey(t *testing.T) {
+	k1, k2 := keyText(t, 1), keyText(t, 2)
+	f := mustParse(t, `arbiter@host namespaces="git,arbiter-ledger" `+k1+"\n"+
+		`b valid-before="20240201Z" `+k2+"\n")
+	at := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name    string
+		ns      string
+		key     byte
+		wantErr string
+	}{
+		{"any principal", "git", 1, ""},
+		{"ledger namespace", "arbiter-ledger", 1, ""},
+		{"wrong namespace", "other", 1, "namespace"},
+		{"expired", "git", 2, "expired"},
+		{"unknown key", "git", 9, "no line"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := f.AuthorizeKey(tc.ns, testKey(t, tc.key), at)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatal(err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("err = %v, want containing %q", err, tc.wantErr)
+			}
+		})
+	}
+}

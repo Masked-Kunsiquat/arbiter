@@ -47,6 +47,8 @@ func run(ctx context.Context, args []string) error {
 			return err
 		}
 		return runSeats(ctx, args[1:])
+	case "audit":
+		return runAudit(ctx, args[1:])
 	case "-h", "--help", "help":
 		printUsage()
 		return nil
@@ -89,6 +91,7 @@ func printUsage() {
 Usage:
   arbiter init [--force]               Detect ecosystem, scaffold .arbiter/, write config.toml
   arbiter seats [<prd-id>] [--stats]   Print the agent tree
+  arbiter audit verify [<commit>]      Verify commit signatures and the committed ledger (git only)
 
 Only a subset of the full CLI command suite (spec §9.B) exists so far.`)
 }

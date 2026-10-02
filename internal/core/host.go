@@ -21,10 +21,14 @@ import (
 	"path/filepath"
 	"sync"
 
+	"github.com/Masked-Kunsiquat/arbiter/internal/allowedsigners"
+	"github.com/Masked-Kunsiquat/arbiter/internal/auditlog"
 	"github.com/Masked-Kunsiquat/arbiter/internal/corelock"
 	"github.com/Masked-Kunsiquat/arbiter/internal/db"
 	"github.com/Masked-Kunsiquat/arbiter/internal/gitsign"
 	"github.com/Masked-Kunsiquat/arbiter/internal/ipc"
+	"github.com/Masked-Kunsiquat/arbiter/internal/ledger"
+	"github.com/Masked-Kunsiquat/arbiter/internal/supervisorkey"
 )
 
 // StateDBName is the repository database's name inside .arbiter.
@@ -43,9 +47,12 @@ type Host struct {
 
 	recovered []string
 
-	// signing prepares and completes human-signed objects (§8.C). Its
-	// Ledger and SpecHash stay nil until the ledger (#19) and PRD parser
-	// (#2) exist.
+	// ledger is audit_log, signed with the supervisor key (§8.B).
+	ledger *auditlog.Store
+
+	// signing prepares and completes human-signed objects (§8.C). It
+	// records prd_lock in the ledger and exports the ledger before the
+	// final merge; its SpecHash stays nil until the PRD parser (#2) exists.
 	signing *gitsign.Service
 
 	serveCtx  context.Context
@@ -106,6 +113,10 @@ func Open(ctx context.Context, arbiterDir string) (_ *Host, retErr error) {
 		return nil, err
 	}
 
+	if err := h.openLedger(); err != nil {
+		return nil, err
+	}
+
 	ln, err := ipc.Listen(endpoint)
 	if err != nil {
 		return nil, fmt.Errorf("core: %w", err)
@@ -119,6 +130,39 @@ func Open(ctx context.Context, arbiterDir string) (_ *Host, retErr error) {
 		h.serveErr = h.srv.Serve(h.serveCtx, ln)
 	}()
 	return h, nil
+}
+
+// openLedger loads the supervisor key (generating it on first use, §8.B)
+// and connects the audit_log store to the signing service.
+func (h *Host) openLedger() error {
+	cfgDir, err := supervisorkey.DefaultConfigDir()
+	if err != nil {
+		return fmt.Errorf("core: %w", err)
+	}
+	key, err := supervisorkey.LoadOrGenerate(cfgDir)
+	if err != nil {
+		return fmt.Errorf("core: loading the supervisor key: %w", err)
+	}
+	host, err := os.Hostname()
+	if err != nil {
+		return fmt.Errorf("core: hostname for the supervisor key's principal: %w", err)
+	}
+	h.ledger = auditlog.New(h.db.SQLDB(), ledger.NewSSHSigner(key))
+	h.signing.Ledger = ledgerAppender{h.ledger}
+	h.signing.Heads = h.ledger
+	h.signing.Entries = h.ledger
+	h.signing.Supervisor = ledger.NewSSHSignerNamespace(key, gitsign.Namespace)
+	h.signing.SupervisorIdent = gitsign.Ident{Name: "Arbiter", Email: allowedsigners.SupervisorPrincipal(host)}
+	return nil
+}
+
+// ledgerAppender adapts auditlog.Store to gitsign.LedgerAppender, which
+// doesn't need the appended entry back.
+type ledgerAppender struct{ s *auditlog.Store }
+
+func (a ledgerAppender) Append(ctx context.Context, chain, seatID, action, taskID string, payload map[string]any) error {
+	_, err := a.s.Append(ctx, chain, seatID, action, taskID, payload)
+	return err
 }
 
 // Endpoint returns the pipe name or socket path the host serves on.

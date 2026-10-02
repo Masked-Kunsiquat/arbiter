@@ -230,6 +230,18 @@ func matchList(pats []string, s string) bool {
 // It returns nil on success, otherwise an error explaining the most specific
 // reason no line authorized the signature.
 func (f *File) Authorize(principal, namespace string, key ssh.PublicKey, at time.Time) error {
+	return f.authorize(&principal, namespace, key, at)
+}
+
+// AuthorizeKey is Authorize with any principal accepted. It is for the
+// supervisor key, whose principal (arbiter@<host>) is not the commit's
+// committer email; the namespace and validity window still apply.
+func (f *File) AuthorizeKey(namespace string, key ssh.PublicKey, at time.Time) error {
+	return f.authorize(nil, namespace, key, at)
+}
+
+// authorize is the shared loop; a nil principal matches any principal.
+func (f *File) authorize(principal *string, namespace string, key ssh.PublicKey, at time.Time) error {
 	kb := key.Marshal()
 	var best error
 	rank := -1
@@ -242,8 +254,8 @@ func (f *File) Authorize(principal, namespace string, key ssh.PublicKey, at time
 		if l.CertAuthority || !bytes.Equal(l.Key.Marshal(), kb) {
 			continue
 		}
-		if !matchList(l.Principals, principal) {
-			fail(1, fmt.Errorf("allowedsigners: key present (line %d) but principal %q not matched", l.LineNo, principal))
+		if principal != nil && !matchList(l.Principals, *principal) {
+			fail(1, fmt.Errorf("allowedsigners: key present (line %d) but principal %q not matched", l.LineNo, *principal))
 			continue
 		}
 		if l.Namespaces != nil && !matchList(l.Namespaces, namespace) {

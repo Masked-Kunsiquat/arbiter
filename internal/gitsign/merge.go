@@ -83,10 +83,11 @@ func (s *Service) mergeMessage(ctx context.Context, req MergeRequest, source str
 	}
 
 	var b strings.Builder
-	b.WriteString(subject + "\n\n")
+	b.WriteString(subject)
+	b.WriteString("\n\n")
 	fmt.Fprintf(&b, "Arbiter-PRD: %s@v%d (tag arbiter/prd/%s/v%d)\n", req.PRDID, version, req.PRDID, version)
 	if head.present {
-		fmt.Fprintf(&b, "Arbiter-Ledger: %s#seq=%d sha256:%s\n", head.path, head.seq, head.hash)
+		fmt.Fprintf(&b, "Arbiter-Ledger: %s\n", LedgerPin{Path: head.path, Seq: head.seq, Hash: head.hash})
 	}
 	return b.String(), head, nil
 }

@@ -19,6 +19,7 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"github.com/Masked-Kunsiquat/arbiter/internal/allowedsigners"
+	"github.com/Masked-Kunsiquat/arbiter/internal/ledger"
 	"github.com/Masked-Kunsiquat/arbiter/internal/worktree"
 )
 
@@ -121,6 +122,14 @@ type Service struct {
 	Heads    LedgerHeads      // may be nil (see LedgerHeads)
 	SpecHash SpecHasher       // may be nil (see SpecHasher)
 	Now      func() time.Time // nil means time.Now
+
+	// Entries, Supervisor and SupervisorIdent let PrepareMerge export a
+	// lagging ledger itself (ensureExport). Supervisor signs in the git
+	// namespace with the supervisor key; SupervisorIdent authors the export
+	// commit (empty: the human). Any of the first two nil: no export.
+	Entries         LedgerEntries
+	Supervisor      ledger.Signer
+	SupervisorIdent Ident
 
 	mu      sync.Mutex
 	pending map[string]*pending
@@ -287,6 +296,11 @@ func (s *Service) PrepareMerge(ctx context.Context, req MergeRequest) (*Prepared
 	if _, err := s.git(ctx, s.RepoDir, nil, "merge-base", "--is-ancestor", source, target); err == nil {
 		return nil, fmt.Errorf("gitsign: %s is already merged into %s", req.Source, req.Target)
 	}
+	// The human signature must pin every ledger entry, so commit any
+	// entries appended since the last task commit first (§8.D).
+	if source, err = s.ensureExport(ctx, req, source, now); err != nil {
+		return nil, err
+	}
 	tree, err := s.mergeTree(ctx, target, source)
 	if err != nil {
 		return nil, fmt.Errorf("gitsign: merging %s into %s: %w", req.Source, req.Target, err)
@@ -405,13 +419,9 @@ func (s *Service) completeLock(ctx context.Context, p *pending, sig string) (*Co
 }
 
 func (s *Service) completeMerge(ctx context.Context, p *pending, sig string) (*Completed, error) {
-	format, err := s.git(ctx, s.RepoDir, nil, "rev-parse", "--show-object-format")
+	header, err := s.sigHeader(ctx)
 	if err != nil {
 		return nil, err
-	}
-	header := "gpgsig"
-	if strings.TrimSpace(format) == "sha256" {
-		header = "gpgsig-sha256"
 	}
 	obj, err := AttachCommitSig(p.payload, sig, header)
 	if err != nil {
@@ -509,6 +519,11 @@ func (s *Service) revParse(ctx context.Context, rev string) (string, error) {
 // fsmonitor), feeding stdin when non-nil. It returns stdout; stderr goes into
 // the error.
 func (s *Service) git(ctx context.Context, dir string, stdin []byte, args ...string) (string, error) {
+	return s.gitEnv(ctx, dir, nil, stdin, args...)
+}
+
+// gitEnv is git with extra environment variables (e.g. GIT_INDEX_FILE).
+func (s *Service) gitEnv(ctx context.Context, dir string, env []string, stdin []byte, args ...string) (string, error) {
 	emptyHooks, err := worktree.EmptyHooksDir(s.ArbiterDir)
 	if err != nil {
 		return "", err
@@ -516,6 +531,9 @@ func (s *Service) git(ctx context.Context, dir string, stdin []byte, args ...str
 	full := append([]string{"-c", "core.hooksPath=" + filepath.ToSlash(emptyHooks), "-c", "core.fsmonitor=false"}, args...)
 	cmd := exec.CommandContext(ctx, "git", full...)
 	cmd.Dir = dir
+	if env != nil {
+		cmd.Env = append(os.Environ(), env...)
+	}
 	if stdin != nil {
 		cmd.Stdin = bytes.NewReader(stdin)
 	}
