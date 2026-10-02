@@ -204,3 +204,20 @@ func TestSHA1RSASignatureRejected(t *testing.T) {
 		t.Error("ssh-rsa (SHA-1) SSHSIG accepted")
 	}
 }
+
+// Stray tags with non-canonical version suffixes don't move the next version.
+func TestLatestLockVersionCanonicalOnly(t *testing.T) {
+	ctx := context.Background()
+	key := newTestKey(t, 1)
+	svc, repo := newRepo(t, key)
+	for _, v := range []string{"+9", "09", "x"} {
+		run(t, repo, "tag", "arbiter/prd/PRD-001/v"+v)
+	}
+	prep, err := svc.PrepareLock(ctx, LockRequest{PRDID: "PRD-001", Signer: key.signerInfo()})
+	if err != nil {
+		t.Fatalf("lock refused despite only non-canonical tags: %v", err)
+	}
+	if prep.Ref != "refs/tags/arbiter/prd/PRD-001/v1" {
+		t.Errorf("ref = %s, want v1", prep.Ref)
+	}
+}

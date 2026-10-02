@@ -247,8 +247,10 @@ func (s *Service) latestLockVersion(ctx context.Context, prdID string) (int, err
 	latest := 0
 	prefix := "refs/tags/arbiter/prd/" + prdID + "/v"
 	for line := range strings.Lines(out) {
-		n, err := strconv.Atoi(strings.TrimPrefix(strings.TrimSpace(line), prefix))
-		if err == nil && n > latest {
+		// Only canonical suffixes count: v+9 or v09 would otherwise parse.
+		suffix := strings.TrimPrefix(strings.TrimSpace(line), prefix)
+		n, err := strconv.Atoi(suffix)
+		if err == nil && strconv.Itoa(n) == suffix && n > latest {
 			latest = n
 		}
 	}

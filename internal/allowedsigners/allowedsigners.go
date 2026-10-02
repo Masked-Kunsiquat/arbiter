@@ -101,6 +101,9 @@ func parseLine(text string) (Line, error) {
 			return l, errors.New("unterminated quote in principals")
 		}
 		princ, rest = text[1:1+end], text[end+2:]
+		if rest == "" || (rest[0] != ' ' && rest[0] != '\t') {
+			return l, errors.New("missing whitespace or key after quoted principals")
+		}
 	} else {
 		i := strings.IndexAny(text, " \t")
 		if i < 0 {

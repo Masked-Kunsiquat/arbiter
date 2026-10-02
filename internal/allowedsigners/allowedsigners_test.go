@@ -88,6 +88,8 @@ func TestParseErrors(t *testing.T) {
 		{"malformed key", "a ssh-ed25519 AAAAnotakey\n", "line 1"},
 		{"no key", "a\n", "line 1"},
 		{"bad time", `a valid-after="2024" ` + k + "\n", "valid-after"},
+		{"quoted principal glued to key", `"a@b"` + k + "\n", "line 1"},
+		{"quoted principal without key", `"a@b"` + "\n", "line 1"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

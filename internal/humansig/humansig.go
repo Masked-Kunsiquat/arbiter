@@ -155,7 +155,7 @@ func (s *Signer) defaultKey(ctx context.Context) (string, error) {
 		if line == "" {
 			continue
 		}
-		if !strings.HasPrefix(line, "key::") && !strings.HasPrefix(line, "ssh-") {
+		if !isLiteral(line) {
 			return "", fmt.Errorf("humansig: gpg.ssh.defaultKeyCommand %q printed %q, which is not a public key", s.cfg.DefaultKeyCommand, line)
 		}
 		return strings.TrimPrefix(line, "key::"), nil

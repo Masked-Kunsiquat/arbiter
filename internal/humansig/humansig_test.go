@@ -2,7 +2,10 @@ package humansig
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/elliptic"
+	"crypto/rand"
 	"encoding/pem"
 	"fmt"
 	"os"
@@ -404,4 +407,28 @@ func echoCommand(t *testing.T, text string) string {
 		t.Skip("test binary path has whitespace; defaultKeyCommand is split on whitespace")
 	}
 	return exe + " --echo " + text
+}
+
+// defaultKeyCommand output is accepted for the same key types as a literal
+// user.signingkey, e.g. ECDSA.
+func TestPublicKeyDefaultKeyCommandECDSA(t *testing.T) {
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pk, err := ssh.NewPublicKey(&priv.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := NewSigner(Config{Format: "ssh", DefaultKeyCommand: echoCommand(t, keyText(pk)), Email: "h@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.PublicKey(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got.Marshal()) != string(pk.Marshal()) {
+		t.Error("wrong key from defaultKeyCommand")
+	}
 }
