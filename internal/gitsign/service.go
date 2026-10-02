@@ -41,10 +41,27 @@ type LedgerAppender interface {
 }
 
 // SpecHasher computes a PRD's spec_hash from its file content (§2.C). The
-// real implementation lands with the PRD parser (issue #2); until then a nil
-// SpecHasher leaves spec_hash null in the prd_lock entry.
+// core's is prd.Hasher, which also parses the PRD strictly, so a PRD it
+// cannot parse is never locked. A nil SpecHasher leaves spec_hash null in
+// the prd_lock entry.
 type SpecHasher interface {
 	SpecHash(prd []byte) (string, error)
+}
+
+// PRDStore is the core's PRD state (§2.A, the prds table). The Check
+// methods run while preparing, before the human is asked to sign; the
+// Record methods run once the tag or merge exists. A nil PRDStore skips
+// both, so the lifecycle isn't enforced.
+type PRDStore interface {
+	// CheckLock validates prd (its file content at the commit being
+	// tagged) for lock tag version n of prdID. For an amendment, prior
+	// holds the content locked by v1..v<n-1>, in order.
+	CheckLock(ctx context.Context, prdID string, n int, prd []byte, prior [][]byte) error
+	RecordLock(ctx context.Context, prdID, tag string, prd []byte, specHash string) error
+	// CheckMerge allows the final merge for prdID; RecordMerge records
+	// that it landed.
+	CheckMerge(ctx context.Context, prdID string) error
+	RecordMerge(ctx context.Context, prdID string) error
 }
 
 // Signer is who will sign: the human's git identity and the public key their
@@ -108,9 +125,12 @@ type pending struct {
 	created   time.Time
 	signersAt string // the commit whose allowed_signers authorizes this object
 
+	prdID string // kindLock, kindMerge
+
 	// kindLock ledger fields
-	prdID, tag string
-	specHash   any // string, or nil when no SpecHasher is set
+	tag      string
+	specHash any // string, or nil when no SpecHasher is set
+	prd      []byte
 }
 
 // Service prepares and completes human-signed objects for one repository.
@@ -121,6 +141,7 @@ type Service struct {
 	Ledger   LedgerAppender   // may be nil (see LedgerAppender)
 	Heads    LedgerHeads      // may be nil (see LedgerHeads)
 	SpecHash SpecHasher       // may be nil (see SpecHasher)
+	PRDs     PRDStore         // may be nil (see PRDStore)
 	Now      func() time.Time // nil means time.Now
 
 	// Entries, Supervisor and SupervisorIdent let PrepareMerge export a
@@ -236,6 +257,15 @@ func (s *Service) PrepareLock(ctx context.Context, req LockRequest) (*Prepared, 
 		}
 		specHash = h
 	}
+	if s.PRDs != nil {
+		prior, err := s.lockedVersions(ctx, req.PRDID, latest)
+		if err != nil {
+			return nil, err
+		}
+		if err := s.PRDs.CheckLock(ctx, req.PRDID, version, []byte(prd), prior); err != nil {
+			return nil, err
+		}
+	}
 
 	verb := "Lock"
 	if req.Amend {
@@ -244,8 +274,23 @@ func (s *Service) PrepareLock(ctx context.Context, req LockRequest) (*Prepared, 
 	payload := TagPayload(commit, "commit", tag, req.Signer.Ident, now, fmt.Sprintf("%s %s v%d", verb, req.PRDID, version))
 	return s.store(&pending{
 		kind: kindLock, payload: payload, ref: "refs/tags/" + tag, principal: req.Signer.Email, created: now,
-		signersAt: commit, prdID: req.PRDID, tag: tag, specHash: specHash,
+		signersAt: commit, prdID: req.PRDID, tag: tag, specHash: specHash, prd: []byte(prd),
 	})
+}
+
+// lockedVersions returns the PRD file as locked by arbiter/prd/<id>/v1..v<n>.
+func (s *Service) lockedVersions(ctx context.Context, prdID string, n int) ([][]byte, error) {
+	prdPath := ".arbiter/prds/" + prdID + ".md"
+	var out [][]byte
+	for v := 1; v <= n; v++ {
+		tag := fmt.Sprintf("arbiter/prd/%s/v%d", prdID, v)
+		blob, err := s.git(ctx, s.RepoDir, nil, "cat-file", "blob", "refs/tags/"+tag+"^{commit}:"+prdPath)
+		if err != nil {
+			return nil, fmt.Errorf("gitsign: reading %s at %s: %w", prdPath, tag, err)
+		}
+		out = append(out, []byte(blob))
+	}
+	return out, nil
 }
 
 // latestLockVersion returns the highest n among arbiter/prd/<id>/v<n>, 0 if none.
@@ -293,6 +338,11 @@ func (s *Service) PrepareMerge(ctx context.Context, req MergeRequest) (*Prepared
 	if err := s.checkSigner(ctx, req.Signer, target, now); err != nil {
 		return nil, err
 	}
+	if s.PRDs != nil {
+		if err := s.PRDs.CheckMerge(ctx, req.PRDID); err != nil {
+			return nil, err
+		}
+	}
 	if _, err := s.git(ctx, s.RepoDir, nil, "merge-base", "--is-ancestor", source, target); err == nil {
 		return nil, fmt.Errorf("gitsign: %s is already merged into %s", req.Source, req.Target)
 	}
@@ -328,7 +378,7 @@ func (s *Service) PrepareMerge(ctx context.Context, req MergeRequest) (*Prepared
 	payload := CommitPayload(tree, []string{target, mergeSource}, req.Signer.Ident, req.Signer.Ident, now, msg)
 	return s.store(&pending{
 		kind: kindMerge, payload: payload, ref: targetRef, oldOID: target, target: req.Target,
-		principal: req.Signer.Email, created: now, signersAt: target,
+		principal: req.Signer.Email, created: now, signersAt: target, prdID: req.PRDID,
 	})
 }
 
@@ -427,6 +477,12 @@ func (s *Service) completeLock(ctx context.Context, p *pending, sig string) (*Co
 			return done, fmt.Errorf("gitsign: %s created, but recording prd_lock in the ledger failed: %w", p.ref, err)
 		}
 	}
+	if s.PRDs != nil {
+		h, _ := p.specHash.(string)
+		if err := s.PRDs.RecordLock(ctx, p.prdID, p.tag, p.prd, h); err != nil {
+			return done, fmt.Errorf("gitsign: %s created, but recording the lock in state.db failed: %w", p.ref, err)
+		}
+	}
 	return done, nil
 }
 
@@ -446,7 +502,13 @@ func (s *Service) completeMerge(ctx context.Context, p *pending, sig string) (*C
 	if err := s.advanceBranch(ctx, p.target, p.oldOID, sha); err != nil {
 		return nil, err
 	}
-	return &Completed{Ref: p.ref, ObjectSHA: sha}, nil
+	done := &Completed{Ref: p.ref, ObjectSHA: sha}
+	if s.PRDs != nil {
+		if err := s.PRDs.RecordMerge(ctx, p.prdID); err != nil {
+			return done, fmt.Errorf("gitsign: %s merged, but recording it in state.db failed: %w", p.ref, err)
+		}
+	}
+	return done, nil
 }
 
 // advanceBranch moves branch from oldOID to newOID. If the branch is checked
