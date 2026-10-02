@@ -1,7 +1,7 @@
 ---
 name: implementer
 description: Writes well-specified, self-contained Go code in the arbiter repo, such as test helpers, table-driven tests, boilerplate, or wiring a CLI command onto an existing core method. Give it an exact spec (files, signatures, behavior). Not for design decisions, concurrency, or OS-specific process/lock/IPC code.
-tools: Glob, Grep, Read, Edit, Write, Bash
+tools: Glob, Grep, Read, Edit, Write, Bash, LSP
 model: sonnet
 ---
 
@@ -14,6 +14,7 @@ You implement a narrowly specified change in the arbiter repo and hand it back f
 **Repo conventions**
 - Match the surrounding code: comment density, error wrapping (`fmt.Errorf("pkg: ...: %w", err)`), naming, and test style (stdlib `testing`, no testify, `t.Helper()` in helpers).
 - Stay cgo-free: no dependency or build tag that needs cgo (Arbiter must run on Alpine).
+- Before changing a signature or renaming, use the `LSP` tool (gopls `findReferences`) to find every caller; don't rely on grep.
 - Tests that create a Unix socket need a short temp root (`os.MkdirTemp("", "arb")` with a `//nolint:usetesting` reason), because `t.TempDir()` paths can pass the ~104-byte socket path limit.
 
 **Validate before reporting** (if `go` or `golangci-lint` isn't on PATH, prepend the local toolchain; match the version to `go.mod`):
