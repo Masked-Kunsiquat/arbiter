@@ -104,7 +104,11 @@ func (s *Service) checkExportCurrent(ctx context.Context, prdID string, head led
 	if seq == 0 && !head.present {
 		return nil
 	}
-	if !head.present || head.seq != seq || head.hash != hash {
+	if head.present && head.seq == seq && head.hash != hash {
+		return fmt.Errorf("gitsign: the %s ledger committed on the feature branch diverges from the live chain at seq %d (entry_hash %s, live %s); the export was rewritten, so re-export it from the core",
+			prdID, seq, short(head.hash), short(hash))
+	}
+	if !head.present || head.seq != seq {
 		return fmt.Errorf("gitsign: the %s ledger committed on the feature branch is at seq %d, but the live chain is at seq %d; export it before the final merge",
 			prdID, head.seq, seq)
 	}

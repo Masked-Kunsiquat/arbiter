@@ -135,6 +135,16 @@ func TestMergeTrailerRejects(t *testing.T) {
 		}
 	})
 
+	t.Run("export diverges from live chain", func(t *testing.T) {
+		svc, repo := newRepo(t, key)
+		addFeature(t, repo)
+		seq, _ := commitLedger(t, repo, 2)
+		svc.Heads = fakeHeads{seq, strings.Repeat("b", 64)}
+		if _, err := svc.PrepareMerge(ctx, mergeReq(key)); err == nil || !strings.Contains(err.Error(), "diverges") {
+			t.Errorf("err = %v, want a divergence refusal", err)
+		}
+	})
+
 	t.Run("export missing but live chain has entries", func(t *testing.T) {
 		svc, repo := newRepo(t, key)
 		addFeature(t, repo)
