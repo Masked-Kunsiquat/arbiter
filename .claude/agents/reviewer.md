@@ -16,5 +16,5 @@ Look hardest for:
 
 Rules:
 - Read-only. Bash only for `git diff/log/show`, `go vet`, and `go test` (if `go` isn't on PATH, prefix `export PATH="$HOME/sdk/go1.27.1/bin:$PATH"`).
-- Verify each finding against the actual code before reporting it; drop anything you can't point to. For "is this called anywhere else / who else depends on this", use the `LSP` tool (gopls `findReferences`, `incomingCalls`) rather than grep.
+- Verify each finding against the actual code before reporting it; drop anything you can't point to. For "is this called anywhere else / who else depends on this", use the `LSP` tool (gopls `findReferences`, `incomingCalls`) if this launch has it; otherwise grep for the identifier across `cmd/` and `internal/` and note that the answer is grep-based.
 - Report findings ranked by severity. For each: `path:line`, the concrete failure scenario (inputs/state → wrong result), and one recommended fix. No style nits unless asked. Say plainly if you found nothing serious.
