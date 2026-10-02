@@ -170,8 +170,12 @@ func (v *verifier) commit(ctx context.Context, sha string) (string, error) {
 	}
 	at := time.Unix(c.committed, 0)
 	if v.signers.IsSupervisorKey(sig.PublicKey) {
-		// The final merge (Arbiter-PRD without Arbiter-Task) is the human's approval (§8.C);
-		// the supervisor signs task and export commits only.
+		// The supervisor signs task squash commits and ledger exports, both single-parent;
+		// merges, and above all the final merge (Arbiter-PRD without Arbiter-Task), are the
+		// human's approval (§8.C).
+		if c.parents > 1 {
+			return subject, errors.New("merge commit is signed by Arbiter's supervisor key, not a human")
+		}
 		if hasTrailer(c.message, "Arbiter-PRD") && !hasTrailer(c.message, "Arbiter-Task") {
 			return subject, errors.New("final merge is signed by Arbiter's supervisor key, not a human")
 		}
@@ -266,6 +270,7 @@ type commitInfo struct {
 	subject   string
 	email     string // committer email
 	committed int64  // committer timestamp, unix seconds
+	parents   int
 }
 
 // parseCommit splits a raw commit object, rebuilding the signed payload exactly (the inverse of
@@ -295,6 +300,9 @@ func parseCommit(raw []byte) (*commitInfo, error) {
 		}
 		inSig = false
 		kept = append(kept, line)
+		if strings.HasPrefix(line, "parent ") {
+			c.parents++
+		}
 		if m := committerRe.FindStringSubmatch(line); m != nil {
 			c.email = m[1]
 			c.committed, _ = strconv.ParseInt(m[2], 10, 64)

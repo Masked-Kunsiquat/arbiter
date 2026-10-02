@@ -318,6 +318,31 @@ func TestVerifyFailures(t *testing.T) {
 			substr: "not a human",
 		},
 		{
+			name: "merge commit signed by the supervisor",
+			setup: func(t *testing.T, r *repo) {
+				t.Helper()
+				r.write(t, ".arbiter/ledger/PRD-001.jsonl", good)
+				first := r.commit(t, msgFor(pinFor(chain)), sup)
+				r.write(t, "README.md", "x"+string(rune(10)))
+				second := r.commit(t, "plain work", nil)
+				tree := git(t, r.dir, "", "write-tree")
+				id := gitsign.Ident{Name: "Human", Email: humanEmail}
+				payload := gitsign.CommitPayload(tree, []string{second, first}, id, id, time.Now(), msgFor(pinFor(chain)))
+				sig, err := ledger.NewSSHSignerNamespace(sup, gitsign.Namespace).Sign(payload)
+				if err != nil {
+					t.Fatal(err)
+				}
+				obj, err := gitsign.AttachCommitSig(payload, sig, "gpgsig")
+				if err != nil {
+					t.Fatal(err)
+				}
+				sha := git(t, r.dir, string(obj), "hash-object", "-t", "commit", "-w", "--stdin")
+				git(t, r.dir, "", "update-ref", "refs/heads/main", sha)
+			},
+			in:     func(rep *Report) []Result { return rep.Commits },
+			substr: "merge commit is signed by Arbiter's supervisor key",
+		},
+		{
 			name: "ledger signed by a human key without namespaces",
 			setup: func(t *testing.T, r *repo) {
 				t.Helper()
