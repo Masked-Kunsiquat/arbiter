@@ -118,6 +118,7 @@ type Service struct {
 	ArbiterDir string // its .arbiter directory
 
 	Ledger   LedgerAppender   // may be nil (see LedgerAppender)
+	Heads    LedgerHeads      // may be nil (see LedgerHeads)
 	SpecHash SpecHasher       // may be nil (see SpecHasher)
 	Now      func() time.Time // nil means time.Now
 
@@ -291,9 +292,12 @@ func (s *Service) PrepareMerge(ctx context.Context, req MergeRequest) (*Prepared
 		return nil, fmt.Errorf("gitsign: merging %s into %s: %w", req.Source, req.Target, err)
 	}
 
-	msg := req.Message
-	if msg == "" {
-		msg = fmt.Sprintf("Merge %s (%s) into %s", req.PRDID, req.Source, req.Target)
+	msg, head, err := s.mergeMessage(ctx, req, source)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.checkExportCurrent(ctx, req.PRDID, head); err != nil {
+		return nil, err
 	}
 	payload := CommitPayload(tree, []string{target, source}, req.Signer.Ident, req.Signer.Ident, now, msg)
 	return s.store(&pending{

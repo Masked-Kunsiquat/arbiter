@@ -136,7 +136,7 @@ func TestClientChecks(t *testing.T) {
 	key := newTestKey(t, 1)
 	svc, repo := newRepo(t, key)
 	addFeature(t, repo)
-	lockReq := LockRequest{PRDID: "PRD-001", Signer: key.signerInfo()}
+	lockReq := LockRequest{PRDID: "PRD-001", Amend: true, Signer: key.signerInfo()} // addFeature locked v1
 	mergeReq := MergeRequest{PRDID: "PRD-001", Source: "feature", Target: "main", Signer: key.signerInfo()}
 
 	lock, err := svc.PrepareLock(ctx, lockReq)
@@ -165,7 +165,7 @@ func TestClientChecks(t *testing.T) {
 	}
 	evil := map[string]error{
 		"lock other commit":  CheckLock(ctx, svc.ArbiterDir, lockReq, tamper(lock, "object "+main, "object "+feature)),
-		"lock other tag":     CheckLock(ctx, svc.ArbiterDir, lockReq, tamper(lock, "PRD-001/v1", "PRD-001/v7")),
+		"lock other tag":     CheckLock(ctx, svc.ArbiterDir, lockReq, tamper(lock, "PRD-001/v2", "PRD-001/v7")),
 		"lock other tagger":  CheckLock(ctx, svc.ArbiterDir, lockReq, tamper(lock, "<human@example.com>", "<evil@example.com>")),
 		"lock extra header":  CheckLock(ctx, svc.ArbiterDir, lockReq, tamper(lock, "type commit\n", "type commit\nextra x\n")),
 		"lock other ref":     CheckLock(ctx, svc.ArbiterDir, lockReq, &Prepared{Payload: lock.Payload, Ref: "refs/tags/x"}),
@@ -174,6 +174,8 @@ func TestClientChecks(t *testing.T) {
 		"merge other ref":    CheckMerge(ctx, svc.ArbiterDir, mergeReq, &Prepared{Payload: merge.Payload, Ref: "refs/heads/feature"}),
 		"merge extra header": CheckMerge(ctx, svc.ArbiterDir, mergeReq, tamper(merge, "\n\n", "\nencoding x\n\n")),
 		"merge other author": CheckMerge(ctx, svc.ArbiterDir, mergeReq, tamper(merge, "author Human", "author Evil")),
+		"merge other lock":   CheckMerge(ctx, svc.ArbiterDir, mergeReq, tamper(merge, "PRD-001@v1", "PRD-001@v9")),
+		"merge no trailers":  CheckMerge(ctx, svc.ArbiterDir, mergeReq, tamper(merge, "\nArbiter-PRD: ", "\nX-PRD: ")),
 	}
 	for name, err := range evil {
 		if err == nil {

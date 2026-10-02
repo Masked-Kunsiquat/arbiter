@@ -338,9 +338,12 @@ func TestCompleteRejects(t *testing.T) {
 	})
 }
 
-// addFeature commits a file on a new branch "feature" and returns to main.
+// addFeature marks PRD-001 locked at v1, commits a file on a new branch
+// "feature" and returns to main. (A lightweight tag is enough: merges only
+// look up the latest lock version.)
 func addFeature(t *testing.T, repo string) {
 	t.Helper()
+	run(t, repo, "tag", "arbiter/prd/PRD-001/v1")
 	run(t, repo, "checkout", "-q", "-b", "feature")
 	writeFile(t, filepath.Join(repo, "feature.txt"), "feature\n")
 	run(t, repo, "add", ".")

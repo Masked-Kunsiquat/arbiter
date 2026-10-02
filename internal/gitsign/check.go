@@ -92,8 +92,9 @@ func CheckLock(ctx context.Context, arbiterDir string, req LockRequest, prep *Pr
 
 // CheckMerge verifies, client-side, that prep is the merge req asked for:
 // parents are the target and source heads in this checkout, the tree is the
-// one this checkout's `git merge-tree` produces, and the signer is author and
-// committer.
+// one this checkout's `git merge-tree` produces, the signer is author and
+// committer, and the message (with its Arbiter-PRD and Arbiter-Ledger
+// trailers) is the one this checkout builds.
 func CheckMerge(ctx context.Context, arbiterDir string, req MergeRequest, prep *Prepared) error {
 	local := NewService(arbiterDir)
 	targetRef := "refs/heads/" + req.Target
@@ -112,9 +113,18 @@ func CheckMerge(ctx context.Context, arbiterDir string, req MergeRequest, prep *
 	if err != nil {
 		return fmt.Errorf("gitsign: checking the core's merge locally: %w", err)
 	}
-	lines, _, err := splitObject(prep.Payload)
+	lines, msg, err := splitObject(prep.Payload)
 	if err != nil {
 		return err
+	}
+	// The trailers pin the lock version and the ledger head (§8.D), so the
+	// whole message must be what this checkout produces.
+	want, _, err := local.mergeMessage(ctx, req, source)
+	if err != nil {
+		return fmt.Errorf("gitsign: checking the core's merge message locally: %w", err)
+	}
+	if msg != message(want) {
+		return fmt.Errorf("gitsign: core's merge message differs from this checkout's:\n%s\n--- want ---\n%s", msg, message(want))
 	}
 	return expectHeaders(lines, []string{
 		"tree " + tree,
