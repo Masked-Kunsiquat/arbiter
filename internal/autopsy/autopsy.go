@@ -20,6 +20,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -55,6 +56,14 @@ const defaultBuildTimeout = 10 * time.Minute
 // (checkpoint/<task>/attempt-N) must only contain characters that are safe
 // in every git ref component.
 var taskRefPattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+
+// validTaskRef also applies git's per-component rules the character class
+// can't express: no leading or trailing dot, no "..", no ".lock" suffix.
+func validTaskRef(id string) bool {
+	return taskRefPattern.MatchString(id) &&
+		!strings.HasPrefix(id, ".") && !strings.HasSuffix(id, ".") &&
+		!strings.Contains(id, "..") && !strings.HasSuffix(id, ".lock")
+}
 
 // Request describes one invocation that ended without finishing.
 type Request struct {
@@ -195,7 +204,7 @@ func validateRequest(req Request) error {
 	if req.Attempt < 1 {
 		return fmt.Errorf("autopsy: invalid attempt %d, want >= 1", req.Attempt)
 	}
-	if !taskRefPattern.MatchString(req.TaskID) {
+	if !validTaskRef(req.TaskID) {
 		return fmt.Errorf("autopsy: task id %q is not safe for a git ref", req.TaskID)
 	}
 	return nil
@@ -267,6 +276,12 @@ func (r *Runner) decide(ctx context.Context, req Request) (*Result, error) {
 	buildPassed := true
 	if req.BuildCommand != "" {
 		output, err := r.runBuild(ctx, req.SlotPath, req.BuildCommand)
+		if errors.Is(err, errBuildNotRun) {
+			// Arbiter couldn't run the build at all; that says nothing
+			// about the agent's work, so report it instead of treating
+			// it as a failed build.
+			return res, err
+		}
 		res.BuildOutput = output
 		buildPassed = err == nil
 	}
@@ -377,11 +392,11 @@ func defaultBuildRunner(ctx context.Context, dir, command string) (string, error
 		if errors.Is(err, supervisor.ErrUnsupported) {
 			return execBuildRunner(ctx, dir, command)
 		}
-		return "", fmt.Errorf("autopsy: starting build supervisor: %w", err)
+		return "", fmt.Errorf("%w: starting build supervisor: %w", errBuildNotRun, err)
 	}
 
 	shellPath, shellArgs := shellCommand(command)
-	var output strings.Builder
+	var output lockedBuilder
 	h, err := sup.Spawn(supervisor.Cmd{
 		Path:   shellPath,
 		Args:   shellArgs,
@@ -391,7 +406,7 @@ func defaultBuildRunner(ctx context.Context, dir, command string) (string, error
 		Stderr: &output,
 	})
 	if err != nil {
-		return "", fmt.Errorf("autopsy: spawning build: %w", err)
+		return "", fmt.Errorf("%w: spawning build: %w", errBuildNotRun, err)
 	}
 
 	waitErr := make(chan error, 1)
@@ -399,12 +414,44 @@ func defaultBuildRunner(ctx context.Context, dir, command string) (string, error
 
 	select {
 	case <-ctx.Done():
-		_ = sup.Terminate(h, 5*time.Second)
-		<-waitErr
-		return output.String(), fmt.Errorf("autopsy: build timed out: %w", ctx.Err())
+		errs := []error{fmt.Errorf("autopsy: build timed out: %w", ctx.Err())}
+		if err := sup.Terminate(h, 5*time.Second); err != nil {
+			errs = append(errs, fmt.Errorf("autopsy: terminating build: %w", err))
+		}
+		select {
+		case <-waitErr:
+		case <-time.After(30 * time.Second):
+			// Output writers may still be live; don't read the buffer.
+			errs = append(errs, errors.New("autopsy: build did not exit after terminate"))
+			return "", errors.Join(errs...)
+		}
+		return output.String(), errors.Join(errs...)
 	case err := <-waitErr:
 		return output.String(), err
 	}
+}
+
+// errBuildNotRun marks a build Arbiter failed to start, as opposed to one
+// that ran and failed.
+var errBuildNotRun = errors.New("autopsy: build not run")
+
+// lockedBuilder is a strings.Builder safe for the concurrent stdout and
+// stderr writers.
+type lockedBuilder struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (l *lockedBuilder) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *lockedBuilder) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
 }
 
 // execBuildRunner is the plain os/exec fallback for platforms without a
@@ -658,7 +705,7 @@ func LatestSummary(ctx context.Context, db *sql.DB, taskID string) (string, erro
 		SELECT root_cause_summary FROM task_memories
 		WHERE task_id = ? AND observation_type = 'autopsy'
 		  AND root_cause_summary IS NOT NULL AND root_cause_summary != ''
-		ORDER BY created_at DESC, id DESC
+		ORDER BY attempt DESC, created_at DESC, id DESC
 		LIMIT 1`, taskID,
 	).Scan(&summary)
 	if errors.Is(err, sql.ErrNoRows) {

@@ -1012,3 +1012,16 @@ func TestWarningPrompt(t *testing.T) {
 		t.Errorf("WarningPrompt(%q) = %q, want %q", "tried X", got, want)
 	}
 }
+
+func TestRun_TaskIDGitRefRulesRejected(t *testing.T) {
+	r := &autopsy.Runner{Git: func(context.Context, string, ...string) (string, error) { return "", nil }}
+	for _, id := range []string{".task", "task.", "ta..sk", "task.lock"} {
+		_, err := r.Run(context.Background(), autopsy.Request{
+			InvocationID: "inv", SeatID: "seat", TaskID: id, Attempt: 1,
+			Cause: autopsy.CauseCrash, BaseCommit: "base", SlotPath: "slot",
+		})
+		if err == nil || !strings.Contains(err.Error(), "not safe for a git ref") {
+			t.Errorf("task id %q: got %v, want ref-safety error", id, err)
+		}
+	}
+}
