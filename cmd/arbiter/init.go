@@ -12,10 +12,11 @@ import (
 
 // runInit implements `arbiter init` (spec §9.B, §9.C, §13): detect the
 // repo's ecosystem, scaffold .arbiter/{worktrees,prds,ledger}/, write a
-// default config.toml, add the *.jsonl .gitattributes entry, then validate
+// default config.toml, add the *.jsonl .gitattributes entry and the
+// allowed_signers lines for the supervisor and human keys, then validate
 // the result so a broken install fails loudly at the point of creation
 // rather than on first use.
-func runInit(_ context.Context, args []string) error {
+func runInit(ctx context.Context, args []string) error {
 	force, err := parseInitArgs(args)
 	if err != nil {
 		return err
@@ -60,6 +61,10 @@ func runInit(_ context.Context, args []string) error {
 	}
 
 	if err := config.EnsureGitattributes(repoRoot); err != nil {
+		return err
+	}
+
+	if err := ensureAllowedSigners(ctx, repoRoot, arbiterDir); err != nil {
 		return err
 	}
 

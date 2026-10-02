@@ -22,6 +22,10 @@ const ConnectTimeout = 10 * time.Second
 type Session struct {
 	client *ipc.Client
 	host   *Host // non-nil when this session hosts the core
+
+	// arbiterDir is the client's own checkout, used to check what the
+	// core asks the human to sign (§8.C).
+	arbiterDir string
 }
 
 // Connect implements the client side of spec §10.B: try to connect to the
@@ -69,7 +73,7 @@ func tryConnect(ctx context.Context, arbiterDir, endpoint, repoHash string) (_ *
 		c, err := ipc.Handshake(ctx, conn, repoHash)
 		switch {
 		case err == nil:
-			return &Session{client: c}, false, nil
+			return &Session{client: c, arbiterDir: arbiterDir}, false, nil
 		case errors.Is(err, ipc.ErrHandshakeRefused), ctx.Err() != nil:
 			return nil, false, err
 		default:
@@ -92,7 +96,7 @@ func tryConnect(ctx context.Context, arbiterDir, endpoint, repoHash string) (_ *
 	if err != nil {
 		return nil, false, errors.Join(err, h.Close())
 	}
-	return &Session{client: c, host: h}, false, nil
+	return &Session{client: c, host: h, arbiterDir: arbiterDir}, false, nil
 }
 
 // Hosted reports whether this session hosts the core in-process.

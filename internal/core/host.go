@@ -23,6 +23,7 @@ import (
 
 	"github.com/Masked-Kunsiquat/arbiter/internal/corelock"
 	"github.com/Masked-Kunsiquat/arbiter/internal/db"
+	"github.com/Masked-Kunsiquat/arbiter/internal/gitsign"
 	"github.com/Masked-Kunsiquat/arbiter/internal/ipc"
 )
 
@@ -41,6 +42,11 @@ type Host struct {
 	srv  *ipc.Server
 
 	recovered []string
+
+	// signing prepares and completes human-signed objects (§8.C). Its
+	// Ledger and SpecHash stay nil until the ledger (#19) and PRD parser
+	// (#2) exist.
+	signing *gitsign.Service
 
 	serveCtx  context.Context
 	stopServe context.CancelFunc
@@ -72,7 +78,7 @@ func Open(ctx context.Context, arbiterDir string) (_ *Host, retErr error) {
 		return nil, err
 	}
 
-	h := &Host{arbiterDir: arbiterDir, repoHash: repoHash, endpoint: endpoint}
+	h := &Host{arbiterDir: arbiterDir, repoHash: repoHash, endpoint: endpoint, signing: gitsign.NewService(arbiterDir)}
 
 	h.lock, err = corelock.Acquire(arbiterDir)
 	if err != nil {
@@ -171,6 +177,12 @@ func (h *Host) Close() error {
 const (
 	MethodStatus    = "core.status"
 	MethodSeatsList = "seats.list"
+
+	// Human signing (§8.C): prepare returns the bytes to sign, complete
+	// takes the CLI's signature back.
+	MethodSignPrepareLock  = "sign.prepare_lock"  // gitsign.LockRequest → gitsign.Prepared
+	MethodSignPrepareMerge = "sign.prepare_merge" // gitsign.MergeRequest → gitsign.Prepared
+	MethodSignComplete     = "sign.complete"      // gitsign.CompleteRequest → gitsign.Completed
 )
 
 // Status is the result of MethodStatus.
@@ -201,6 +213,24 @@ func (h *Host) handle(ctx context.Context, method string, params json.RawMessage
 			return nil, err
 		}
 		return listSeats(ctx, h.db.SQLDB(), p.PRDID)
+	case MethodSignPrepareLock:
+		var p gitsign.LockRequest
+		if err := decodeParams(params, &p); err != nil {
+			return nil, err
+		}
+		return h.signing.PrepareLock(ctx, p)
+	case MethodSignPrepareMerge:
+		var p gitsign.MergeRequest
+		if err := decodeParams(params, &p); err != nil {
+			return nil, err
+		}
+		return h.signing.PrepareMerge(ctx, p)
+	case MethodSignComplete:
+		var p gitsign.CompleteRequest
+		if err := decodeParams(params, &p); err != nil {
+			return nil, err
+		}
+		return h.signing.Complete(ctx, p)
 	default:
 		return nil, ipc.Errorf(ipc.CodeUnknownMethod, "unknown method %q", method)
 	}

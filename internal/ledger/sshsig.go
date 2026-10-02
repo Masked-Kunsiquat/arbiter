@@ -46,7 +46,13 @@ type SSHSigner struct {
 
 // NewSSHSigner wraps an SSH key. Ed25519 is recommended: its signatures are deterministic,
 // so the same entry signs to the same bytes on every platform.
-func NewSSHSigner(s ssh.Signer) *SSHSigner { return &SSHSigner{signer: s, namespace: Namespace} }
+func NewSSHSigner(s ssh.Signer) *SSHSigner { return NewSSHSignerNamespace(s, Namespace) }
+
+// NewSSHSignerNamespace is NewSSHSigner for another namespace, e.g. "git" for commit and tag
+// signatures (§8.D).
+func NewSSHSignerNamespace(s ssh.Signer, namespace string) *SSHSigner {
+	return &SSHSigner{signer: s, namespace: namespace}
+}
 
 func (s *SSHSigner) PublicKey() ssh.PublicKey { return s.signer.PublicKey() }
 
@@ -66,44 +72,75 @@ func (s *SSHSigner) Sign(message []byte) (string, error) {
 	return armor(blob.Bytes()), nil
 }
 
-// VerifySSHSig checks an armored SSHSIG over message, made by pub in namespace.
-func VerifySSHSig(pub ssh.PublicKey, namespace string, message []byte, armored string) error {
+// Sig is a parsed SSHSIG blob.
+type Sig struct {
+	PublicKey ssh.PublicKey // the key the signature claims; trust it only after checking it elsewhere
+	Namespace string
+	signature ssh.Signature
+	blob      []byte
+}
+
+// Armor re-encodes the signature in canonical armor (70-column base64 lines, LF endings, no
+// trailing newline), whatever whitespace the parsed text had.
+func (s *Sig) Armor() string { return armor(s.blob) }
+
+// ParseSSHSig decodes an armored SSHSIG without verifying it. The embedded public key tells a
+// verifier which allowed_signers line to check; it is never trusted on its own.
+func ParseSSHSig(armored string) (*Sig, error) {
 	blob, err := dearmor(armored)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	r := bytes.NewReader(blob)
 	magic := make([]byte, len(sshsigMagic))
 	if _, err := r.Read(magic); err != nil || string(magic) != sshsigMagic {
-		return errors.New("sshsig: bad magic")
+		return nil, errors.New("sshsig: bad magic")
 	}
 	var version uint32
 	if err := binary.Read(r, binary.BigEndian, &version); err != nil || version != sshsigVersion {
-		return fmt.Errorf("sshsig: unsupported version %d", version)
+		return nil, fmt.Errorf("sshsig: unsupported version %d", version)
 	}
 	fields := make([][]byte, 5) // publickey, namespace, reserved, hash_algorithm, signature
 	for i := range fields {
 		if fields[i], err = readString(r); err != nil {
-			return fmt.Errorf("sshsig: truncated signature: %w", err)
+			return nil, fmt.Errorf("sshsig: truncated signature: %w", err)
 		}
 	}
 	if r.Len() != 0 {
-		return errors.New("sshsig: trailing data")
-	}
-	if !bytes.Equal(fields[0], pub.Marshal()) {
-		return errors.New("sshsig: signed by a different key")
-	}
-	if string(fields[1]) != namespace {
-		return fmt.Errorf("sshsig: namespace %q, want %q", fields[1], namespace)
+		return nil, errors.New("sshsig: trailing data")
 	}
 	if string(fields[3]) != sshsigHash {
-		return fmt.Errorf("sshsig: hash algorithm %q, want %q", fields[3], sshsigHash)
+		return nil, fmt.Errorf("sshsig: hash algorithm %q, want %q", fields[3], sshsigHash)
 	}
-	var sig ssh.Signature
-	if err := ssh.Unmarshal(fields[4], &sig); err != nil {
-		return fmt.Errorf("sshsig: bad signature blob: %w", err)
+	pub, err := ssh.ParsePublicKey(fields[0])
+	if err != nil {
+		return nil, fmt.Errorf("sshsig: bad public key: %w", err)
 	}
-	if err := pub.Verify(signedData(namespace, message), &sig); err != nil {
+	sig := &Sig{PublicKey: pub, Namespace: string(fields[1]), blob: blob}
+	if err := ssh.Unmarshal(fields[4], &sig.signature); err != nil {
+		return nil, fmt.Errorf("sshsig: bad signature blob: %w", err)
+	}
+	// OpenSSH's sshsig refuses SHA-1 RSA signatures; x/crypto would accept them, and git would
+	// then report an object Arbiter accepted as badly signed.
+	if sig.signature.Format == ssh.KeyAlgoRSA {
+		return nil, errors.New("sshsig: ssh-rsa (SHA-1) signatures are not accepted; use rsa-sha2-256 or rsa-sha2-512")
+	}
+	return sig, nil
+}
+
+// VerifySSHSig checks an armored SSHSIG over message, made by pub in namespace.
+func VerifySSHSig(pub ssh.PublicKey, namespace string, message []byte, armored string) error {
+	sig, err := ParseSSHSig(armored)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(sig.PublicKey.Marshal(), pub.Marshal()) {
+		return errors.New("sshsig: signed by a different key")
+	}
+	if sig.Namespace != namespace {
+		return fmt.Errorf("sshsig: namespace %q, want %q", sig.Namespace, namespace)
+	}
+	if err := pub.Verify(signedData(namespace, message), &sig.signature); err != nil {
 		return fmt.Errorf("sshsig: %w", err)
 	}
 	return nil
