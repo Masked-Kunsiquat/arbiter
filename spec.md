@@ -1,6 +1,14 @@
-# Arbiter Engine: Architecture & System Specification (v3.3)
+# Arbiter Engine: Architecture & System Specification (v3.4)
 
 A lean, local-first execution arbiter, task governor, and multi-agent coordination layer built on native Git primitives, embedded SQLite, and signed audit records.
+
+> **Changes from v3.3** (§8.C human SSH signing implementation, PR #53):
+>
+> | Issue | Resolution | Section |
+> |---|---|---|
+> | The human's final-merge signature covered the ledger only as of the last task commit; later entries were unpinned, so the chain's tail could be truncated silently | The core exports the chain onto the feature branch before the final merge, and the merge commit carries `Arbiter-PRD` and `Arbiter-Ledger` trailers, so the human signature pins the whole chain. No new §8.E action | §8.B, §8.C, §8.D |
+> | Client-side signing only resists a compromised or remote core if the client knows what it signs | The CLI rebuilds the expected object from its own checkout and refuses to sign anything else | §8.C |
+> | Which `allowed_signers` a human signature is checked against, and whether the supervisor key counts as a human, were unstated | Checked against the file as committed (at the tagged commit or the merge target); keys marked as Arbiter's (the `arbiter-ledger` namespace or an `arbiter@` principal) never count as human | §8.C |
 
 > **Changes from v3.2** (§5.3 warm slot implementation, PR #49):
 >
@@ -935,14 +943,14 @@ v1's per-agent ephemeral Ed25519 keypairs are **removed**. The supervisor held e
 - **Hash chain (ledger format v1):** `entry_hash = hex(sha256(JCS(entry)))`, where `entry` is the row as a JSON object with every column except `entry_hash` and `supervisor_signature`: `v`, `chain`, `seq`, `task_id` (`null` when absent), `seat_id`, `action`, `payload_json` (as parsed JSON), `created_at`, and `prev_hash`. `prev_hash` is the previous entry's `entry_hash` (lowercase hex), 64 zeros for `seq = 1`; it links the chain from *inside* the hashed object, so nothing is concatenated outside it. `JCS` is RFC 8785 JSON canonicalization. There is one chain per PRD (`chain = 'PRD-004'`) plus a `global` chain, so each exported ledger file verifies on its own.
   - **Pinned details:** `v` is `1` on every entry from the first one. `created_at` is UTC in exactly `YYYY-MM-DDTHH:MM:SS.ffffffZ` form. Payload numbers must be exactly representable as IEEE-754 doubles (integers within ±2^53); anything else is rejected at write time, never rounded.
   - **Signature:** OpenSSH SSHSIG (the `ssh-keygen -Y sign` format), namespace `arbiter-ledger` (distinct from git's `git`, so a ledger signature can't be replayed as a commit signature), over the message = the 64-character `entry_hash` with no newline. Stored armored: 70-column base64 lines, LF endings, no trailing newline. It checks with `ssh-keygen -Y verify -n arbiter-ledger`.
-  - **What it detects:** editing, re-attributing, reordering, or deleting any entry *before the last one*. Removing entries from the end leaves a shorter valid chain; that is detected only against a head pinned elsewhere, the `Arbiter-Ledger` trailer of a signed commit (§8.D). Entries written after the last signed task commit are not pinned by anything yet.
+  - **What it detects:** editing, re-attributing, reordering, or deleting any entry *before the last one*. Removing entries from the end leaves a shorter valid chain; that is detected only against a head pinned elsewhere, the `Arbiter-Ledger` trailer of a signed commit (§8.D). Entries written after the last signed task commit are pinned by the human-signed final merge, which carries the same trailer; until it lands, nothing pins them. Entries appended after the final merge are pinned only by a later signed commit.
   - **Frozen:** this format is frozen once the first ledger is committed. Any change bumps `v`, and verifiers keep accepting every earlier version. Never a silent rehash.
 
 ### 8.C Human Signatures (git-native, minimal prompts)
 
 Human authority uses git's native SSH signing (`git config gpg.format ssh`, `user.signingkey`, an `allowed_signers` file) and `ssh-keygen -Y sign/verify`. It works with ssh-agent, YubiKeys, and 1Password's SSH agent.
 
-**Signing is always client-side.** The core never holds your key. It prepares the object to sign (tag, merge commit, promotion manifest), your CLI signs it locally, and sends the signature back. This works the same whether the core is on your laptop or a server (§10).
+**Signing is always client-side.** The core never holds your key. It prepares the object to sign (tag, merge commit, promotion manifest), your CLI signs it locally, and sends the signature back. This works the same whether the core is on your laptop or a server (§10). Before signing, the CLI rebuilds the expected object from its own checkout (commit, parents, tree, tag name, identity, trailers) and refuses anything else, so a compromised or remote core can't get your signature on an object you didn't ask for. The core checks the signature against `allowed_signers` as committed at the tagged commit or the merge target, never a working-tree edit, and never accepts a key marked as Arbiter's own (§8.D) as a human signature.
 
 Signatures are required **only** for:
 
@@ -950,7 +958,7 @@ Signatures are required **only** for:
 |---|---|---|
 | PRD lock | Signed tag `arbiter/prd/<id>/v<n>` | 1 per feature |
 | PRD amendment (invariants / boundaries / ACs) | New signed tag `v<n+1>` | Rare |
-| Final feature → main merge | Signed merge commit | 1 per feature |
+| Final feature → main merge | Signed merge commit with `Arbiter-PRD` and `Arbiter-Ledger` trailers (§8.D) | 1 per feature |
 | Org promotion | One signature over a manifest listing all staged lessons | 1 per batch |
 
 Task-level merges into the feature branch are signed automatically by the **supervisor key** (§8.D), with no prompt. HITL approvals are keypresses recorded in the ledger. Typical cost: about 2 human signature prompts per feature.
@@ -978,7 +986,11 @@ The signature covers the trailers, so attribution can't be edited without breaki
 
 **2. Committed ledger.** Each PRD's chain is exported to `.arbiter/ledger/<PRD>.jsonl` and committed in each task's squash commit. Each line is exactly `JCS(hashed form + entry_hash + supervisor_signature)`, in `seq` order, with LF line endings. Verifiers reject any line that isn't byte-identical to its own canonical form, which rules out extra fields, duplicate keys, reformatting and non-canonical escapes in one check, and makes a re-export byte-identical. A trailing CR per line is tolerated for `core.autocrlf` checkouts; `arbiter init` adds `.arbiter/ledger/*.jsonl text eol=lf` to `.gitattributes`. The file holds the actions in §8.E: hashes and short summaries only, no transcripts or secrets. The `Arbiter-Ledger` trailer pins the chain head, so the signed commit vouches for the entire history before it. The `merge` entry for a commit can't contain that commit's own sha, so it records the tree hash of the merged content, and the next entry records the commit sha.
 
-**3. Human capstone.** The final feature → main merge is signed with *your* key. That key's signature covers everything the supervisor key did on the branch.
+**3. Human capstone.** The final feature → main merge is signed with *your* key. That key's signature covers everything the supervisor key did on the branch, including the end of the ledger:
+
+- Before preparing the merge, the core exports the PRD's chain to `.arbiter/ledger/<PRD>.jsonl` in a supervisor-signed commit on the feature branch, if anything was appended since the last task commit. The core refuses to prepare the merge while the committed export lags the live chain.
+- The merge message carries two trailers. `Arbiter-PRD: PRD-004@v2 (tag arbiter/prd/PRD-004/v2)` names the latest lock version; a PRD that was never locked can't be merged. `Arbiter-Ledger: .arbiter/ledger/PRD-004.jsonl#seq=162 sha256:4b07...` pins the head of the exported chain, which is part of the merged tree.
+- `audit verify` checks this trailer like any task commit's, so truncating the chain's tail breaks the human signature. There is no ledger action for the final merge: an entry can't record its own commit, and no later commit would carry one.
 
 **Verification:** `arbiter audit verify [<commit>]` (v0.1) checks commit signatures against `allowed_signers`, recomputes the ledger hash chain, verifies every entry's signature, and confirms that the chain ends exactly at each trailer's pinned head (which is what catches truncation). The verifying key always comes from `allowed_signers`, never from the ledger file: a rewritten chain re-signed with another key is internally consistent. The supervisor key's line restricts its namespaces, e.g. `arbiter@host namespaces="git,arbiter-ledger" ssh-ed25519 AAAA…`. It ships with the ledger because it is also the ledger's test oracle. Plain `git log --show-signature`, `ssh-keygen -Y verify`, and reading the JSONL get most of the way without Arbiter installed.
 
