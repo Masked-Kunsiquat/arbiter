@@ -460,10 +460,16 @@ func prdReview(ctx context.Context, root string, a prdArgs) error {
 	if err != nil {
 		return fmt.Errorf("arbiter prd review: %w", err)
 	}
-	done, err := sess.MergeFinal(ctx, gitsign.MergeRequest{PRDID: a.ID, Source: p.TargetBranch, Target: a.Into, Signer: signer}, sign)
+	// Merge the branch the signed lock names, not one edited into the
+	// working copy since.
+	source := st.TargetBranch
+	if source == "" {
+		source = p.TargetBranch
+	}
+	done, err := sess.MergeFinal(ctx, gitsign.MergeRequest{PRDID: a.ID, Source: source, Target: a.Into, Signer: signer}, sign)
 	if err != nil {
 		return fmt.Errorf("arbiter prd review: %w", err)
 	}
-	fmt.Printf("%s: merged %s into %s (commit %s)\n", a.ID, p.TargetBranch, a.Into, done.ObjectSHA)
+	fmt.Printf("%s: merged %s into %s (commit %s)\n", a.ID, source, a.Into, done.ObjectSHA)
 	return nil
 }
