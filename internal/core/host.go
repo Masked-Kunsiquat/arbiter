@@ -28,6 +28,7 @@ import (
 	"github.com/Masked-Kunsiquat/arbiter/internal/gitsign"
 	"github.com/Masked-Kunsiquat/arbiter/internal/ipc"
 	"github.com/Masked-Kunsiquat/arbiter/internal/ledger"
+	"github.com/Masked-Kunsiquat/arbiter/internal/prd"
 	"github.com/Masked-Kunsiquat/arbiter/internal/supervisorkey"
 )
 
@@ -51,8 +52,9 @@ type Host struct {
 	ledger *auditlog.Store
 
 	// signing prepares and completes human-signed objects (§8.C). It
-	// records prd_lock in the ledger and exports the ledger before the
-	// final merge; its SpecHash stays nil until the PRD parser (#2) exists.
+	// parses and hashes the PRD before a lock (§2.C), enforces the PRD
+	// lifecycle (§2.A), records prd_lock in the ledger, and exports the
+	// ledger before the final merge.
 	signing *gitsign.Service
 
 	serveCtx  context.Context
@@ -153,6 +155,8 @@ func (h *Host) openLedger() error {
 	h.signing.Entries = h.ledger
 	h.signing.Supervisor = ledger.NewSSHSignerNamespace(key, gitsign.Namespace)
 	h.signing.SupervisorIdent = gitsign.Ident{Name: "Arbiter", Email: allowedsigners.SupervisorPrincipal(host)}
+	h.signing.SpecHash = prd.Hasher{}
+	h.signing.PRDs = prdStore{h.db.SQLDB()}
 	return nil
 }
 
@@ -221,6 +225,7 @@ func (h *Host) Close() error {
 const (
 	MethodStatus    = "core.status"
 	MethodSeatsList = "seats.list"
+	MethodPRDGet    = "prd.get" // GetPRDParams → PRDState
 
 	// Human signing (§8.C): prepare returns the bytes to sign, complete
 	// takes the CLI's signature back.
@@ -257,6 +262,15 @@ func (h *Host) handle(ctx context.Context, method string, params json.RawMessage
 			return nil, err
 		}
 		return listSeats(ctx, h.db.SQLDB(), p.PRDID)
+	case MethodPRDGet:
+		var p GetPRDParams
+		if err := decodeParams(params, &p); err != nil {
+			return nil, err
+		}
+		if !prd.IDRe.MatchString(p.PRDID) {
+			return nil, ipc.Errorf(ipc.CodeBadParams, "bad PRD id %q", p.PRDID)
+		}
+		return getPRD(ctx, h.db.SQLDB(), p.PRDID)
 	case MethodSignPrepareLock:
 		var p gitsign.LockRequest
 		if err := decodeParams(params, &p); err != nil {

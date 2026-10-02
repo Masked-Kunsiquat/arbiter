@@ -16,6 +16,7 @@ import (
 	"github.com/Masked-Kunsiquat/arbiter/internal/allowedsigners"
 	"github.com/Masked-Kunsiquat/arbiter/internal/gitsign"
 	"github.com/Masked-Kunsiquat/arbiter/internal/ledger"
+	"github.com/Masked-Kunsiquat/arbiter/internal/prd"
 )
 
 func gitIn(t *testing.T, dir string, args ...string) string {
@@ -58,7 +59,7 @@ func TestSession_LockPRDOverIPC(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(dir, "prds"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "prds", "PRD-001.md"), []byte("# PRD-001\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "prds", "PRD-001.md"), validPRD(t), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	gitIn(t, repo, "add", ".arbiter/prds", ".arbiter/ledger")
@@ -88,6 +89,19 @@ func TestSession_LockPRDOverIPC(t *testing.T) {
 	obj := gitIn(t, repo, "cat-file", "tag", done.ObjectSHA)
 	if !strings.HasPrefix(obj+"\n", string(signed)) {
 		t.Errorf("tag object does not start with the signed payload:\n%s\n--- payload ---\n%s", obj, signed)
+	}
+
+	// The lock is recorded in state.db with the hash of what was tagged.
+	wantHash, err := prd.SpecHash(validPRD(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := s.GetPRD(context.Background(), "PRD-001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Status != prd.StatusLocked || st.LockTag != "arbiter/prd/PRD-001/v1" || st.SpecHash != wantHash {
+		t.Errorf("prd row = %+v, want locked, tag v1, spec_hash %s", st, wantHash)
 	}
 
 	// A signer error aborts without creating anything.

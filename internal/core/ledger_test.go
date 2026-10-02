@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"database/sql"
 	"os"
 	"path/filepath"
 	"strings"
@@ -61,7 +62,7 @@ func TestSession_LedgerEndToEnd(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(dir, "prds"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "prds", "PRD-001.md"), []byte("# PRD-001\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "prds", "PRD-001.md"), validPRD(t), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	gitIn(t, repo, "add", ".arbiter/prds", ".arbiter/ledger")
@@ -93,6 +94,12 @@ func TestSession_LedgerEndToEnd(t *testing.T) {
 	}
 	gitIn(t, repo, "add", "main.txt")
 	gitIn(t, repo, "commit", "-q", "-m", "main work")
+
+	// The final merge waits for a completed PRD. Task completion (#14) isn't
+	// built yet, so mark it directly.
+	withDB(t, dir, func(raw *sql.DB) {
+		mustExec(t, raw, `UPDATE prds SET status = 'completed' WHERE id = 'PRD-001'`)
+	})
 
 	if _, err := s.MergeFinal(ctx, gitsign.MergeRequest{PRDID: "PRD-001", Source: "feature", Target: "main", Signer: signer}, sign); err != nil {
 		t.Fatalf("MergeFinal: %v", err)
