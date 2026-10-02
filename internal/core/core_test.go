@@ -29,7 +29,23 @@ func TestMain(m *testing.M) {
 	if dir := os.Getenv(helperEnv); dir != "" {
 		os.Exit(runHelperHost(dir))
 	}
-	os.Exit(m.Run())
+	os.Exit(runIsolated(m))
+}
+
+// runIsolated points HOME (USERPROFILE on Windows) at a temporary directory
+// for the whole test binary, child hosts included, so opening a core
+// generates its supervisor key there and never in the developer's
+// ~/.config/arbiter.
+func runIsolated(m *testing.M) int {
+	home, err := os.MkdirTemp("", "arbiter-core-home-")
+	if err != nil {
+		os.Stderr.WriteString(err.Error() + "\n")
+		return 2
+	}
+	defer os.RemoveAll(home)
+	os.Setenv("HOME", home)
+	os.Setenv("USERPROFILE", home)
+	return m.Run()
 }
 
 // runHelperHost hosts the core like `arbiter run` would, printing READY

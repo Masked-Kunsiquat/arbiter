@@ -151,11 +151,9 @@ func generateAndSave(configDir, path string) (ssh.Signer, error) {
 	return signer, nil
 }
 
-// DefaultConfigDir returns ~/.config/arbiter (spec §8.B, §4.B), honoring
-// XDG_CONFIG_HOME when set, as os.UserConfigDir does on POSIX; on Windows it
-// falls back to os.UserConfigDir's %AppData%-based default since the spec
-// fixes ~/.config/arbiter as the Unix convention it's borrowing, not a
-// Windows one.
+// DefaultConfigDir returns ~/.config/arbiter (spec §8.B, §4.B) under
+// os.UserHomeDir ($HOME, or %USERPROFILE% on Windows) on every platform. It
+// does not consult XDG_CONFIG_HOME or %AppData%: the spec fixes the path.
 func DefaultConfigDir() (string, error) {
 	base, err := os.UserHomeDir()
 	if err != nil {
