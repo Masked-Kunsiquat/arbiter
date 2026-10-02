@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -104,6 +105,7 @@ type pending struct {
 	target    string // kindMerge: branch name
 	principal string
 	created   time.Time
+	signersAt string // the commit whose allowed_signers authorizes this object
 
 	// kindLock ledger fields
 	prdID, tag string
@@ -136,14 +138,30 @@ func (s *Service) now() time.Time {
 	return time.Now()
 }
 
-// AllowedSignersPath is the committed allowed_signers file (§8.D).
+// AllowedSignersPath is the allowed_signers file in the working tree (§8.D).
 func (s *Service) AllowedSignersPath() string {
 	return filepath.Join(s.ArbiterDir, filepath.FromSlash(allowedsigners.RelPath))
 }
 
+// signersAt reads allowed_signers as committed at commit. Signatures are
+// checked against the committed file, the one `arbiter audit verify` uses
+// later, never an uncommitted edit in the working tree.
+func (s *Service) signersAt(ctx context.Context, commit string) (*allowedsigners.File, error) {
+	path := ".arbiter/" + allowedsigners.RelPath
+	out, err := s.git(ctx, s.RepoDir, nil, "cat-file", "blob", commit+":"+path)
+	if err != nil {
+		return nil, fmt.Errorf("gitsign: %s is not committed at %s; run arbiter init and commit it: %w", path, short(commit), err)
+	}
+	f, err := allowedsigners.Parse(strings.NewReader(out))
+	if err != nil {
+		return nil, fmt.Errorf("gitsign: %s at %s: %w", path, short(commit), err)
+	}
+	return f, nil
+}
+
 // checkSigner fails early, before any prompt, when the human's key isn't in
-// allowed_signers for their email.
-func (s *Service) checkSigner(sg Signer, at time.Time) error {
+// allowed_signers (as committed at commit) for their email.
+func (s *Service) checkSigner(ctx context.Context, sg Signer, commit string, at time.Time) error {
 	if err := sg.validate(); err != nil {
 		return err
 	}
@@ -151,12 +169,15 @@ func (s *Service) checkSigner(sg Signer, at time.Time) error {
 	if err != nil {
 		return fmt.Errorf("gitsign: signer public key: %w", err)
 	}
-	signers, err := allowedsigners.Load(s.AllowedSignersPath())
+	signers, err := s.signersAt(ctx, commit)
 	if err != nil {
 		return err
 	}
+	if signers.IsSupervisorKey(key) {
+		return errors.New("gitsign: that is Arbiter's supervisor key; set user.signingkey to your own key")
+	}
 	if err := signers.Authorize(sg.Email, Namespace, key, at); err != nil {
-		return fmt.Errorf("gitsign: %w; add your key to %s (arbiter init does this from user.signingkey)", err, s.AllowedSignersPath())
+		return fmt.Errorf("gitsign: %w; add your key to .arbiter/%s and commit it (arbiter init does this from user.signingkey)", err, allowedsigners.RelPath)
 	}
 	return nil
 }
@@ -167,15 +188,15 @@ func (s *Service) PrepareLock(ctx context.Context, req LockRequest) (*Prepared, 
 		return nil, fmt.Errorf("gitsign: bad PRD id %q", req.PRDID)
 	}
 	now := s.now()
-	if err := s.checkSigner(req.Signer, now); err != nil {
-		return nil, err
-	}
 	rev := req.Commit
 	if rev == "" {
 		rev = "HEAD"
 	}
 	commit, err := s.revParse(ctx, rev+"^{commit}")
 	if err != nil {
+		return nil, err
+	}
+	if err := s.checkSigner(ctx, req.Signer, commit, now); err != nil {
 		return nil, err
 	}
 	prdPath := ".arbiter/prds/" + req.PRDID + ".md"
@@ -213,7 +234,7 @@ func (s *Service) PrepareLock(ctx context.Context, req LockRequest) (*Prepared, 
 	payload := TagPayload(commit, "commit", tag, req.Signer.Ident, now, fmt.Sprintf("%s %s v%d", verb, req.PRDID, version))
 	return s.store(&pending{
 		kind: kindLock, payload: payload, ref: "refs/tags/" + tag, principal: req.Signer.Email, created: now,
-		prdID: req.PRDID, tag: tag, specHash: specHash,
+		signersAt: commit, prdID: req.PRDID, tag: tag, specHash: specHash,
 	})
 }
 
@@ -245,9 +266,6 @@ func (s *Service) PrepareMerge(ctx context.Context, req MergeRequest) (*Prepared
 		return nil, errors.New("gitsign: merge needs a source and a target branch")
 	}
 	now := s.now()
-	if err := s.checkSigner(req.Signer, now); err != nil {
-		return nil, err
-	}
 	targetRef := "refs/heads/" + req.Target
 	if _, err := s.git(ctx, s.RepoDir, nil, "check-ref-format", targetRef); err != nil {
 		return nil, fmt.Errorf("gitsign: bad target branch %q", req.Target)
@@ -260,14 +278,16 @@ func (s *Service) PrepareMerge(ctx context.Context, req MergeRequest) (*Prepared
 	if err != nil {
 		return nil, err
 	}
+	if err := s.checkSigner(ctx, req.Signer, target, now); err != nil {
+		return nil, err
+	}
 	if _, err := s.git(ctx, s.RepoDir, nil, "merge-base", "--is-ancestor", source, target); err == nil {
 		return nil, fmt.Errorf("gitsign: %s is already merged into %s", req.Source, req.Target)
 	}
-	out, err := s.git(ctx, s.RepoDir, nil, "merge-tree", "--write-tree", "--no-messages", target, source)
+	tree, err := s.mergeTree(ctx, target, source)
 	if err != nil {
-		return nil, fmt.Errorf("gitsign: merging %s into %s has conflicts or failed: %w", req.Source, req.Target, err)
+		return nil, fmt.Errorf("gitsign: merging %s into %s: %w", req.Source, req.Target, err)
 	}
-	tree := strings.TrimSpace(strings.SplitN(out, "\n", 2)[0])
 
 	msg := req.Message
 	if msg == "" {
@@ -276,8 +296,23 @@ func (s *Service) PrepareMerge(ctx context.Context, req MergeRequest) (*Prepared
 	payload := CommitPayload(tree, []string{target, source}, req.Signer.Ident, req.Signer.Ident, now, msg)
 	return s.store(&pending{
 		kind: kindMerge, payload: payload, ref: targetRef, oldOID: target, target: req.Target,
-		principal: req.Signer.Email, created: now,
+		principal: req.Signer.Email, created: now, signersAt: target,
 	})
+}
+
+// mergeTree writes the merged tree of target and source and returns its id.
+// Exit status 1 from `git merge-tree --write-tree` means conflicts; anything
+// else usually means git is older than 2.38, which added --write-tree.
+func (s *Service) mergeTree(ctx context.Context, target, source string) (string, error) {
+	out, err := s.git(ctx, s.RepoDir, nil, "merge-tree", "--write-tree", "--no-messages", target, source)
+	if err != nil {
+		var ee *exec.ExitError
+		if errors.As(err, &ee) && ee.ExitCode() == 1 {
+			return "", errors.New("the merge has conflicts; resolve them on the feature branch first")
+		}
+		return "", fmt.Errorf("git merge-tree --write-tree failed (it needs git 2.38 or newer): %w", err)
+	}
+	return strings.TrimSpace(strings.SplitN(out, "\n", 2)[0]), nil
 }
 
 func (s *Service) store(p *pending) (*Prepared, error) {
@@ -324,18 +359,21 @@ func (s *Service) Complete(ctx context.Context, req CompleteRequest) (*Completed
 	if err != nil {
 		return nil, err
 	}
-	signers, err := allowedsigners.Load(s.AllowedSignersPath())
+	signers, err := s.signersAt(ctx, p.signersAt)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := Verify(signers, p.principal, p.payload, req.Signature, now); err != nil {
+	sig, err := Verify(signers, p.principal, p.payload, req.Signature, p.created)
+	if err != nil {
 		return nil, err
 	}
+	// Attach canonical armor, not the client's text: stray whitespace would
+	// verify here but make git and GitHub see the object as unsigned.
 	switch p.kind {
 	case kindLock:
-		return s.completeLock(ctx, p, req.Signature)
+		return s.completeLock(ctx, p, sig.Armor())
 	case kindMerge:
-		return s.completeMerge(ctx, p, req.Signature)
+		return s.completeMerge(ctx, p, sig.Armor())
 	default:
 		return nil, fmt.Errorf("gitsign: unknown request kind %d", p.kind)
 	}
@@ -415,20 +453,31 @@ func (s *Service) advanceBranch(ctx context.Context, branch, oldOID, newOID stri
 	return nil
 }
 
-// worktreeFor returns the worktree that has ref checked out, or "".
+// worktreeFor returns the worktree that has ref checked out, or "" if none
+// does, or if the one that does is prunable (its directory is gone).
 func (s *Service) worktreeFor(ctx context.Context, ref string) (string, error) {
-	out, err := s.git(ctx, s.RepoDir, nil, "worktree", "list", "--porcelain")
+	out, err := s.git(ctx, s.RepoDir, nil, "worktree", "list", "--porcelain", "-z")
 	if err != nil {
 		return "", err
 	}
+	// Attribute fields are NUL-terminated; an empty field ends a worktree.
 	var path string
-	for line := range strings.Lines(out) {
-		line = strings.TrimRight(line, "\r\n")
+	var match, prunable bool
+	for field := range strings.SplitSeq(out, "\x00") {
 		switch {
-		case strings.HasPrefix(line, "worktree "):
-			path = strings.TrimPrefix(line, "worktree ")
-		case line == "branch "+ref:
-			return path, nil
+		case field == "":
+			if match && !prunable {
+				if _, err := os.Stat(path); err == nil {
+					return path, nil
+				}
+			}
+			path, match, prunable = "", false, false
+		case strings.HasPrefix(field, "worktree "):
+			path = strings.TrimPrefix(field, "worktree ")
+		case field == "branch "+ref:
+			match = true
+		case field == "prunable" || strings.HasPrefix(field, "prunable "):
+			prunable = true
 		}
 	}
 	return "", nil

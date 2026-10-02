@@ -21,8 +21,6 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/crypto/ssh"
-
 	"github.com/Masked-Kunsiquat/arbiter/internal/allowedsigners"
 	"github.com/Masked-Kunsiquat/arbiter/internal/ledger"
 )
@@ -107,10 +105,13 @@ func AttachCommitSig(payload []byte, sig, header string) ([]byte, error) {
 }
 
 // Verify checks that sig is a valid git-namespace SSH signature over
-// payload, made by a key that signers authorizes for principal at time at.
-// The verifying key comes from signers; the key embedded in sig only selects
-// which line to check (§8.D). It returns the signing key.
-func Verify(signers *allowedsigners.File, principal string, payload []byte, sig string, at time.Time) (ssh.PublicKey, error) {
+// payload, made by a key that signers authorizes for principal at time at
+// (the object's own timestamp, which is what git checks against). The
+// verifying key comes from signers; the key embedded in sig only selects
+// which line to check (§8.D). The supervisor key is refused: it may sign
+// task commits, never human approvals. It returns the parsed signature, whose
+// Armor is what gets written into the object.
+func Verify(signers *allowedsigners.File, principal string, payload []byte, sig string, at time.Time) (*ledger.Sig, error) {
 	parsed, err := ledger.ParseSSHSig(sig)
 	if err != nil {
 		return nil, err
@@ -118,11 +119,14 @@ func Verify(signers *allowedsigners.File, principal string, payload []byte, sig 
 	if parsed.Namespace != Namespace {
 		return nil, fmt.Errorf("gitsign: signature namespace %q, want %q", parsed.Namespace, Namespace)
 	}
+	if signers.IsSupervisorKey(parsed.PublicKey) {
+		return nil, errors.New("gitsign: signed by Arbiter's supervisor key; human approvals need the human's key")
+	}
 	if err := signers.Authorize(principal, Namespace, parsed.PublicKey, at); err != nil {
 		return nil, fmt.Errorf("gitsign: %w", err)
 	}
 	if err := ledger.VerifySSHSig(parsed.PublicKey, Namespace, payload, sig); err != nil {
 		return nil, fmt.Errorf("gitsign: %w", err)
 	}
-	return parsed.PublicKey, nil
+	return parsed, nil
 }

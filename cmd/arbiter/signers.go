@@ -35,8 +35,11 @@ func ensureAllowedSigners(ctx context.Context, repoRoot, arbiterDir string) erro
 	if err != nil {
 		return fmt.Errorf("arbiter init: hostname for the supervisor key's principal: %w", err)
 	}
+	// A conflict here usually means the hostname changed (a renamed machine,
+	// a container's random hostname) and the key already has a line under
+	// the old principal. That line still authorizes it, so warn, don't fail.
 	if added, err := allowedsigners.Ensure(path, allowedsigners.SupervisorPrincipal(host), allowedsigners.SupervisorNamespaces, sup.PublicKey()); err != nil {
-		return err
+		fmt.Printf("arbiter init: warning: supervisor key not added: %v\n", err)
 	} else if added {
 		fmt.Printf("arbiter init: added the supervisor key (arbiter@%s) to %s\n", host, path)
 	}

@@ -17,6 +17,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -28,7 +29,7 @@ const RelPath = "ledger/allowed_signers"
 
 // SupervisorNamespaces and HumanNamespaces are the namespace sets Arbiter writes.
 var (
-	SupervisorNamespaces = []string{"git", "arbiter-ledger"}
+	SupervisorNamespaces = []string{"git", LedgerNamespace}
 	HumanNamespaces      = []string{"git"}
 )
 
@@ -342,4 +343,29 @@ func sameSet(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// LedgerNamespace is the namespace only the supervisor key may sign in.
+const LedgerNamespace = "arbiter-ledger"
+
+// IsSupervisorKey reports whether any line marks key as Arbiter's own: a line
+// allowing the arbiter-ledger namespace, or one with an arbiter@<host>
+// principal. Human-signature checks (§8.C) reject such keys, so the core,
+// which holds the supervisor key, can't stand in for the human.
+func (f *File) IsSupervisorKey(key ssh.PublicKey) bool {
+	kb := key.Marshal()
+	for _, l := range f.Lines {
+		if !bytes.Equal(l.Key.Marshal(), kb) {
+			continue
+		}
+		if slices.Contains(l.Namespaces, LedgerNamespace) {
+			return true
+		}
+		for _, p := range l.Principals {
+			if strings.HasPrefix(p, "arbiter@") {
+				return true
+			}
+		}
+	}
+	return false
 }

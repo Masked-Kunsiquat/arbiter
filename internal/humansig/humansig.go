@@ -138,13 +138,13 @@ func (s *Signer) resolveKey(ctx context.Context) (keyRef, error) {
 }
 
 // defaultKey runs gpg.ssh.defaultKeyCommand and returns its first non-empty line (a literal key).
+// Like git, it splits the command on whitespace and runs it without a shell.
 func (s *Signer) defaultKey(ctx context.Context) (string, error) {
-	var cmd *exec.Cmd
-	if runtime.GOOS == "windows" {
-		cmd = exec.CommandContext(ctx, "cmd", "/C", s.cfg.DefaultKeyCommand)
-	} else {
-		cmd = exec.CommandContext(ctx, "sh", "-c", s.cfg.DefaultKeyCommand)
+	argv := strings.Fields(s.cfg.DefaultKeyCommand)
+	if len(argv) == 0 {
+		return "", errors.New("humansig: gpg.ssh.defaultKeyCommand is empty")
 	}
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Stderr = s.stderr
 	out, err := cmd.Output()
 	if err != nil {

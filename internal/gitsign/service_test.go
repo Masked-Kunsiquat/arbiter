@@ -128,7 +128,8 @@ func (fakeHasher) SpecHash(prd []byte) (string, error) {
 func verifyWithGit(t *testing.T, svc *Service, repo, verb, name string) {
 	t.Helper()
 	if _, err := exec.LookPath("ssh-keygen"); err != nil {
-		t.Skip("ssh-keygen not on PATH")
+		t.Log("ssh-keygen not on PATH; skipping the git verify step only")
+		return
 	}
 	cmd := exec.Command("git", "-c", "gpg.ssh.allowedSignersFile="+filepath.ToSlash(svc.AllowedSignersPath()), verb, "-v", name)
 	cmd.Dir = repo

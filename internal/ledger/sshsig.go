@@ -77,7 +77,12 @@ type Sig struct {
 	PublicKey ssh.PublicKey // the key the signature claims; trust it only after checking it elsewhere
 	Namespace string
 	signature ssh.Signature
+	blob      []byte
 }
+
+// Armor re-encodes the signature in canonical armor (70-column base64 lines, LF endings, no
+// trailing newline), whatever whitespace the parsed text had.
+func (s *Sig) Armor() string { return armor(s.blob) }
 
 // ParseSSHSig decodes an armored SSHSIG without verifying it. The embedded public key tells a
 // verifier which allowed_signers line to check; it is never trusted on its own.
@@ -111,9 +116,14 @@ func ParseSSHSig(armored string) (*Sig, error) {
 	if err != nil {
 		return nil, fmt.Errorf("sshsig: bad public key: %w", err)
 	}
-	sig := &Sig{PublicKey: pub, Namespace: string(fields[1])}
+	sig := &Sig{PublicKey: pub, Namespace: string(fields[1]), blob: blob}
 	if err := ssh.Unmarshal(fields[4], &sig.signature); err != nil {
 		return nil, fmt.Errorf("sshsig: bad signature blob: %w", err)
+	}
+	// OpenSSH's sshsig refuses SHA-1 RSA signatures; x/crypto would accept them, and git would
+	// then report an object Arbiter accepted as badly signed.
+	if sig.signature.Format == ssh.KeyAlgoRSA {
+		return nil, errors.New("sshsig: ssh-rsa (SHA-1) signatures are not accepted; use rsa-sha2-256 or rsa-sha2-512")
 	}
 	return sig, nil
 }

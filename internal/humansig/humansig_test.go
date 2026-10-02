@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/pem"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,6 +18,12 @@ const fakeSig = "-----BEGIN SSH SIGNATURE-----\nFAKE\n-----END SSH SIGNATURE----
 
 // TestMain lets the test binary double as a fake signing program.
 func TestMain(m *testing.M) {
+	// "<test binary> --echo words..." stands in for a gpg.ssh.defaultKeyCommand
+	// like "ssh-add -L": git (and humansig) run it without a shell.
+	if len(os.Args) > 1 && os.Args[1] == "--echo" {
+		fmt.Println(strings.Join(os.Args[2:], " "))
+		os.Exit(0)
+	}
 	if os.Getenv("HUMANSIG_FAKE_SIGNER") == "1" {
 		os.Exit(fakeSigner())
 	}
@@ -201,8 +208,7 @@ func TestPublicKey(t *testing.T) {
 
 func TestPublicKeyDefaultKeyCommand(t *testing.T) {
 	_, _, pk := testKey(t, t.TempDir())
-	// "echo ..." works under both sh -c and cmd /C.
-	s, err := NewSigner(Config{Format: "ssh", DefaultKeyCommand: "echo " + keyText(pk), Email: "h@example.com"})
+	s, err := NewSigner(Config{Format: "ssh", DefaultKeyCommand: echoCommand(t, keyText(pk)), Email: "h@example.com"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -214,7 +220,7 @@ func TestPublicKeyDefaultKeyCommand(t *testing.T) {
 		t.Error("wrong key from defaultKeyCommand")
 	}
 
-	bad, err := NewSigner(Config{Format: "ssh", DefaultKeyCommand: "echo not-a-key", Email: "h@example.com"})
+	bad, err := NewSigner(Config{Format: "ssh", DefaultKeyCommand: echoCommand(t, "not-a-key"), Email: "h@example.com"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -337,7 +343,7 @@ func TestSignDefaultKeyCommandIsLiteral(t *testing.T) {
 	_, _, pk := testKey(t, t.TempDir())
 	s, argsFile, _ := fakeSignerFor(t, "placeholder")
 	s.cfg.SigningKey = ""
-	s.cfg.DefaultKeyCommand = "echo " + keyText(pk)
+	s.cfg.DefaultKeyCommand = echoCommand(t, keyText(pk))
 	if _, err := s.Sign(context.Background(), []byte("p")); err != nil {
 		t.Fatal(err)
 	}
@@ -385,4 +391,17 @@ func TestProgramPath(t *testing.T) {
 	if got := programPath(`"C:\Program Files\x\ssh-keygen.exe"`); got != `C:\Program Files\x\ssh-keygen.exe` {
 		t.Errorf("got %q", got)
 	}
+}
+
+// echoCommand is a defaultKeyCommand that prints text, via the test binary.
+func echoCommand(t *testing.T, text string) string {
+	t.Helper()
+	exe, err := filepath.Abs(os.Args[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.ContainsAny(exe, " 	") {
+		t.Skip("test binary path has whitespace; defaultKeyCommand is split on whitespace")
+	}
+	return exe + " --echo " + text
 }
