@@ -1,6 +1,18 @@
-# Arbiter Engine: Architecture & System Specification (v3.4)
+# Arbiter Engine: Architecture & System Specification (v3.5)
 
 A lean, local-first execution arbiter, task governor, and multi-agent coordination layer built on native Git primitives, embedded SQLite, and signed audit records.
+
+> **Changes from v3.4** (§9.A agent I/O contract, issue #20; evidence in `spikes/harness/FINDINGS.md` §6):
+>
+> | Issue | Resolution | Section |
+> |---|---|---|
+> | `terminal_reason` and `api_error_status` were "recorded with the invocation" but had no columns | Two nullable columns on `invocations` | §4, §9.A |
+> | A `--max-budget-usd` stop (`terminal_reason: "budget_exhausted"`, `is_error: true`) would have gone to the autopsy as a crash | New `exit_reason` `budget_exhausted`; the task goes to `awaiting_human` with no autopsy | §4, §5.8, §9.A |
+> | Untrusted data could close its own delimiter (`</diff>` inside a diff) | Closing tags inside a block are escaped | §9.A |
+> | The plan's semantic-check resume and the invalid-output resume could stack | One resume per invocation covers both; each launch is its own `invocations` row | §9.A |
+> | Evidence bundle: items 1–2 over the cap alone, items 3–4, and `bundle_hash` input were unspecified | Items 1–4 are never cut; an over-cap bundle is sent and flagged; `bundle_hash` = sha256 of the rendered bundle | §9.A |
+> | Agent git identity had no email format; `core.fsmonitor` not pinned for agents | `user.email = <seat id, / and ~ → .>@arbiter.invalid`; `core.fsmonitor=false` | §9.A |
+> | `PowerShell` in the edit roles' `--tools` on Linux | Unknown tool names are dropped by the harness; one list for every platform. The core checks `system/init` reports exactly the profile's tools and no MCP servers, else kills the run | §9.A |
 
 > **Changes from v3.3** (§8.C human SSH signing implementation, PR #53):
 >
@@ -458,9 +470,11 @@ CREATE TABLE invocations (
     supervisor_handle TEXT,                  -- PGID (POSIX) or Job Object name (Windows)
     pid INTEGER,
     lease_expires_at DATETIME,               -- renewed by supervisor observation, not by the model
-    exit_reason TEXT CHECK (exit_reason IN ('ok', 'invalid_output', 'crash', 'lease_expired', 'killed')),
+    exit_reason TEXT CHECK (exit_reason IN ('ok', 'invalid_output', 'crash', 'lease_expired', 'killed', 'budget_exhausted')),
     cost_usd REAL,                           -- from the harness's final result event (§9.A); NULL if none arrived (killed)
     cost_estimated INTEGER NOT NULL DEFAULT 0, -- 1 when cost_usd was summed from streamed usage instead (§5.8)
+    terminal_reason TEXT,                    -- the result event's terminal_reason (§9.A); NULL if none arrived
+    api_error_status INTEGER,                -- the result event's api_error_status (e.g. 404, 529); NULL if none
     started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     ended_at DATETIME,
     FOREIGN KEY(seat_id) REFERENCES seats(id)
@@ -735,7 +749,7 @@ Every retry path has one shared bound.
 
 - **Attempt ceiling:** every agent relaunch for a task increments `tasks.attempt`, whatever the reason: diff-check rejection, upheld rejection, integration red, rebase conflict, crash or lease expiry, granted scope request, invalid-output retry. At `attempt > max_attempts` (default 6, set in project config) the task goes to `awaiting_human`. The narrower caps (3 upheld rejections, 2 adversary regenerations, 1 schema retry) still apply inside it.
 - **Budget:** each invocation records `cost_usd` from the harness's final result event (§9.A). Task spend and PRD spend (`prds.spent_usd`) are sums of that. Before every launch the core checks `prds.spent_usd < max_budget_usd`; if the budget is used up, the task goes to `awaiting_human` and nothing new launches for that PRD. On subscription plans the reported cost is notional but still works as a relative brake.
-  - **The harness enforces the cap too.** Every launch passes `--max-budget-usd <max_budget_usd − prds.spent_usd>`, so a runaway invocation stops mid-run instead of being noticed at exit.
+  - **The harness enforces the cap too.** Every launch passes `--max-budget-usd <max_budget_usd − prds.spent_usd>`, so a runaway invocation stops mid-run instead of being noticed at exit. The stop is checked between turns, so the reported cost can overshoot the cap. It ends with `terminal_reason: "budget_exhausted"`; that invocation's `exit_reason` is `budget_exhausted` (not a crash, no autopsy), its cost is recorded, and the task goes to `awaiting_human`.
   - **Killed invocations report no cost.** A process stopped by lease expiry, `Terminate`, or a crash emits no `result` event. The core then sums the per-message `usage` from the streamed `assistant` events against a model price table, stores that as `cost_usd`, and sets `invocations.cost_estimated = 1`. If even that is unavailable, `cost_usd` stays NULL and the ledger `exit` entry records `null`. The budget check counts estimates and treats a NULL as unknown, flagged to the human at the next HITL prompt.
 - **Ways out of `awaiting_human`** (the HITL prompt, §5.7):
   - **Approve**: continue to the next step (integration gate, or the verdict for "no adversarial coverage").
@@ -1053,10 +1067,11 @@ claude -p --model <model> --output-format stream-json --verbose \
 
   `--bare` would be leaner but accepts only `ANTHROPIC_API_KEY`, never subscription (OAuth) login, so it isn't used.
 - **Prompt on stdin, never in argv.** A prompt carrying a diff easily overflows Windows' 32,767-character command-line limit, or 8,191 if the command goes through `cmd.exe`. On Windows, `harness.command` must resolve to a native `.exe`; startup validation (§13) rejects a `.cmd`/`.bat` shim.
-- **Prompt layout: instruction first, data fenced.** Every prompt starts with the role instruction; diffs, test output, specs and other untrusted material follow in delimited blocks (`<diff>…</diff>`). An instruction placed after a large blob reads like prompt injection, and the model may refuse it.
+- **Prompt layout: instruction first, data fenced.** Every prompt starts with the role instruction; diffs, test output, specs and other untrusted material follow in delimited blocks (`<diff>…</diff>`). An instruction placed after a large blob reads like prompt injection, and the model may refuse it. A block's own closing tag inside its body (`</diff` in a diff) is escaped as `<\/diff`, so data can't end its block early.
 - **Streaming output** gives the supervisor a stdout event per turn and tool call (liveness, §7) and a live feed for the TUI. The final `result` event carries the model's final message, `session_id` (stored as `seats.harness_session_id`; it stays the same across `--resume`), `is_error`, and `total_cost_usd` (stored as `invocations.cost_usd`, §5.8).
-- **Reading the stream.** Read stdout to EOF: `result` is not always the last event (hook events can follow it). The invocation succeeded only if `is_error == false`. Never go by `subtype`: an API error arrives as `subtype: "success"` with `is_error: true`. No `result` event at all (killed, crashed) is a crash (autopsy). `terminal_reason` and `api_error_status` are recorded with the invocation. `rate_limit_event` carries subscription utilization; it's shown in the TUI and logged.
-- **Git environment** is overridden per process with `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n` (git ≥ 2.31): `commit.gpgsign=false` and `tag.gpgsign=false` (so a global signing setup never prompts you for an agent's commit), `core.hooksPath=<empty arbiter dir>`, and `user.name`/`user.email` = the seat. `GIT_TERMINAL_PROMPT=0` as well.
+- **Reading the stream.** Read stdout to EOF: `result` is not always the last event (hook events can follow it). The invocation succeeded only if `is_error == false`. Never go by `subtype`: an API error arrives as `subtype: "success"` with `is_error: true`. No `result` event at all (killed, crashed) is a crash (autopsy). `terminal_reason: "budget_exhausted"` is the `--max-budget-usd` stop: exit reason `budget_exhausted`, task to `awaiting_human`, no autopsy (§5.8). `terminal_reason` and `api_error_status` are recorded with the invocation (§4). `rate_limit_event` carries subscription utilization; it's shown in the TUI and logged.
+- **Checking the baseline took.** The `system/init` event lists the loaded `tools` and `mcp_servers`. If the tools aren't exactly the role profile's (the harness silently drops names it doesn't have, such as `PowerShell` on Linux, so missing names are fine) or any MCP server is loaded, the core terminates the run as a crash and logs a violation. A harness update that changes what a flag means then fails loudly instead of widening a role.
+- **Git environment** is overridden per process with `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n` (git ≥ 2.31): `commit.gpgsign=false` and `tag.gpgsign=false` (so a global signing setup never prompts you for an agent's commit), `core.hooksPath=<empty arbiter dir>`, `core.fsmonitor=false`, and `user.name` = the seat id, `user.email` = the seat id with `/` and `~` replaced by `.`, at `arbiter.invalid` (RFC 2606, never deliverable). Any inherited `GIT_CONFIG_COUNT`/`KEY`/`VALUE` variables are dropped first. `GIT_TERMINAL_PROMPT=0` as well.
 - **Role tool profiles** (defense in depth on top of the diff check). A role is defined by `--tools`, which decides which tools *exist*, plus allow rules for which shell commands may run. `--allowedTools` alone is only a permission allow-list: every other tool stays loaded, and anything else that grants permission (a permission mode, a settings file) lets it through.
 
 | Role | Profile flags (on top of the baseline) | After exit |
@@ -1068,7 +1083,7 @@ claude -p --model <model> --output-format stream-json --verbose \
 
   `harness.shell_allow` (§9.C) lists the shell commands the edit roles may run, as Claude Code allow rules (e.g. `Bash(go test *)`); everything else is denied. The list doesn't stop a test file from running arbitrary code; the diff check is the boundary for tracked files, and the unseen-state check is a tripwire for the rest (§5.3). Neither contains a hostile process (§8.A).
 
-**Result.** The model's final message must be exactly one JSON object; Arbiter strips a single surrounding code fence if present. It's validated against the schema for the invocation's `purpose`. Invalid output → **resume the same session once** with the validation error (the worker's edits are kept), then treat it as a crash (autopsy). Either way it counts as an attempt.
+**Result.** The model's final message must be exactly one JSON object; Arbiter strips a single surrounding code fence if present. It's validated against the schema for the invocation's `purpose`. Invalid output → **resume the same session once** with the validation error (the worker's edits are kept), then treat it as a crash (autopsy). Either way it counts as an attempt. That one resume covers both the schema check and any semantic check the core applies to the output (the plan's cycle and boundary checks below): an invocation never gets two. Each launch is its own `invocations` row; the first ends `invalid_output`. Unknown fields are invalid, and so is any rule in the table below (e.g. a 201-character summary); nothing is silently repaired.
 
 **Output schemas** (fields are required unless marked `?`):
 
@@ -1092,7 +1107,7 @@ claude -p --model <model> --output-format stream-json --verbose \
 5. The worker diff and the attack-test diff.
 6. Output of passing tests.
 
-When over the cap, items are cut from the bottom up: passing-test output first, then the attack-test diff is replaced by `git diff --stat` lines, then the largest worker file diffs are replaced by stat lines, one at a time. The Judge runs read-only in the slot with `submit_commit` checked out, so it can open any truncated file itself.
+When over the cap, items are cut from the bottom up: passing-test output first, then the attack-test diff is replaced by `git diff --stat` lines, then the largest worker file diffs are replaced by stat lines, one at a time. Items 1–4 are never cut. If the bundle is still over the cap after every cut, it is sent anyway and the overrun is recorded in the verdict's ledger entry; the Judge can answer `needs_human`. `bundle_hash` is the sha256 of the rendered bundle exactly as sent. The Judge runs read-only in the slot with `submit_commit` checked out, so it can open any truncated file itself.
 
 MCP (v0.3+) adds mid-run tools (`reserve`, `get_context`, `ask_judge`) and attached interactive sessions, using `connection` binding (§8.B). The I/O contract above stays valid; MCP is an addition, not a replacement.
 
