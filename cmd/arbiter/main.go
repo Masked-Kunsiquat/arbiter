@@ -2,8 +2,8 @@
 //
 // This is a v0.1 bootstrap scaffold: only enough of the command tree exists
 // to unblock work that depends on a CLI entrypoint (e.g. `arbiter seats`,
-// issue #5; `arbiter init`, issue #1). PRD lifecycle commands and the
-// Runner are not implemented yet; the process supervisor it will use is
+// issue #5; `arbiter init`, issue #1; `arbiter prd`, issue #2). The Runner is
+// not implemented yet; the process supervisor it will use is
 // internal/supervisor (issue #15).
 //
 // Commands reach state through the core, never by opening state.db
@@ -47,6 +47,11 @@ func run(ctx context.Context, args []string) error {
 			return err
 		}
 		return runSeats(ctx, args[1:])
+	case "prd":
+		if err := loadAndValidateConfig(); err != nil {
+			return err
+		}
+		return runPRD(ctx, args[1:])
 	case "audit":
 		return runAudit(ctx, args[1:])
 	case "-h", "--help", "help":
@@ -92,6 +97,10 @@ Usage:
   arbiter init [--force]               Detect ecosystem, scaffold .arbiter/, write config.toml
   arbiter seats [<prd-id>] [--stats]   Print the agent tree
   arbiter audit verify [<commit>]      Verify commit signatures and the committed ledger (git only)
+  arbiter prd init "<title>" [--branch <name>]   Create the next draft PRD in .arbiter/prds/
+  arbiter prd lock <prd-id>            Commit the PRD and create its signed lock tag
+  arbiter prd amend <prd-id>           Sign the next lock tag version for an amended PRD
+  arbiter prd review <prd-id> [--into <branch>]  Summarize a PRD; offer the signed final merge when completed
 
 Only a subset of the full CLI command suite (spec §9.B) exists so far.`)
 }
