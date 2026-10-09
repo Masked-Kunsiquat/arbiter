@@ -143,3 +143,19 @@ func TestLaunchArgsNeverCarriesPrompt(t *testing.T) {
 		}
 	}
 }
+
+func TestLaunchArgsRejectsFlagLikeValues(t *testing.T) {
+	for name, mutate := range map[string]func(*Launch){
+		"model flag":       func(l *Launch) { l.Model = "--dangerously-skip-permissions" },
+		"model space":      func(l *Launch) { l.Model = "opus --verbose" },
+		"resume flag":      func(l *Launch) { l.ResumeSessionID = "--continue" },
+		"resume non-uuid":  func(l *Launch) { l.ResumeSessionID = "../../x" },
+		"shell_allow flag": func(l *Launch) { l.Role = seat.RoleWorker; l.ShellAllow = []string{"--dangerously-skip-permissions"} },
+	} {
+		l := baseLaunch()
+		mutate(&l)
+		if args, err := l.Args(); err == nil {
+			t.Errorf("%s: Args() = %q, want an error", name, args)
+		}
+	}
+}

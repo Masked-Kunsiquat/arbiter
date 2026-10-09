@@ -27,8 +27,9 @@ type Block struct {
 }
 
 // Render returns the prompt text. Inside each body, the block's own closing
-// tag (matched case-insensitively) is escaped as <\/tag, so data can't end
-// its block early and pass what follows off as instructions.
+// tag is escaped as <\/tag, matched case-insensitively and with any
+// whitespace around the slash (a model reads "< /diff>" as a close too), so
+// data can't end its block early and pass what follows off as instructions.
 func (p Prompt) Render() (string, error) {
 	if strings.TrimSpace(p.Instruction) == "" {
 		return "", errors.New("agent: prompt needs an instruction")
@@ -40,8 +41,8 @@ func (p Prompt) Render() (string, error) {
 		if !tagPattern.MatchString(blk.Tag) {
 			return "", fmt.Errorf("agent: invalid prompt block tag %q", blk.Tag)
 		}
-		closing := regexp.MustCompile(`(?i)</(` + blk.Tag + `)`)
-		body := closing.ReplaceAllString(blk.Body, `<\/$1`)
+		closing := regexp.MustCompile(`(?i)<(\s*)/(\s*` + blk.Tag + `)`)
+		body := closing.ReplaceAllString(blk.Body, `<$1\/$2`)
 		fmt.Fprintf(&b, "\n<%s>\n%s", blk.Tag, body)
 		if !strings.HasSuffix(body, "\n") {
 			b.WriteString("\n")

@@ -61,3 +61,15 @@ func TestPromptRenderRejectsBadInput(t *testing.T) {
 		}
 	}
 }
+
+func TestPromptRenderEscapesLooseClosingTags(t *testing.T) {
+	body := "< /diff>\n</ diff>\n<\t/DIFF>\n"
+	got, err := Prompt{Instruction: "Review.", Blocks: []Block{{Tag: "diff", Body: body}}}.Render()
+	if err != nil {
+		t.Fatal(err)
+	}
+	inner := strings.TrimSuffix(got, "</diff>\n")
+	if strings.Contains(strings.ToLower(strings.Join(strings.Fields(inner), "")), "</diff") {
+		t.Errorf("a whitespace-padded closing tag survived:\n%q", got)
+	}
+}

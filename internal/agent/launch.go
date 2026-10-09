@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -21,6 +22,14 @@ import (
 // ErrBudgetExhausted is returned by Launch.Args when less than the smallest
 // amount --max-budget-usd can express is left (§5.8: nothing new launches).
 var ErrBudgetExhausted = errors.New("agent: PRD budget exhausted")
+
+// modelPattern and sessionPattern keep argv values from reading as flags
+// (or anything else) to the harness: a model id never starts with "-" or
+// holds whitespace, and a session id is a UUID.
+var (
+	modelPattern   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:@/\[\]-]*$`)
+	sessionPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+)
 
 // budgetStep is the granularity of --max-budget-usd: 1/10000 USD.
 const budgetStep = 1e4
@@ -52,6 +61,10 @@ func ProfileFor(role seat.Role, shellAllow []string) (Profile, error) {
 			// a rule would split it into two, one broader than intended.
 			if strings.Contains(rule, ",") {
 				return Profile{}, fmt.Errorf("agent: shell_allow rule %q contains a comma", rule)
+			}
+			// The joined value must not read as a flag either.
+			if rule == "" || strings.HasPrefix(rule, "-") {
+				return Profile{}, fmt.Errorf("agent: invalid shell_allow rule %q", rule)
 			}
 		}
 		return Profile{Tools: editTools, PermissionMode: "acceptEdits", AllowedTools: shellAllow}, nil
@@ -89,8 +102,11 @@ type Launch struct {
 // Args returns the harness arguments (§9.A launch recipe), not including the
 // program itself. The prompt is never among them: it goes on stdin.
 func (l Launch) Args() ([]string, error) {
-	if l.Model == "" {
-		return nil, errors.New("agent: launch needs a model")
+	if !modelPattern.MatchString(l.Model) {
+		return nil, fmt.Errorf("agent: invalid model %q", l.Model)
+	}
+	if l.ResumeSessionID != "" && !sessionPattern.MatchString(l.ResumeSessionID) {
+		return nil, fmt.Errorf("agent: invalid harness session id %q", l.ResumeSessionID)
 	}
 	profile, err := ProfileFor(l.Role, l.ShellAllow)
 	if err != nil {
