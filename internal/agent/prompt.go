@@ -7,6 +7,15 @@ import (
 	"strings"
 )
 
+// closeParts match the pieces of a closing tag the way a model may read
+// one: "<" or a lookalike, then any whitespace, separator or invisible
+// format character (zero-width space, joiner, ...), then "/" or a lookalike.
+const (
+	closeLT    = `[<\x{FF1C}\x{FE64}]`
+	closeGap   = `[\s\p{Z}\p{Cf}]*`
+	closeSlash = `[/\x{FF0F}\x{2215}\x{2044}]`
+)
+
 // tagPattern limits block tags to names that can't break the delimiter
 // syntax themselves.
 var tagPattern = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
@@ -27,9 +36,11 @@ type Block struct {
 }
 
 // Render returns the prompt text. Inside each body, the block's own closing
-// tag is escaped as <\/tag, matched case-insensitively and with any
-// whitespace around the slash (a model reads "< /diff>" as a close too), so
-// data can't end its block early and pass what follows off as instructions.
+// tag is escaped by putting a backslash before the slash (<\/tag). It is
+// matched case-insensitively and loosely (closeParts: "< /diff", "</ diff",
+// fullwidth and zero-width variants), since a model reads those as a close
+// too, so data can't end its block early and pass what follows off as
+// instructions.
 func (p Prompt) Render() (string, error) {
 	if strings.TrimSpace(p.Instruction) == "" {
 		return "", errors.New("agent: prompt needs an instruction")
@@ -41,8 +52,8 @@ func (p Prompt) Render() (string, error) {
 		if !tagPattern.MatchString(blk.Tag) {
 			return "", fmt.Errorf("agent: invalid prompt block tag %q", blk.Tag)
 		}
-		closing := regexp.MustCompile(`(?i)<(\s*)/(\s*` + blk.Tag + `)`)
-		body := closing.ReplaceAllString(blk.Body, `<$1\/$2`)
+		closing := regexp.MustCompile(`(?i)(` + closeLT + closeGap + `)(` + closeSlash + `)(` + closeGap + blk.Tag + `)`)
+		body := closing.ReplaceAllString(blk.Body, `$1\$2$3`)
 		fmt.Fprintf(&b, "\n<%s>\n%s", blk.Tag, body)
 		if !strings.HasSuffix(body, "\n") {
 			b.WriteString("\n")

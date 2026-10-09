@@ -73,3 +73,22 @@ func TestPromptRenderEscapesLooseClosingTags(t *testing.T) {
 		t.Errorf("a whitespace-padded closing tag survived:\n%q", got)
 	}
 }
+
+func TestPromptRenderEscapesUnicodeLookalikeClosingTags(t *testing.T) {
+	for _, planted := range []string{
+		"<​/diff>", // zero-width space
+		"< /diff>", // no-break space
+		"＜/diff＞",  // fullwidth < and >
+		"<／diff>",  // fullwidth solidus
+		"<∕diff>",  // division slash
+		"﹤/‍diff>", // small < and zero-width joiner
+	} {
+		got, err := Prompt{Instruction: "Review.", Blocks: []Block{{Tag: "diff", Body: planted}}}.Render()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(got, planted) {
+			t.Errorf("%q survived unescaped:\n%q", planted, got)
+		}
+	}
+}
