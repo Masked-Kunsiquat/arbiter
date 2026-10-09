@@ -13,12 +13,14 @@ import (
 	"testing"
 
 	"github.com/Masked-Kunsiquat/arbiter/internal/config"
+	"github.com/Masked-Kunsiquat/arbiter/internal/gittest"
 	"github.com/Masked-Kunsiquat/arbiter/internal/worktree"
 )
 
 // initGitRepo initializes a temporary git repository with an initial commit.
 func initGitRepo(t *testing.T) (repoRoot, initialCommit string) {
 	t.Helper()
+	gittest.Isolate(t)
 	repoRoot = t.TempDir()
 
 	runGit := func(args ...string) string {

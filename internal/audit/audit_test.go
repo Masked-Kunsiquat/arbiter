@@ -15,6 +15,7 @@ import (
 
 	"github.com/Masked-Kunsiquat/arbiter/internal/allowedsigners"
 	"github.com/Masked-Kunsiquat/arbiter/internal/gitsign"
+	"github.com/Masked-Kunsiquat/arbiter/internal/gittest"
 	"github.com/Masked-Kunsiquat/arbiter/internal/ledger"
 )
 
@@ -52,12 +53,7 @@ type repo struct {
 
 func newRepo(t *testing.T, sup ssh.Signer) *repo {
 	t.Helper()
-	empty := filepath.Join(t.TempDir(), "gitconfig")
-	if err := os.WriteFile(empty, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("GIT_CONFIG_GLOBAL", empty)
-	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	gittest.Isolate(t)
 	dir := t.TempDir()
 	git(t, dir, "", "init", "-q", "-b", "main")
 	git(t, dir, "", "config", "user.name", "Human")

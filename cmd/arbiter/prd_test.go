@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Masked-Kunsiquat/arbiter/internal/gittest"
 	"github.com/Masked-Kunsiquat/arbiter/internal/prd"
 )
 
@@ -84,12 +85,7 @@ func TestFormatLineErrors(t *testing.T) {
 // findStateDB), isolates git config, and chdirs into it.
 func gitRepo(t *testing.T) string {
 	t.Helper()
-	empty := filepath.Join(t.TempDir(), "gitconfig")
-	if err := os.WriteFile(empty, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("GIT_CONFIG_GLOBAL", empty)
-	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	gittest.Isolate(t)
 
 	repo := t.TempDir()
 	gitT(t, repo, "init", "-q", "-b", "main")

@@ -15,6 +15,7 @@ import (
 
 	"github.com/Masked-Kunsiquat/arbiter/internal/allowedsigners"
 	"github.com/Masked-Kunsiquat/arbiter/internal/gitsign"
+	"github.com/Masked-Kunsiquat/arbiter/internal/gittest"
 	"github.com/Masked-Kunsiquat/arbiter/internal/ledger"
 	"github.com/Masked-Kunsiquat/arbiter/internal/prd"
 )
@@ -34,12 +35,7 @@ func gitIn(t *testing.T, dir string, args ...string) string {
 // core prepares must reach the signer unchanged, and the signature must come
 // back to the core, which verifies it and writes the tag.
 func TestSession_LockPRDOverIPC(t *testing.T) {
-	empty := filepath.Join(t.TempDir(), "gitconfig")
-	if err := os.WriteFile(empty, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("GIT_CONFIG_GLOBAL", empty)
-	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	gittest.Isolate(t)
 
 	dir := newArbiterDir(t)
 	repo := filepath.Dir(dir)

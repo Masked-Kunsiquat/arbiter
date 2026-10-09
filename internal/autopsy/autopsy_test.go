@@ -15,6 +15,7 @@ import (
 
 	"github.com/Masked-Kunsiquat/arbiter/internal/autopsy"
 	"github.com/Masked-Kunsiquat/arbiter/internal/db"
+	"github.com/Masked-Kunsiquat/arbiter/internal/gittest"
 	"github.com/Masked-Kunsiquat/arbiter/internal/seat"
 	"github.com/Masked-Kunsiquat/arbiter/internal/worktree"
 )
@@ -128,6 +129,7 @@ func requireGit(t *testing.T) {
 // following internal/worktree/worktree_test.go's initGitRepo.
 func initGitRepo(t *testing.T) (repoRoot, initialCommit string) {
 	t.Helper()
+	gittest.Isolate(t)
 	repoRoot = t.TempDir()
 
 	runGit := func(args ...string) string {
