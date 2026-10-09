@@ -16,6 +16,7 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"github.com/Masked-Kunsiquat/arbiter/internal/allowedsigners"
+	"github.com/Masked-Kunsiquat/arbiter/internal/gittest"
 	"github.com/Masked-Kunsiquat/arbiter/internal/ledger"
 )
 
@@ -55,18 +56,6 @@ func (k testKey) sign(t *testing.T, payload []byte) string {
 	return sig
 }
 
-// isolateGit keeps the developer's global and system git config (signing
-// programs, hooks, default branch) out of the test.
-func isolateGit(t *testing.T) {
-	t.Helper()
-	empty := filepath.Join(t.TempDir(), "gitconfig")
-	if err := os.WriteFile(empty, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("GIT_CONFIG_GLOBAL", empty)
-	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
-}
-
 func run(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command("git", args...)
@@ -92,7 +81,7 @@ func writeFile(t *testing.T, path, content string) {
 // listing key for humanEmail.
 func newRepo(t *testing.T, key testKey) (*Service, string) {
 	t.Helper()
-	isolateGit(t)
+	gittest.Isolate(t)
 	repo := t.TempDir()
 	run(t, repo, "init", "-q", "-b", "main")
 	run(t, repo, "config", "user.name", "Human")

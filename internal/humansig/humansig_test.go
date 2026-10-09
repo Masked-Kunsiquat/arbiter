@@ -15,6 +15,8 @@ import (
 	"testing"
 
 	"golang.org/x/crypto/ssh"
+
+	"github.com/Masked-Kunsiquat/arbiter/internal/gittest"
 )
 
 const fakeSig = "-----BEGIN SSH SIGNATURE-----\nFAKE\n-----END SSH SIGNATURE-----\n"
@@ -85,16 +87,6 @@ func keyText(pk ssh.PublicKey) string {
 	return strings.TrimSpace(string(ssh.MarshalAuthorizedKey(pk)))
 }
 
-func isolateGit(t *testing.T) {
-	t.Helper()
-	empty := filepath.Join(t.TempDir(), "gitconfig")
-	if err := os.WriteFile(empty, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("GIT_CONFIG_GLOBAL", empty)
-	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
-}
-
 func git(t *testing.T, dir string, args ...string) {
 	t.Helper()
 	out, err := exec.Command("git", append([]string{"-C", dir}, args...)...).CombinedOutput()
@@ -107,7 +99,7 @@ func TestLoadConfig(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not on PATH")
 	}
-	isolateGit(t)
+	gittest.Isolate(t)
 	dir := t.TempDir()
 	git(t, dir, "init", "-q")
 
