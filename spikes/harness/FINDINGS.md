@@ -176,3 +176,27 @@ emits per-chunk deltas and would close that gap if the 120 s rule proves too tig
 6. **§4 `invocations`:** optionally log `rate_limit_event` utilization; on subscription plans it's a
    better brake than notional cost (this account was at 86 % of its 7-day window during the spike).
 7. **§13 startup validation:** the `.exe` check passes here (`claude` → `claude.exe`, native).
+
+## 6. Addendum (issue #20): budget stop and unknown tool names
+
+Claude Code 2.1.284, haiku, same isolation baseline. Raw streams: `out/budget.jsonl`, `out/unknown-tool.jsonl`.
+
+```
+--max-budget-usd 0.0001   (400-word essay prompt)
+  result: subtype=error_max_budget_usd is_error=true terminal_reason=budget_exhausted
+          errors=["Reached maximum budget ($0.0001)"] total_cost_usd=0.000957 num_turns=1
+  exit=1 stderr=""
+```
+
+The cap is checked between turns, so the reported cost overshoots it (here ~10x on a tiny cap).
+`terminal_reason: "budget_exhausted"` is the signal; Arbiter maps it to `exit_reason = budget_exhausted`
+and `awaiting_human` (§5.8) rather than an autopsy.
+
+```
+--tools "Read,Grep,Glob,NoSuchTool"
+  system/init tools=["Glob","Grep","Read"]   result="PONG" is_error=false exit=0
+```
+
+An unknown name in `--tools` is silently dropped, so one Worker list (`…,Bash,PowerShell`) is safe on
+Linux, where `PowerShell` doesn't exist. Because the harness won't complain, Arbiter checks the
+`system/init` tool list against the role profile itself (§9.A).
