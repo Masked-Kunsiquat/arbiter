@@ -639,3 +639,84 @@ func TestRenewLease(t *testing.T) {
 		t.Error("RenewLease on an ended invocation succeeded")
 	}
 }
+
+func TestEndInvocation_RecordsBudgetStopAndHarnessFields(t *testing.T) {
+	raw := openDB(t)
+	id := mintTestSeat(t, raw)
+	invID, err := seat.StartInvocation(context.Background(), raw, seat.StartInvocationRequest{
+		SeatID: id, TaskID: "TASK-001", Purpose: seat.PurposeImplement,
+	})
+	if err != nil {
+		t.Fatalf("StartInvocation: %v", err)
+	}
+	cost, status := 0.00096, 429
+	if err := seat.EndInvocation(context.Background(), raw, seat.EndInvocationRequest{
+		InvocationID:   invID,
+		ExitReason:     seat.ExitBudgetExhausted,
+		CostUSD:        &cost,
+		TerminalReason: "budget_exhausted",
+		APIErrorStatus: &status,
+	}); err != nil {
+		t.Fatalf("EndInvocation: %v", err)
+	}
+	var exitReason, terminal string
+	var apiStatus sql.NullInt64
+	if err := raw.QueryRowContext(context.Background(),
+		`SELECT exit_reason, terminal_reason, api_error_status FROM invocations WHERE id = ?`, invID).
+		Scan(&exitReason, &terminal, &apiStatus); err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if exitReason != "budget_exhausted" || terminal != "budget_exhausted" || apiStatus.Int64 != 429 {
+		t.Errorf("got exit_reason=%q terminal_reason=%q api_error_status=%v", exitReason, terminal, apiStatus)
+	}
+}
+
+func TestEndInvocation_NoTerminalReasonStoresNull(t *testing.T) {
+	raw := openDB(t)
+	id := mintTestSeat(t, raw)
+	invID, err := seat.StartInvocation(context.Background(), raw, seat.StartInvocationRequest{
+		SeatID: id, TaskID: "TASK-001", Purpose: seat.PurposeImplement,
+	})
+	if err != nil {
+		t.Fatalf("StartInvocation: %v", err)
+	}
+	if err := seat.EndInvocation(context.Background(), raw, seat.EndInvocationRequest{
+		InvocationID: invID, ExitReason: seat.ExitCrash,
+	}); err != nil {
+		t.Fatalf("EndInvocation: %v", err)
+	}
+	var terminal sql.NullString
+	var apiStatus sql.NullInt64
+	if err := raw.QueryRowContext(context.Background(),
+		`SELECT terminal_reason, api_error_status FROM invocations WHERE id = ?`, invID).
+		Scan(&terminal, &apiStatus); err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if terminal.Valid || apiStatus.Valid {
+		t.Errorf("got terminal_reason=%v api_error_status=%v, want NULLs when no result arrived", terminal, apiStatus)
+	}
+}
+
+func TestSetHarnessSession(t *testing.T) {
+	raw := openDB(t)
+	id := mintTestSeat(t, raw)
+	ctx := context.Background()
+	if err := seat.SetHarnessSession(ctx, raw, id, "577b6ab1"); err != nil {
+		t.Fatalf("SetHarnessSession: %v", err)
+	}
+	// Same id again (every --resume reports it) is fine.
+	if err := seat.SetHarnessSession(ctx, raw, id, "577b6ab1"); err != nil {
+		t.Fatalf("SetHarnessSession again: %v", err)
+	}
+	got, err := seat.HarnessSession(ctx, raw, id)
+	if err != nil || got != "577b6ab1" {
+		t.Fatalf("HarnessSession = %q, %v", got, err)
+	}
+	// A different id means the resume silently forked; refuse to overwrite.
+	if err := seat.SetHarnessSession(ctx, raw, id, "ffffffff"); err == nil {
+		t.Error("SetHarnessSession overwrote a different session id")
+	}
+	if err := seat.SetHarnessSession(ctx, raw, "no-such-seat", "x"); err == nil {
+		t.Error("SetHarnessSession on a missing seat succeeded")
+	}
+}

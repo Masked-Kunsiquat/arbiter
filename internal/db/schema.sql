@@ -240,9 +240,11 @@ CREATE TABLE IF NOT EXISTS invocations (
     supervisor_handle TEXT,                  -- PGID (POSIX) or Job Object name (Windows)
     pid INTEGER,
     lease_expires_at DATETIME,               -- renewed by supervisor observation, not by the model
-    exit_reason TEXT CHECK (exit_reason IN ('ok', 'invalid_output', 'crash', 'lease_expired', 'killed')),
+    exit_reason TEXT CHECK (exit_reason IN ('ok', 'invalid_output', 'crash', 'lease_expired', 'killed', 'budget_exhausted')),
     cost_usd REAL,                           -- from the harness's final result event (§9.A); NULL if none arrived (killed)
     cost_estimated INTEGER NOT NULL DEFAULT 0, -- 1 when cost_usd was summed from streamed usage instead (§5.8)
+    terminal_reason TEXT,                    -- the result event's terminal_reason (§9.A); NULL if none arrived
+    api_error_status INTEGER,                -- the result event's api_error_status (e.g. 404, 529); NULL if none
     started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     ended_at DATETIME,
     FOREIGN KEY(seat_id) REFERENCES seats(id)
