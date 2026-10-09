@@ -136,26 +136,32 @@ func (s *Stream) handle(line []byte, onEvent func(Event)) {
 	}
 	switch {
 	case head.Type == "system" && head.Subtype == "init":
+		// An init or result that doesn't decode is malformed, not ignored:
+		// it must still trip the integrity checks (Run's checkResult).
 		var init InitEvent
-		if json.Unmarshal(line, &init) == nil {
-			s.Inits++
-			if s.Init == nil {
-				s.Init = &init
-			}
+		if json.Unmarshal(line, &init) != nil {
+			s.Malformed++
+			break
+		}
+		s.Inits++
+		if s.Init == nil {
+			s.Init = &init
 		}
 	case head.Type == "result":
 		var res ResultEvent
 		var probe struct {
 			IsError *bool `json:"is_error"`
 		}
-		if json.Unmarshal(line, &res) == nil && json.Unmarshal(line, &probe) == nil {
-			res.HasIsError = probe.IsError != nil
-			// Keep the first: a process the agent started can write to the
-			// harness's stdout, and must not replace the real outcome.
-			s.Results++
-			if s.Result == nil {
-				s.Result = &res
-			}
+		if json.Unmarshal(line, &res) != nil || json.Unmarshal(line, &probe) != nil {
+			s.Malformed++
+			break
+		}
+		res.HasIsError = probe.IsError != nil
+		// Keep the first: a process the agent started can write to the
+		// harness's stdout, and must not replace the real outcome.
+		s.Results++
+		if s.Result == nil {
+			s.Result = &res
 		}
 	case head.Type == "rate_limit_event":
 		var ev struct {
