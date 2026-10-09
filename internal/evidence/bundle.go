@@ -15,10 +15,11 @@ package evidence
 import (
 	"cmp"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -173,8 +174,12 @@ func truncationNote(b Bundle, rep Report) string {
 		lines = append(lines, "- The attack-test diff was cut to `git diff --stat` lines; open the files in the slot.")
 	}
 	if len(rep.WorkerStatPaths) > 0 {
-		lines = append(lines, "- These worker files' diffs were cut to `git diff --stat` lines; open them in the slot: "+
-			strings.Join(rep.WorkerStatPaths, ", "))
+		lines = append(lines, "- These worker files' diffs were cut to `git diff --stat` lines; open them in the slot:")
+		for _, p := range rep.WorkerStatPaths {
+			// The worker chose these names; quoting escapes any newline or
+			// control character, so a name can't add lines to this block.
+			lines = append(lines, "  - "+strconv.Quote(p))
+		}
 	}
 	if rep.OverCap {
 		lines = append(lines, "- The bundle is still over the cap after every cut.")
@@ -209,21 +214,21 @@ func size(blocks []agent.Block) int {
 }
 
 // Hash is the ledger's bundle_hash: the sha256, as lowercase hex, of the
-// blocks as sent, serialized as a JSON array of {"tag","body"} objects. It
-// doesn't depend on the prompt's per-render marker.
+// blocks as sent, each tag and body as an 8-byte big-endian length followed
+// by its exact bytes. Exact bytes, not JSON: JSON would map every invalid
+// UTF-8 byte (diffs can hold any) to U+FFFD, so different bundles could
+// share a hash. It doesn't depend on the prompt's per-render marker.
 func Hash(blocks []agent.Block) string {
-	type entry struct {
-		Tag  string `json:"tag"`
-		Body string `json:"body"`
+	h := sha256.New()
+	field := func(s string) {
+		var n [8]byte
+		binary.BigEndian.PutUint64(n[:], uint64(len(s)))
+		h.Write(n[:])
+		h.Write([]byte(s))
 	}
-	entries := make([]entry, len(blocks))
-	for i, b := range blocks {
-		entries[i] = entry{b.Tag, b.Body}
+	for _, b := range blocks {
+		field(b.Tag)
+		field(b.Body)
 	}
-	data, err := json.Marshal(entries)
-	if err != nil {
-		panic(fmt.Sprintf("evidence: marshalling blocks: %v", err)) // strings always marshal
-	}
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:])
+	return hex.EncodeToString(h.Sum(nil))
 }
