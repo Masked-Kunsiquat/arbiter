@@ -42,6 +42,9 @@ type ResultEvent struct {
 	APIErrorStatus *int     `json:"api_error_status"`
 	Errors         []string `json:"errors"`
 	NumTurns       int      `json:"num_turns"`
+	// HasIsError is false when the event had no is_error field, which would
+	// otherwise decode as a success.
+	HasIsError bool `json:"-"`
 }
 
 // RateLimit is a rate_limit_event's rate_limit_info: subscription headroom.
@@ -69,7 +72,8 @@ type MessageUsage struct {
 
 // Stream is what ReadStream collected.
 type Stream struct {
-	Init      *InitEvent   // nil if the harness never initialised (e.g. a bad --resume)
+	Init      *InitEvent   // the first one; nil if the harness never initialised (e.g. a bad --resume)
+	Inits     int          // init events seen; the harness emits one
 	Result    *ResultEvent // the first one; nil if none arrived: killed or crashed (§9.A)
 	Results   int          // result events seen; more than one means something forged one
 	RateLimit *RateLimit   // the last one seen
@@ -134,11 +138,18 @@ func (s *Stream) handle(line []byte, onEvent func(Event)) {
 	case head.Type == "system" && head.Subtype == "init":
 		var init InitEvent
 		if json.Unmarshal(line, &init) == nil {
-			s.Init = &init
+			s.Inits++
+			if s.Init == nil {
+				s.Init = &init
+			}
 		}
 	case head.Type == "result":
 		var res ResultEvent
-		if json.Unmarshal(line, &res) == nil {
+		var probe struct {
+			IsError *bool `json:"is_error"`
+		}
+		if json.Unmarshal(line, &res) == nil && json.Unmarshal(line, &probe) == nil {
+			res.HasIsError = probe.IsError != nil
 			// Keep the first: a process the agent started can write to the
 			// harness's stdout, and must not replace the real outcome.
 			s.Results++

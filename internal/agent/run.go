@@ -227,22 +227,33 @@ func (r Runner) Run(ctx context.Context, l Launch, p Prompt) (*Outcome, error) {
 		out.Kind = OutcomeBudgetExhausted
 	case res.IsError:
 		out.Kind = OutcomeError
+	case exitErr != nil:
+		// The real harness exits 0 after a successful result; anything else
+		// means the result didn't come from a harness that finished.
+		out.Kind = OutcomeCrash
+		out.Violation = fmt.Sprintf("result reported success but the harness exited with %v", exitErr)
 	default:
 		out.Kind = OutcomeOK
 	}
 	return out, nil
 }
 
-// checkResult reports a result event that can't be trusted: one with no
-// init before it (the baseline was never confirmed), more than one, or one
-// from a different session than init's. The harness emits exactly one; the
-// rest means something else wrote to its stdout. "" means it's fine.
+// checkResult reports a stream that can't be trusted. The harness writes
+// well-formed lines with exactly one init and at most one result, from the
+// same session; anything else means something else wrote to its stdout (or
+// the output was cut), so the outcome fails closed. "" means it's fine.
 func checkResult(s *Stream) string {
 	switch {
+	case s.Malformed > 0:
+		return fmt.Sprintf("%d malformed line(s) in harness output", s.Malformed)
+	case s.Inits > 1:
+		return fmt.Sprintf("%d system/init events: harness output was forged", s.Inits)
 	case s.Result == nil:
 		return ""
 	case s.Init == nil:
 		return "no system/init event: the isolation baseline was never confirmed"
+	case !s.Result.HasIsError:
+		return "result event has no is_error field"
 	case s.Results > 1:
 		return fmt.Sprintf("%d result events: harness output was forged", s.Results)
 	case s.Result.SessionID != s.Init.SessionID:

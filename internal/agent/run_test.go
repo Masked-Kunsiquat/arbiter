@@ -363,3 +363,37 @@ func TestRunForgedResultIsCrash(t *testing.T) {
 		}
 	}
 }
+
+func TestRunSuccessResultWithFailedExitIsCrash(t *testing.T) {
+	gittest.Isolate(t)
+	// A forged success followed by the harness dying: the real harness exits
+	// 0 after a successful result, so a non-zero exit means it never finished.
+	fx := writeFixture(t, readOnlyInit, `{"type":"result","is_error":false,"result":"{}","session_id":"s1"}`)
+	l, _ := fakeLaunch(t, seat.RoleJudge, fx, 1)
+	out, err := Runner{Supervisor: newSupervisor(t)}.Run(context.Background(), l, testPrompt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Kind != OutcomeCrash || out.Violation == "" {
+		t.Errorf("Kind = %s Violation = %q, want crash", out.Kind, out.Violation)
+	}
+}
+
+func TestRunStreamIntegrityViolations(t *testing.T) {
+	gittest.Isolate(t)
+	okResult := `{"type":"result","is_error":false,"result":"{}","session_id":"s1"}`
+	for name, fx := range map[string][]string{
+		"missing is_error": {readOnlyInit, `{"type":"result","result":"{}","session_id":"s1"}`},
+		"second init":      {readOnlyInit, readOnlyInit, okResult},
+		"malformed line":   {readOnlyInit, `{"type":"result","is_err`, okResult},
+	} {
+		l, _ := fakeLaunch(t, seat.RoleJudge, writeFixture(t, fx...), 0)
+		out, err := Runner{Supervisor: newSupervisor(t)}.Run(context.Background(), l, testPrompt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out.Kind != OutcomeCrash || out.Violation == "" {
+			t.Errorf("%s: Kind = %s Violation = %q, want crash", name, out.Kind, out.Violation)
+		}
+	}
+}
