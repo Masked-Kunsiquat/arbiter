@@ -8,5 +8,5 @@
 
 # Agent Skills
 .agents/
-agent/
+/agent/
 .claude/skills/
