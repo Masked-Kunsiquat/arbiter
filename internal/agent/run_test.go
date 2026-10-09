@@ -28,6 +28,7 @@ const (
 	envFake    = "ARBITER_TEST_FAKE_HARNESS" // fixture path, or "hang"
 	envRecord  = "ARBITER_TEST_FAKE_RECORD"  // where to write the launch record
 	envExit    = "ARBITER_TEST_FAKE_EXIT"    // exit code
+	envResume  = "ARBITER_TEST_FAKE_RESUME"  // fixture for a --resume launch; record goes to <record>.resume
 	fakeStderr = "fake harness stderr line"
 )
 
@@ -52,7 +53,12 @@ func fakeHarness(fixture string) int {
 	stdin, _ := io.ReadAll(os.Stdin)
 	dir, _ := os.Getwd()
 	rec, _ := json.Marshal(launchRecord{Args: os.Args[1:], Env: os.Environ(), Dir: dir, Stdin: string(stdin)})
-	if path := os.Getenv(envRecord); path != "" {
+	path := os.Getenv(envRecord)
+	if slices.Contains(os.Args[1:], "--resume") && os.Getenv(envResume) != "" {
+		fixture = os.Getenv(envResume)
+		path += ".resume"
+	}
+	if path != "" {
 		_ = os.WriteFile(path, rec, 0o600)
 	}
 	fmt.Fprintln(os.Stderr, fakeStderr)
