@@ -36,6 +36,9 @@ const (
 	ExitCrash         ExitReason = "crash"
 	ExitLeaseExpired  ExitReason = "lease_expired"
 	ExitKilled        ExitReason = "killed"
+	// ExitBudgetExhausted: the harness stopped at --max-budget-usd (§5.8);
+	// the task goes to awaiting_human, not the autopsy.
+	ExitBudgetExhausted ExitReason = "budget_exhausted"
 )
 
 // StartInvocationRequest describes a new process launch under an existing
@@ -141,6 +144,10 @@ type EndInvocationRequest struct {
 	ExitReason    ExitReason
 	CostUSD       *float64 // nil if none arrived (killed), per spec §4
 	CostEstimated bool     // true when CostUSD was summed from streamed usage instead (§5.8)
+	// TerminalReason and APIErrorStatus come from the harness's result
+	// event (§9.A); "" and nil (stored NULL) when none arrived.
+	TerminalReason string
+	APIErrorStatus *int
 }
 
 // EndInvocation records the exit reason and cost for an invocation. It does
@@ -151,19 +158,23 @@ func EndInvocation(ctx context.Context, db *sql.DB, req EndInvocationRequest) er
 		return errors.New("seat: EndInvocation requires an invocation_id")
 	}
 	switch req.ExitReason {
-	case ExitOK, ExitInvalidOutput, ExitCrash, ExitLeaseExpired, ExitKilled:
+	case ExitOK, ExitInvalidOutput, ExitCrash, ExitLeaseExpired, ExitKilled, ExitBudgetExhausted:
 	default:
 		return fmt.Errorf("seat: invalid exit_reason %q", req.ExitReason)
 	}
-	var cost any
+	var cost, apiStatus any
 	if req.CostUSD != nil {
 		cost = *req.CostUSD
 	}
+	if req.APIErrorStatus != nil {
+		apiStatus = *req.APIErrorStatus
+	}
 	res, err := db.ExecContext(ctx, `
 		UPDATE invocations
-		SET exit_reason = ?, cost_usd = ?, cost_estimated = ?, ended_at = CURRENT_TIMESTAMP
+		SET exit_reason = ?, cost_usd = ?, cost_estimated = ?,
+		    terminal_reason = NULLIF(?, ''), api_error_status = ?, ended_at = CURRENT_TIMESTAMP
 		WHERE id = ?`,
-		string(req.ExitReason), cost, req.CostEstimated, req.InvocationID,
+		string(req.ExitReason), cost, req.CostEstimated, req.TerminalReason, apiStatus, req.InvocationID,
 	)
 	if err != nil {
 		return fmt.Errorf("seat: ending invocation %s: %w", req.InvocationID, err)
@@ -184,4 +195,48 @@ func randomInvocationID() (string, error) {
 		return "", fmt.Errorf("seat: generating invocation id: %w", err)
 	}
 	return "inv-" + hex.EncodeToString(b), nil
+}
+
+// SetHarnessSession stores the harness conversation id reported by the
+// seat's first invocation (seats.harness_session_id, §9.A), so later
+// invocations resume it. The id stays the same across --resume, so storing
+// the same value again is a no-op; a different value is an error, since it
+// means a resume silently started a new conversation.
+func SetHarnessSession(ctx context.Context, db *sql.DB, seatID, sessionID string) error {
+	if sessionID == "" {
+		return errors.New("seat: SetHarnessSession requires a session id")
+	}
+	res, err := db.ExecContext(ctx, `
+		UPDATE seats SET harness_session_id = ?
+		WHERE id = ? AND (harness_session_id IS NULL OR harness_session_id = ?)`,
+		sessionID, seatID, sessionID,
+	)
+	if err != nil {
+		return fmt.Errorf("seat: setting harness session for %s: %w", seatID, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("seat: setting harness session for %s: %w", seatID, err)
+	}
+	if n == 0 {
+		current, err := HarnessSession(ctx, db, seatID)
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("seat: %s already has harness session %s, got %s", seatID, current, sessionID)
+	}
+	return nil
+}
+
+// HarnessSession returns the seat's harness conversation id, "" if none yet.
+func HarnessSession(ctx context.Context, db *sql.DB, seatID string) (string, error) {
+	var id sql.NullString
+	err := db.QueryRowContext(ctx, `SELECT harness_session_id FROM seats WHERE id = ?`, seatID).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", fmt.Errorf("seat: %s not found", seatID)
+	}
+	if err != nil {
+		return "", fmt.Errorf("seat: loading harness session for %s: %w", seatID, err)
+	}
+	return id.String, nil
 }
