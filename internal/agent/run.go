@@ -213,8 +213,8 @@ func (r Runner) Run(ctx context.Context, l Launch, p Prompt) (*Outcome, error) {
 		return nil, spawnErr
 	}
 	out := &Outcome{Stream: stream, Exit: exitErr, Tail: tail.String()}
-	if violation == "" && stream.Init == nil && stream.Result != nil {
-		violation = "no system/init event: the isolation baseline was never confirmed"
+	if violation == "" {
+		violation = checkResult(stream)
 	}
 	switch res := stream.Result; {
 	case violation != "":
@@ -231,6 +231,25 @@ func (r Runner) Run(ctx context.Context, l Launch, p Prompt) (*Outcome, error) {
 		out.Kind = OutcomeOK
 	}
 	return out, nil
+}
+
+// checkResult reports a result event that can't be trusted: one with no
+// init before it (the baseline was never confirmed), more than one, or one
+// from a different session than init's. The harness emits exactly one; the
+// rest means something else wrote to its stdout. "" means it's fine.
+func checkResult(s *Stream) string {
+	switch {
+	case s.Result == nil:
+		return ""
+	case s.Init == nil:
+		return "no system/init event: the isolation baseline was never confirmed"
+	case s.Results > 1:
+		return fmt.Sprintf("%d result events: harness output was forged", s.Results)
+	case s.Result.SessionID != s.Init.SessionID:
+		return fmt.Sprintf("result session %q differs from init session %q: harness output was forged",
+			s.Result.SessionID, s.Init.SessionID)
+	}
+	return ""
 }
 
 // checkBaseline reports how the system/init event in raw departs from the

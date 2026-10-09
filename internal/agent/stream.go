@@ -70,7 +70,8 @@ type MessageUsage struct {
 // Stream is what ReadStream collected.
 type Stream struct {
 	Init      *InitEvent   // nil if the harness never initialised (e.g. a bad --resume)
-	Result    *ResultEvent // nil if none arrived: killed or crashed (§9.A)
+	Result    *ResultEvent // the first one; nil if none arrived: killed or crashed (§9.A)
+	Results   int          // result events seen; more than one means something forged one
 	RateLimit *RateLimit   // the last one seen
 	// Usage maps assistant message id to its usage. The harness repeats a
 	// message once per content block, so each id is counted once.
@@ -138,7 +139,12 @@ func (s *Stream) handle(line []byte, onEvent func(Event)) {
 	case head.Type == "result":
 		var res ResultEvent
 		if json.Unmarshal(line, &res) == nil {
-			s.Result = &res
+			// Keep the first: a process the agent started can write to the
+			// harness's stdout, and must not replace the real outcome.
+			s.Results++
+			if s.Result == nil {
+				s.Result = &res
+			}
 		}
 	case head.Type == "rate_limit_event":
 		var ev struct {

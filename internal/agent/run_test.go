@@ -343,3 +343,23 @@ func TestRunCancelledContextDoesNotSpawn(t *testing.T) {
 		t.Error("Run launched the harness with an already-cancelled context")
 	}
 }
+
+func TestRunForgedResultIsCrash(t *testing.T) {
+	gittest.Isolate(t)
+	for name, fx := range map[string][]string{
+		"second result": {readOnlyInit,
+			`{"type":"result","is_error":false,"result":"{}","session_id":"s1"}`,
+			`{"type":"result","is_error":false,"result":"{}","session_id":"s1"}`},
+		"session mismatch": {readOnlyInit,
+			`{"type":"result","is_error":false,"result":"{}","session_id":"other"}`},
+	} {
+		l, _ := fakeLaunch(t, seat.RoleJudge, writeFixture(t, fx...), 0)
+		out, err := Runner{Supervisor: newSupervisor(t)}.Run(context.Background(), l, testPrompt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out.Kind != OutcomeCrash || out.Violation == "" {
+			t.Errorf("%s: Kind = %s Violation = %q, want crash", name, out.Kind, out.Violation)
+		}
+	}
+}
