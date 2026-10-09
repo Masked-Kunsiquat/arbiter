@@ -133,6 +133,7 @@ var testPrompt = Prompt{Instruction: "Reply with one JSON object.", Blocks: []Bl
 
 func TestRunSuccess(t *testing.T) {
 	gittest.Isolate(t)
+	pinMarker(t, "m1")
 	l, record := fakeLaunch(t, seat.RoleJudge, "iso-readonly.jsonl", 0)
 	var events int
 	r := Runner{Supervisor: newSupervisor(t), OnEvent: func(Event) { events++ }}
