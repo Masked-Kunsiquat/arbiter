@@ -204,6 +204,27 @@ func TestTerminateGracefulAfterLeaderExit(t *testing.T) {
 	assertDead(t, grandchild)
 }
 
+// The graceful signal to a leaderless container must report success: a
+// failure makes Terminate skip the grace period and hard-kill at once
+// (#58: on Windows the _ctrlbreak helper died of its own CTRL_BREAK).
+func TestSignalAfterLeaderExit(t *testing.T) {
+	sup := newTestSupervisor(t)
+	dir := t.TempDir()
+	h, err := sup.Spawn(Cmd{Path: os.Args[0], Env: childEnv(dir, "orphaner")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sup.Terminate(h, 0) })
+	grandchild := readPID(t, filepath.Join(dir, "grandchild.pid"))
+	killOnCleanup(t, grandchild)
+	<-h.Exited()
+
+	if err := h.(*proc).c.signal(); err != nil {
+		t.Fatalf("signal: %v", err)
+	}
+	waitFile(t, filepath.Join(dir, "grandchild.sig"), 20*time.Second)
+}
+
 // assertDead fails unless every pid is already dead: Terminate and Wait
 // return only once the container is empty.
 func assertDead(t *testing.T, pids ...int) {
