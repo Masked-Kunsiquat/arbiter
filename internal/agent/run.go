@@ -109,15 +109,21 @@ type Runner struct {
 // The error is non-nil only when nothing was run (bad launch, spawn
 // failure) or OnSpawn failed; every other ending is an Outcome.
 func (r Runner) Run(ctx context.Context, l Launch, p Prompt) (*Outcome, error) {
+	text, err := p.Render()
+	if err != nil {
+		return nil, err
+	}
+	return r.runText(ctx, l, text)
+}
+
+// runText is Run with the prompt already rendered (Invoke hashes the exact
+// text it sends).
+func (r Runner) runText(ctx context.Context, l Launch, text string) (*Outcome, error) {
 	args, err := l.Args()
 	if err != nil {
 		return nil, err
 	}
 	profile, err := ProfileFor(l.Role, l.ShellAllow)
-	if err != nil {
-		return nil, err
-	}
-	text, err := p.Render()
 	if err != nil {
 		return nil, err
 	}
