@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"os/signal"
 	"slices"
 	"strconv"
 	"strings"
@@ -28,9 +27,10 @@ const (
 )
 
 var (
-	kernel32          = windows.NewLazySystemDLL("kernel32.dll")
-	procFreeConsole   = kernel32.NewProc("FreeConsole")
-	procAttachConsole = kernel32.NewProc("AttachConsole")
+	kernel32                  = windows.NewLazySystemDLL("kernel32.dll")
+	procFreeConsole           = kernel32.NewProc("FreeConsole")
+	procAttachConsole         = kernel32.NewProc("AttachConsole")
+	procSetConsoleCtrlHandler = kernel32.NewProc("SetConsoleCtrlHandler")
 )
 
 func newSupervisor(helper []string) (Supervisor, error) {
@@ -105,7 +105,7 @@ func jobName() (string, error) {
 }
 
 // newJob creates a Job Object that kills its processes when its last handle
-// closes, which is how a crashed supervisor's trees die (§7).
+// closes, which is how a crashed supervisor's trees die (Â§7).
 func newJob(name string) (windows.Handle, error) {
 	namep, err := windows.UTF16PtrFromString(name)
 	if err != nil {
@@ -191,14 +191,21 @@ func (j *jobObject) alive() bool {
 
 // signal delivers CTRL_BREAK_EVENT to the job through the _ctrlbreak
 // helper. The supervisor never attaches to a child's console itself: it
-// would lose its own, process-wide (§7). While the leader lives, the helper
+// would lose its own, process-wide (Â§7). While the leader lives, the helper
 // attaches to its console and signals its process group. Once it has
 // exited, a group id with no leader reaches nobody, so the helper attaches
 // via a surviving member and signals group 0: every process on that
 // console. CREATE_NO_WINDOW gave the leader a console of its own, so that
 // is the job's processes.
 func (j *jobObject) signal() error {
+	// Just after the leader exits, the pid list can read empty for a moment
+	// while the job still has active processes (#58). Wait that out instead
+	// of failing, which would skip the grace period.
 	members := j.members()
+	for deadline := time.Now().Add(time.Second); len(members) == 0 && j.alive() && time.Now().Before(deadline); {
+		time.Sleep(pollInterval)
+		members = j.members()
+	}
 	if len(members) == 0 {
 		return errors.New("supervisor: job is empty")
 	}
@@ -286,9 +293,6 @@ func runCtrlBreak(args []string) int {
 	if len(attach) == 0 {
 		attach = ids[:1]
 	}
-	// Group 0 includes us. Handle (not Ignore) the event: an ignored
-	// CTRL_BREAK falls through to the default handler, which exits.
-	signal.Notify(make(chan os.Signal, 1), os.Interrupt)
 	_, _, _ = procFreeConsole.Call()
 	var attachErr error
 	for _, pid := range attach {
@@ -303,12 +307,40 @@ func runCtrlBreak(args []string) int {
 		fmt.Fprintln(os.Stderr, "_ctrlbreak: AttachConsole:", attachErr)
 		return 1
 	}
-	err := windows.GenerateConsoleCtrlEvent(windows.CTRL_BREAK_EVENT, group)
-	_, _, _ = procFreeConsole.Call()
-	if err != nil {
+	// Group 0 includes us, and an unhandled CTRL_BREAK ends us with
+	// STATUS_CONTROL_C_EXIT, which the supervisor reads as a failed signal
+	// and skips the grace period (#58). The Go runtime's handler, set at
+	// startup, is not called once we have reattached, so set our own here.
+	self := make(chan struct{}, 1)
+	r, _, err := procSetConsoleCtrlHandler.Call(windows.NewCallback(func(event uint32) uintptr {
+		if event != windows.CTRL_BREAK_EVENT {
+			return 0
+		}
+		select {
+		case self <- struct{}{}:
+		default:
+		}
+		return 1
+	}), 1)
+	if r == 0 {
+		_, _, _ = procFreeConsole.Call()
+		fmt.Fprintln(os.Stderr, "_ctrlbreak: SetConsoleCtrlHandler:", err)
+		return 1
+	}
+	if err := windows.GenerateConsoleCtrlEvent(windows.CTRL_BREAK_EVENT, group); err != nil {
+		_, _, _ = procFreeConsole.Call()
 		fmt.Fprintln(os.Stderr, "_ctrlbreak: GenerateConsoleCtrlEvent:", err)
 		return 1
 	}
+	if group == 0 {
+		// Delivery is asynchronous: wait for our own copy rather than have
+		// it land while we exit.
+		select {
+		case <-self:
+		case <-time.After(ctrlBreakTimeout / 2):
+		}
+	}
+	_, _, _ = procFreeConsole.Call()
 	return 0
 }
 
