@@ -178,3 +178,22 @@ func TestReadStreamSecondResultIsForgery(t *testing.T) {
 		t.Errorf("Results = %d, want 2", s.Results)
 	}
 }
+
+func TestReadStreamCountsUndecodableInitAndResultAsMalformed(t *testing.T) {
+	// Valid JSON with a type, but fields of the wrong type: the typed decode
+	// fails, and a forged line must not slip past the integrity counts.
+	for name, line := range map[string]string{
+		"init tools not a list":  `{"type":"system","subtype":"init","session_id":"s1","tools":"Read"}`,
+		"result is_error string": `{"type":"result","is_error":"no","session_id":"s1"}`,
+		"result cost string":     `{"type":"result","is_error":false,"session_id":"s1","total_cost_usd":"0"}`,
+	} {
+		s, err := ReadStream(strings.NewReader(line+"\n"), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s.Malformed != 1 || s.Inits != 0 || s.Results != 0 || s.Init != nil || s.Result != nil {
+			t.Errorf("%s: Malformed=%d Inits=%d Results=%d, want the line counted malformed and nothing stored",
+				name, s.Malformed, s.Inits, s.Results)
+		}
+	}
+}
