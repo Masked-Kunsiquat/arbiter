@@ -3,6 +3,11 @@
 // from the bottom up to fit the cap, and hashed for the ledger's
 // bundle_hash.
 //
+// Each section is its own prompt block, so agent-written content (a diff
+// line reading "## Attack results", a fake truncation note) stays data
+// inside its block: agent.Prompt gives every block marked tags the content
+// can't forge. What was cut is stated in a core-written "truncation" block.
+//
 // The core computes every section (blast radius, attack results, diffs);
 // this package only orders, truncates and hashes them.
 package evidence
@@ -11,10 +16,13 @@ import (
 	"cmp"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"slices"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/Masked-Kunsiquat/arbiter/internal/agent"
 )
 
 const (
@@ -22,6 +30,8 @@ const (
 	CharsPerToken = 4
 	// DefaultCapTokens is limits.judge_bundle_tokens' default (§9.C).
 	DefaultCapTokens = 60000
+	// blockOverhead approximates a block's marked tags and newlines.
+	blockOverhead = 48
 )
 
 // FileDiff is one file's part of a diff.
@@ -39,7 +49,7 @@ type Bundle struct {
 	AcceptanceCriteria string // 1. PRD acceptance criteria
 	BlastRadius        string // 2. computed blast radius and its reasons
 	Attacks            string // 3. attack results, claim rulings, disputes, earlier upheld rejections
-	Lessons            string // 4. injected lessons with their text (v0.2+); "" omits the section
+	Lessons            string // 4. injected lessons with their text (v0.2+); "" omits the block
 	WorkerDiff         []FileDiff
 	AttackDiff         []FileDiff
 	PassingOutput      string // 6. output of passing tests
@@ -47,7 +57,7 @@ type Bundle struct {
 
 // Report says what Render cut.
 type Report struct {
-	Chars                int // characters in the rendered text
+	Chars                int // estimated characters the blocks take in the prompt
 	CapChars             int // the cap, in characters
 	PassingOutputDropped bool
 	AttackDiffStat       bool     // attack-test diff replaced by stat lines
@@ -55,24 +65,18 @@ type Report struct {
 	OverCap              bool     // still over the cap after every cut: sent anyway (§9.A)
 }
 
-// cuts is the truncation state Render steps through.
-type cuts struct {
-	dropPassing bool
-	attackStat  bool
-	workerStat  map[string]bool
-}
-
-// Render returns the bundle text and what was cut to fit capTokens (≤ 0
-// means DefaultCapTokens). Cuts go bottom up: passing-test output first,
-// then the attack-test diff becomes stat lines, then the largest worker file
-// diffs become stat lines one at a time. If it's still over the cap, it is
-// returned anyway with OverCap set. The Judge can open any cut file itself.
-func (b Bundle) Render(capTokens int) (string, Report) {
+// Render returns the bundle as prompt blocks and what was cut to fit
+// capTokens (≤ 0 means DefaultCapTokens). Cuts go bottom up: passing-test
+// output first, then the attack-test diff becomes stat lines, then the
+// largest worker file diffs become stat lines one at a time. If it's still
+// over the cap, it is returned anyway with OverCap set. The Judge can open
+// any cut file itself.
+func (b Bundle) Render(capTokens int) ([]agent.Block, Report) {
 	if capTokens <= 0 {
 		capTokens = DefaultCapTokens
 	}
 	rep := Report{CapChars: capTokens * CharsPerToken}
-	c := cuts{workerStat: map[string]bool{}}
+	workerStat := map[string]bool{}
 
 	// Largest worker diffs first; ties by path so the result is stable.
 	order := slices.Clone(b.WorkerDiff)
@@ -84,94 +88,142 @@ func (b Bundle) Render(capTokens int) (string, Report) {
 	})
 
 	for {
-		text := b.render(c)
-		rep.Chars = utf8.RuneCountInString(text)
+		blocks := b.blocks(rep, workerStat)
+		rep.Chars = size(blocks)
 		if rep.Chars <= rep.CapChars {
-			return text, rep
+			return blocks, rep
 		}
-		switch next := b.nextWorkerCut(order, c); {
-		case !c.dropPassing && b.PassingOutput != "":
-			c.dropPassing, rep.PassingOutputDropped = true, true
-		case !c.attackStat && len(b.AttackDiff) > 0:
-			c.attackStat, rep.AttackDiffStat = true, true
+		next := ""
+		for _, f := range order {
+			if !workerStat[f.Path] {
+				next = f.Path
+				break
+			}
+		}
+		switch {
+		case !rep.PassingOutputDropped && b.PassingOutput != "":
+			rep.PassingOutputDropped = true
+		case !rep.AttackDiffStat && len(b.AttackDiff) > 0:
+			rep.AttackDiffStat = true
 		case next != "":
-			c.workerStat[next] = true
+			workerStat[next] = true
 			rep.WorkerStatPaths = append(rep.WorkerStatPaths, next)
 		default:
 			rep.OverCap = true
-			return text, rep
+			blocks = b.blocks(rep, workerStat)
+			rep.Chars = size(blocks)
+			return blocks, rep
 		}
 	}
 }
 
-// nextWorkerCut returns the largest worker file not yet cut, "" if none.
-func (b Bundle) nextWorkerCut(order []FileDiff, c cuts) string {
-	for _, f := range order {
-		if !c.workerStat[f.Path] {
-			return f.Path
-		}
+// blocks renders the bundle with rep's cuts applied.
+func (b Bundle) blocks(rep Report, workerStat map[string]bool) []agent.Block {
+	out := []agent.Block{
+		block("spec", b.Spec),
+		block("invariants", b.Invariants),
+		block("acceptance_criteria", b.AcceptanceCriteria),
+		block("blast_radius", b.BlastRadius),
+		block("attack_results", b.Attacks),
 	}
-	return ""
-}
-
-func (b Bundle) render(c cuts) string {
-	var s strings.Builder
-	section := func(title, body string) {
-		if strings.TrimSpace(body) == "" {
-			body = "(none)"
-		}
-		fmt.Fprintf(&s, "## %s\n\n%s\n\n", title, strings.TrimRight(body, "\n"))
-	}
-	section("Task spec", b.Spec)
-	section("PRD invariants", b.Invariants)
-	section("PRD acceptance criteria", b.AcceptanceCriteria)
-	section("Blast radius", b.BlastRadius)
-	section("Attack results", b.Attacks)
 	if b.Lessons != "" {
-		section("Injected lessons", b.Lessons)
+		out = append(out, block("lessons", b.Lessons))
 	}
 
 	var worker strings.Builder
 	for _, f := range b.WorkerDiff {
-		if c.workerStat[f.Path] {
-			fmt.Fprintf(&worker, "%s  [diff cut to fit the evidence cap; open %s in the slot]\n", f.Stat, f.Path)
-			continue
-		}
-		worker.WriteString(f.Patch)
-		if !strings.HasSuffix(f.Patch, "\n") {
-			worker.WriteString("\n")
+		if workerStat[f.Path] {
+			writeLine(&worker, f.Stat)
+		} else {
+			writeLine(&worker, f.Patch)
 		}
 	}
-	section("Worker diff", worker.String())
+	out = append(out, block("worker_diff", worker.String()))
 
 	var attack strings.Builder
-	if c.attackStat {
-		attack.WriteString("[diff cut to fit the evidence cap; stat lines only, open the files in the slot]\n")
-	}
 	for _, f := range b.AttackDiff {
-		body := f.Patch
-		if c.attackStat {
-			body = f.Stat
-		}
-		attack.WriteString(body)
-		if !strings.HasSuffix(body, "\n") {
-			attack.WriteString("\n")
+		if rep.AttackDiffStat {
+			writeLine(&attack, f.Stat)
+		} else {
+			writeLine(&attack, f.Patch)
 		}
 	}
-	section("Attack-test diff", attack.String())
+	out = append(out, block("attack_diff", attack.String()))
 
 	passing := b.PassingOutput
-	if c.dropPassing {
-		passing = fmt.Sprintf("[%d characters of passing-test output cut to fit the evidence cap]",
-			utf8.RuneCountInString(b.PassingOutput))
+	if rep.PassingOutputDropped {
+		passing = "(cut: see the truncation block)"
 	}
-	section("Passing test output", passing)
-	return strings.TrimRight(s.String(), "\n") + "\n"
+	out = append(out, block("passing_output", passing))
+
+	if note := truncationNote(b, rep); note != "" {
+		out = append(out, block("truncation", note))
+	}
+	return out
 }
 
-// Hash is the ledger's bundle_hash: the sha256 of the rendered bundle text
-// exactly as sent to the Judge, as lowercase hex.
-func Hash(text string) string {
-	sum := sha256.Sum256([]byte(text))
+// truncationNote is the core's own account of what was cut, "" if nothing.
+func truncationNote(b Bundle, rep Report) string {
+	var lines []string
+	if rep.PassingOutputDropped {
+		lines = append(lines, fmt.Sprintf("- The passing-test output (%d characters) was cut.",
+			utf8.RuneCountInString(b.PassingOutput)))
+	}
+	if rep.AttackDiffStat {
+		lines = append(lines, "- The attack-test diff was cut to `git diff --stat` lines; open the files in the slot.")
+	}
+	if len(rep.WorkerStatPaths) > 0 {
+		lines = append(lines, "- These worker files' diffs were cut to `git diff --stat` lines; open them in the slot: "+
+			strings.Join(rep.WorkerStatPaths, ", "))
+	}
+	if rep.OverCap {
+		lines = append(lines, "- The bundle is still over the cap after every cut.")
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	return "Arbiter cut these parts of the evidence to fit the cap:\n" + strings.Join(lines, "\n")
+}
+
+func block(tag, body string) agent.Block {
+	if strings.TrimSpace(body) == "" {
+		body = "(none)"
+	}
+	return agent.Block{Tag: tag, Body: body}
+}
+
+func writeLine(b *strings.Builder, s string) {
+	b.WriteString(s)
+	if !strings.HasSuffix(s, "\n") {
+		b.WriteString("\n")
+	}
+}
+
+// size estimates the characters blocks take in the prompt.
+func size(blocks []agent.Block) int {
+	n := 0
+	for _, b := range blocks {
+		n += utf8.RuneCountInString(b.Body) + 2*len(b.Tag) + blockOverhead
+	}
+	return n
+}
+
+// Hash is the ledger's bundle_hash: the sha256, as lowercase hex, of the
+// blocks as sent, serialized as a JSON array of {"tag","body"} objects. It
+// doesn't depend on the prompt's per-render marker.
+func Hash(blocks []agent.Block) string {
+	type entry struct {
+		Tag  string `json:"tag"`
+		Body string `json:"body"`
+	}
+	entries := make([]entry, len(blocks))
+	for i, b := range blocks {
+		entries[i] = entry{b.Tag, b.Body}
+	}
+	data, err := json.Marshal(entries)
+	if err != nil {
+		panic(fmt.Sprintf("evidence: marshalling blocks: %v", err)) // strings always marshal
+	}
+	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
 }
